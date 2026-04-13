@@ -143,30 +143,26 @@ func NetworkConfig(ip string) []configItem {
 	}
 }
 
-// InternalNetworkConfig returns the lxc.conf lines for the internal bridge
-// (gow0) WITHOUT a default gateway. Used for dual-NIC containers where the
-// default route goes through the LAN bridge instead.
-func InternalNetworkConfig(ip string) []configItem {
-	return []configItem{
-		{"lxc.net.0.type", "veth"},
-		{"lxc.net.0.link", BridgeName},
-		{"lxc.net.0.flags", "up"},
-		{"lxc.net.0.ipv4.address", ip + "/24"},
-	}
-}
-
-// LANNetworkConfig returns the lxc.conf lines for a second NIC (net.1) on a
-// physical LAN bridge (e.g. vmbr0). This gives the container a routable IP
-// on the local network for mDNS discovery and direct client connections.
-func LANNetworkConfig(bridge, ip, gateway string) []configItem {
+// DualNICConfig returns lxc.conf lines for a dual-NIC container: the LAN
+// bridge as net.0 (primary — so mDNS and other services advertise the LAN IP)
+// and the internal gow0 bridge as net.1 (for inter-container traffic).
+func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem {
+	// net.0 = LAN (primary): routable IP on the physical network.
 	items := []configItem{
-		{"lxc.net.1.type", "veth"},
-		{"lxc.net.1.link", bridge},
-		{"lxc.net.1.flags", "up"},
-		{"lxc.net.1.ipv4.address", ip},
+		{"lxc.net.0.type", "veth"},
+		{"lxc.net.0.link", lanBridge},
+		{"lxc.net.0.flags", "up"},
+		{"lxc.net.0.ipv4.address", lanIP},
 	}
-	if gateway != "" {
-		items = append(items, configItem{"lxc.net.1.ipv4.gateway", gateway})
+	if lanGateway != "" {
+		items = append(items, configItem{"lxc.net.0.ipv4.gateway", lanGateway})
 	}
+	// net.1 = internal gow0 bridge (no gateway — connected route only).
+	items = append(items,
+		configItem{"lxc.net.1.type", "veth"},
+		configItem{"lxc.net.1.link", BridgeName},
+		configItem{"lxc.net.1.flags", "up"},
+		configItem{"lxc.net.1.ipv4.address", internalIP + "/24"},
+	)
 	return items
 }

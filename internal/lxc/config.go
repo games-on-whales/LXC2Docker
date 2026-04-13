@@ -179,12 +179,11 @@ func buildItems(cfg ContainerConfig, ip string) []configItem {
 
 	// Network configuration.
 	if cfg.LANBridge != "" {
-		// Dual-NIC: internal bridge (gow0, no gateway) + LAN bridge (default route).
-		// Used instead of host networking for containers that need LAN access
-		// (e.g. Moonlight mDNS discovery) but run as Proxmox CTs where
+		// Dual-NIC: LAN bridge as net.0 (primary — mDNS advertises this IP)
+		// and internal gow0 as net.1. This replaces host networking for
+		// containers that need LAN access but run as Proxmox CTs where
 		// lxc.namespace.clone is silently stripped.
-		items = append(items, InternalNetworkConfig(ip)...)
-		items = append(items, LANNetworkConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway)...)
+		items = append(items, DualNICConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway, ip)...)
 	} else if cfg.NetworkMode == "host" {
 		// Share the host's network namespace by only cloning the other namespaces.
 		// lxc.namespace.clone lists which namespaces to CREATE; omitting net
@@ -447,9 +446,8 @@ func buildPVEItems(cfg ContainerConfig, ip string) []configItem {
 
 	// Network configuration.
 	if cfg.LANBridge != "" {
-		// Dual-NIC: internal bridge (gow0) + physical LAN bridge.
-		items = append(items, InternalNetworkConfig(ip)...)
-		items = append(items, LANNetworkConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway)...)
+		// Dual-NIC: LAN bridge as net.0 (primary) + internal gow0 as net.1.
+		items = append(items, DualNICConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway, ip)...)
 	} else if cfg.NetworkMode == "host" {
 		items = append(items, configItem{"lxc.namespace.clone", "ipc mnt pid uts"})
 	} else {
