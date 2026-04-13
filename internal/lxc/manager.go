@@ -260,10 +260,7 @@ func (m *Manager) pullOCI(r *image.ResolvedImage, progress func(string)) error {
 		}
 		templateVMID = vmid
 
-		hostname := "tmpl-" + oci.SafeDirName(r.Ref)
-		if len(hostname) > 63 {
-			hostname = hostname[:63]
-		}
+		hostname := sanitizeHostname("tmpl-" + oci.SafeDirName(r.Ref))
 
 		out, err = exec.Command("pct", "create", fmt.Sprintf("%d", vmid), tarball,
 			"--storage", m.pveStorage,
@@ -281,9 +278,8 @@ func (m *Manager) pullOCI(r *image.ResolvedImage, progress func(string)) error {
 		exec.Command("pct", "template", fmt.Sprintf("%d", vmid)).Run()
 
 		// Create a ZFS snapshot for instant ephemeral container cloning.
-		// Ephemeral containers (not Proxmox CTs) clone from this snapshot
-		// so they stay off the Proxmox UI while still using PVE storage.
-		snapDataset := fmt.Sprintf("%s/subvol-%d-disk-0@tmpl", m.pveStorage, vmid)
+		// pct template converts subvol → basevol, so snapshot the basevol.
+		snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, vmid)
 		if snapOut, snapErr := exec.Command("zfs", "snapshot", snapDataset).CombinedOutput(); snapErr != nil {
 			log.Printf("pullOCI: warning: could not create ZFS snapshot %s: %s: %v", snapDataset, snapOut, snapErr)
 		} else {
@@ -421,20 +417,19 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 		return fmt.Errorf("manager: mkdir log dir: %w", err)
 	}
 
-	// Determine the container hostname (use Docker name, truncated for DNS).
+	// Determine the container hostname (use Docker name, sanitized for DNS).
 	hostname := id[:12]
 	if storeRec := m.store.GetContainer(id); storeRec != nil {
 		hostname = storeRec.Name
 	}
-	if len(hostname) > 63 {
-		hostname = hostname[:63]
-	}
+	hostname = sanitizeHostname(hostname)
 
 	// Build rootfs spec for Proxmox config.
 	rootfsSpec := fmt.Sprintf("%s:subvol-%d-disk-0,size=4G", m.pveStorage, vmid)
+	rootfsPath := m.pveRootfsPath(vmid)
 
 	// Write the Proxmox CT config.
-	if err := writePVEConfig(vmid, hostname, rootfsSpec, cfg, ip); err != nil {
+	if err := writePVEConfig(vmid, hostname, rootfsSpec, rootfsPath, cfg, ip); err != nil {
 		exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run()
 		return fmt.Errorf("manager: write PVE config: %w", err)
 	}
@@ -457,7 +452,8 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 // rootfs lives on the PVE storage pool (ZFS).
 func (m *Manager) createEphemeralPVE(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
 	// ZFS clone the template rootfs for instant provisioning.
-	snapDataset := fmt.Sprintf("%s/subvol-%d-disk-0@tmpl", m.pveStorage, imgRec.TemplateVMID)
+	// pct template converts subvol → basevol, so clone from basevol.
+	snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, imgRec.TemplateVMID)
 	cloneDataset := fmt.Sprintf("%s/lxc-%s", m.pveStorage, id)
 	cloneMountpoint := fmt.Sprintf("/%s/lxc-%s", m.pveStorage, id)
 
@@ -790,7 +786,7 @@ func (m *Manager) RemoveImage(ref string) error {
 	if rec.TemplateVMID > 0 {
 		// PVE template — first destroy any ZFS snapshots (used by ephemeral
 		// clones), then destroy the CT template via pct.
-		snapDataset := fmt.Sprintf("%s/subvol-%d-disk-0@tmpl", m.pveStorage, rec.TemplateVMID)
+		snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, rec.TemplateVMID)
 		exec.Command("zfs", "destroy", snapDataset).Run() // best-effort
 		out, err := exec.Command("pct", "destroy", fmt.Sprintf("%d", rec.TemplateVMID), "--force").CombinedOutput()
 		if err != nil {
@@ -888,6 +884,33 @@ func (m *Manager) RootfsPath(id string) string {
 }
 
 // --- helpers ---
+
+// sanitizeHostname converts a string to a valid DNS hostname: lowercase,
+// only letters/digits/hyphens, max 63 chars, no leading/trailing hyphens.
+func sanitizeHostname(s string) string {
+	var b strings.Builder
+	for _, c := range strings.ToLower(s) {
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			b.WriteRune(c)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	h := b.String()
+	// Collapse multiple hyphens.
+	for strings.Contains(h, "--") {
+		h = strings.ReplaceAll(h, "--", "-")
+	}
+	h = strings.Trim(h, "-")
+	if len(h) > 63 {
+		h = h[:63]
+	}
+	h = strings.TrimRight(h, "-")
+	if h == "" {
+		h = "ct"
+	}
+	return h
+}
 
 // allocateVMID requests the next available Proxmox VMID.
 func allocateVMID() (int, error) {

@@ -380,7 +380,7 @@ func deviceNumbers(path string) (int, int) {
 // writePVEConfig writes a Proxmox CT config to /etc/pve/lxc/<vmid>.conf.
 // It uses Proxmox-native syntax for core options and raw lxc.* pass-through
 // for everything else. The rootfsSpec should be like "large:subvol-260-disk-0,size=4G".
-func writePVEConfig(vmid int, hostname, rootfsSpec string, cfg ContainerConfig, ip string) error {
+func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg ContainerConfig, ip string) error {
 	path := fmt.Sprintf("/etc/pve/lxc/%d.conf", vmid)
 
 	var lines []string
@@ -397,21 +397,18 @@ func writePVEConfig(vmid int, hostname, rootfsSpec string, cfg ContainerConfig, 
 	lines = append(lines, fmt.Sprintf("rootfs: %s", rootfsSpec))
 	lines = append(lines, "unprivileged: 0")
 
-	// Network: Proxmox-native net0 for bridge mode.
-	if cfg.NetworkMode != "host" && ip != "" {
-		lines = append(lines, fmt.Sprintf(
-			"net0: name=eth0,bridge=%s,ip=%s/24,gw=%s,type=veth",
-			BridgeName, ip, BridgeGW))
-	}
-
-	// Raw lxc.* pass-through items. Build the same items as for raw LXC
-	// but skip network items (handled by net0 above) and memory/cpu
-	// (handled by Proxmox-native options).
+	// Raw lxc.* pass-through items (including network config).
 	items := buildPVEItems(cfg, ip)
 
-	// Resolve mount destinations against the rootfs.
-	// For PVE containers, rootfs is at /<storage>/subvol-<vmid>-disk-0.
-	// We'll resolve symlinks at start time; just write the entries as-is.
+	// Resolve mount entry destinations against the container rootfs so
+	// symlinks (e.g. /var/run → /run) are followed. LXC rejects mount
+	// entries whose destination traverses symlinks.
+	for i, item := range items {
+		if item.key == "lxc.mount.entry" {
+			items[i].value = resolveMountDest(rootfsPath, item.value)
+		}
+	}
+
 	for _, item := range items {
 		lines = append(lines, fmt.Sprintf("%s: %s", item.key, item.value))
 	}
@@ -420,8 +417,9 @@ func writePVEConfig(vmid int, hostname, rootfsSpec string, cfg ContainerConfig, 
 }
 
 // buildPVEItems returns the lxc.* config items for a Proxmox CT config.
-// It excludes network items (net0 is Proxmox-native) and cgroup memory/cpu
-// items (also Proxmox-native), but includes everything else from buildItems.
+// Uses raw lxc.* directives for all settings including networking, since
+// Proxmox-native net0: doesn't reliably configure interfaces in unmanaged
+// OS-type containers.
 func buildPVEItems(cfg ContainerConfig, ip string) []configItem {
 	var items []configItem
 
@@ -432,9 +430,11 @@ func buildPVEItems(cfg ContainerConfig, ip string) []configItem {
 	// /dev/shm
 	items = append(items, configItem{"lxc.mount.entry", "tmpfs dev/shm tmpfs rw,nosuid,nodev,create=dir 0 0"})
 
-	// Host network mode: share host network namespace.
+	// Network: same raw lxc.net.0.* directives as for ephemeral containers.
 	if cfg.NetworkMode == "host" {
 		items = append(items, configItem{"lxc.namespace.clone", "ipc mnt pid uts"})
+	} else {
+		items = append(items, NetworkConfig(ip)...)
 	}
 
 	// Environment variables.
