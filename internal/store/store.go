@@ -32,6 +32,7 @@ type ContainerRecord struct {
 	IPAddress    string            `json:"ip_address"`
 	PortBindings []PortBinding    `json:"port_bindings,omitempty"`
 	Mounts       []MountSpec      `json:"mounts"`
+	StartedAt    *time.Time        `json:"started_at,omitempty"` // nil until first start; distinguishes "created" from "exited"
 }
 
 // PortBinding records a single host→container port mapping.

@@ -73,6 +73,41 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, resp)
 }
 
+// --- network stubs (Wolf queries networks when creating containers) ---
+
+func (h *Handler) listNetworks(w http.ResponseWriter, r *http.Request) {
+	jsonResponse(w, http.StatusOK, []any{})
+}
+
+func (h *Handler) inspectNetwork(w http.ResponseWriter, r *http.Request) {
+	errResponse(w, http.StatusNotFound, "network not found")
+}
+
+func (h *Handler) createNetwork(w http.ResponseWriter, r *http.Request) {
+	jsonResponse(w, http.StatusCreated, map[string]string{"Id": "stub"})
+}
+
+func (h *Handler) connectNetwork(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) disconnectNetwork(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}
+
+// events implements GET /events. It holds the connection open as a streaming
+// endpoint. Wolf uses this to monitor container lifecycle events. We don't
+// emit real events yet — the handler simply blocks until the client disconnects.
+func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	// Block until the client closes the connection.
+	<-r.Context().Done()
+}
+
 // --- helpers ---
 
 const apiVersion = "1.43"
@@ -101,4 +136,21 @@ func unameRelease(u unix.Utsname) string {
 func hostname() string {
 	h, _ := os.Hostname()
 	return h
+}
+
+// statusRecorder wraps http.ResponseWriter to capture the status code.
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.code = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }

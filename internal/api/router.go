@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log"
 	"net/http"
 	"time"
 
@@ -47,6 +48,14 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/_ping", h.ping).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/version", h.version).Methods(http.MethodGet)
 		sub.HandleFunc("/info", h.info).Methods(http.MethodGet)
+		sub.HandleFunc("/events", h.events).Methods(http.MethodGet)
+
+		// Networks (stub)
+		sub.HandleFunc("/networks", h.listNetworks).Methods(http.MethodGet)
+		sub.HandleFunc("/networks/{id}", h.inspectNetwork).Methods(http.MethodGet)
+		sub.HandleFunc("/networks/create", h.createNetwork).Methods(http.MethodPost)
+		sub.HandleFunc("/networks/{id}/connect", h.connectNetwork).Methods(http.MethodPost)
+		sub.HandleFunc("/networks/{id}/disconnect", h.disconnectNetwork).Methods(http.MethodPost)
 
 		// Containers
 		sub.HandleFunc("/containers/json", h.listContainers).Methods(http.MethodGet)
@@ -76,6 +85,21 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/exec/{id}/start", h.execStart).Methods(http.MethodPost)
 		sub.HandleFunc("/exec/{id}/json", h.execInspect).Methods(http.MethodGet)
 	}
+
+	// Log all requests for debugging.
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			log.Printf("API: %s %s", req.Method, req.URL.Path)
+			rw := &statusRecorder{ResponseWriter: w, code: 200}
+			next.ServeHTTP(rw, req)
+			log.Printf("API: %s %s → %d", req.Method, req.URL.Path, rw.code)
+		})
+	})
+	// Catch-all for unmatched routes so we log 404s with the path.
+	r.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		log.Printf("API: 404 not found: %s %s", req.Method, req.URL.Path)
+		errResponse(w, http.StatusNotFound, "404 page not found")
+	})
 
 	return r
 }

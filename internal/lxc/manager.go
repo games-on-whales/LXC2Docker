@@ -4,6 +4,7 @@
 package lxc
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -75,8 +76,15 @@ func (m *Manager) PullImage(ref, arch string, progress func(string)) error {
 		return err
 	}
 
-	// If the template container already exists, nothing to do.
+	// If the template container already exists, nothing to do — but restore
+	// the store record if it was lost (e.g. state.json was cleared).
 	if m.containerExists(resolved.TemplateContainerName) {
+		if m.store.GetImage(resolved.Ref) == nil {
+			rec := m.restoreImageRecord(resolved)
+			if err := m.store.AddImage(rec); err != nil {
+				log.Printf("PullImage: warning: could not restore store record for %s: %v", resolved.Ref, err)
+			}
+		}
 		progress("Image already present")
 		return nil
 	}
@@ -260,6 +268,22 @@ lxc.uts.name = %s
 	// Clean up the OCI layout/bundle now that rootfs is in place.
 	oci.Cleanup(ociStoreDir, r.Ref)
 
+	// Write a metadata sidecar so we can restore the store record if
+	// state.json is ever lost (e.g. daemon state directory cleared).
+	if data, err := json.Marshal(store.ImageRecord{
+		ID:            "oci_" + oci.SafeDirName(r.Ref),
+		Ref:           r.Ref,
+		Arch:          r.Arch,
+		TemplateName:  r.TemplateContainerName,
+		OCIEntrypoint: cfg.Entrypoint,
+		OCICmd:        cfg.Cmd,
+		OCIEnv:        cfg.Env,
+		OCIWorkingDir: cfg.WorkingDir,
+		OCIPorts:      cfg.Ports,
+	}); err == nil {
+		os.WriteFile(filepath.Join(templateDir, "oci-meta.json"), data, 0o644)
+	}
+
 	progress("Image ready")
 	return m.store.AddImage(&store.ImageRecord{
 		ID:            "oci_" + oci.SafeDirName(r.Ref),
@@ -283,24 +307,31 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 		return fmt.Errorf("manager: image %q not found; run pull first", imageRef)
 	}
 
-	// Clone template → new container.
-	tmpl, err := liblxc.NewContainer(rec.TemplateName, m.lxcPath)
+	// Clone template → new container using lxc-copy command instead of the
+	// go-lxc Clone() CGO binding. The CGO call can deadlock the Go runtime
+	// when other liblxc CGO calls are in flight on other goroutines (the C
+	// library acquires internal locks that block all OS threads).
+	log.Printf("CreateContainer: cloning %s → %s", rec.TemplateName, id)
+	out, err := exec.Command("lxc-copy",
+		"-n", rec.TemplateName,
+		"-N", id,
+		"--lxcpath", m.lxcPath,
+		"--newpath", m.lxcPath,
+	).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: open template %s: %w", rec.TemplateName, err)
+		return fmt.Errorf("manager: clone %s → %s: %s: %w", rec.TemplateName, id, out, err)
 	}
-	if err := tmpl.Clone(id, liblxc.CloneOptions{
-		Backend:  liblxc.Directory,
-		Snapshot: false,
-	}); err != nil {
-		return fmt.Errorf("manager: clone %s → %s: %w", rec.TemplateName, id, err)
-	}
+	log.Printf("CreateContainer: clone complete for %s", id)
 
-	// Allocate IP and configure networking + rest of config.
-	// If anything below fails, destroy the cloned container to avoid orphans.
-	ip, err := m.store.AllocateIP()
-	if err != nil {
-		m.destroyOrphan(id)
-		return fmt.Errorf("manager: allocate IP: %w", err)
+	// Allocate IP for bridge networking. Host-network containers share the
+	// host network namespace and don't get a bridge IP.
+	var ip string
+	if cfg.NetworkMode != "host" {
+		ip, err = m.store.AllocateIP()
+		if err != nil {
+			m.destroyOrphan(id)
+			return fmt.Errorf("manager: allocate IP: %w", err)
+		}
 	}
 
 	// Set console log path.
@@ -317,11 +348,27 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 		return fmt.Errorf("manager: rewrite config: %w", err)
 	}
 
+	// Ensure runtime directories referenced by environment variables exist
+	// in the rootfs. Docker images often rely on XDG_RUNTIME_DIR existing
+	// but don't create it at build time. Wolf, for example, expects
+	// /run/user/wolf to exist for its API server Unix socket.
+	rootfs := filepath.Join(m.lxcPath, id, "rootfs")
+	for _, e := range cfg.Env {
+		if strings.HasPrefix(e, "XDG_RUNTIME_DIR=") {
+			dir := strings.TrimPrefix(e, "XDG_RUNTIME_DIR=")
+			if dir != "" {
+				runtimeDir := filepath.Join(rootfs, dir)
+				if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
+					log.Printf("CreateContainer: warning: mkdir XDG_RUNTIME_DIR %s: %v", runtimeDir, err)
+				}
+			}
+		}
+	}
+
 	// Ensure the container has working DNS resolution by writing resolv.conf
 	// into the rootfs before first start. Ubuntu uses a symlink to
 	// systemd-resolved which won't exist in the container, so remove any
 	// existing symlink first.
-	rootfs := filepath.Join(m.lxcPath, id, "rootfs")
 	resolvPath := filepath.Join(rootfs, "etc", "resolv.conf")
 	os.Remove(resolvPath) // remove symlink or stale file; ignore error
 	if err := os.MkdirAll(filepath.Dir(resolvPath), 0o755); err != nil {
@@ -340,40 +387,43 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 }
 
 // StartContainer starts a stopped container.
+// Uses lxc-start command instead of go-lxc CGO binding to avoid thread contention.
 func (m *Manager) StartContainer(id string) error {
-	c, err := m.openContainer(id)
-	if err != nil {
-		return err
-	}
-	if c.State() == liblxc.RUNNING {
+	state, _ := m.State(id)
+	if state == "running" {
 		return nil
 	}
-	if err := c.Start(); err != nil {
-		return fmt.Errorf("manager: start %s: %w", id, err)
-	}
-	return waitRunning(c, 30*time.Second)
-}
-
-// StopContainer stops a running container gracefully, waiting up to timeout.
-func (m *Manager) StopContainer(id string, timeout time.Duration) error {
-	c, err := m.openContainer(id)
+	log.Printf("StartContainer: starting %s", id)
+	out, err := exec.Command("lxc-start", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
 	if err != nil {
-		return err
+		return fmt.Errorf("manager: start %s: %s: %w", id, out, err)
 	}
-	if c.State() == liblxc.STOPPED {
-		return nil
-	}
-	if err := c.Stop(); err != nil {
-		return fmt.Errorf("manager: stop %s: %w", id, err)
-	}
-	deadline := time.Now().Add(timeout)
+	// Wait for the container to reach RUNNING state.
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		if c.State() == liblxc.STOPPED {
+		state, _ := m.State(id)
+		if state == "running" {
+			log.Printf("StartContainer: %s is running", id)
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("manager: container %s did not stop within %s", id, timeout)
+	return fmt.Errorf("manager: container %s did not reach RUNNING within 30s", id)
+}
+
+// StopContainer stops a running container gracefully, waiting up to timeout.
+// Uses lxc-stop command instead of go-lxc CGO binding to avoid thread contention.
+func (m *Manager) StopContainer(id string, timeout time.Duration) error {
+	state, _ := m.State(id)
+	if state != "running" {
+		return nil
+	}
+	out, err := exec.Command("lxc-stop", "-n", id, "--lxcpath", m.lxcPath,
+		"-t", fmt.Sprintf("%d", int(timeout.Seconds()))).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("manager: stop %s: %s: %w", id, out, err)
+	}
+	return nil
 }
 
 // KillContainer sends a signal to the container's init process. For SIGKILL
@@ -393,34 +443,33 @@ func (m *Manager) KillContainer(id, signal string) error {
 		return nil
 	}
 
-	// For other signals, send directly to the container's init PID.
-	c, err := m.openContainer(id)
+	// For other signals, get the init PID via lxc-info (avoids CGO) and
+	// send the signal directly.
+	pidOut, err := exec.Command("lxc-info", "-n", id, "--lxcpath", m.lxcPath, "-pH").Output()
 	if err != nil {
-		return err
+		return fmt.Errorf("manager: kill %s: cannot get init pid: %w", id, err)
 	}
-	pid := c.InitPid()
-	if pid < 1 {
+	pidStr := strings.TrimSpace(string(pidOut))
+	if pidStr == "" || pidStr == "-1" {
 		return fmt.Errorf("manager: kill %s: container not running (no init pid)", id)
 	}
-	out, err := exec.Command("kill", fmt.Sprintf("-%s", signal), fmt.Sprintf("%d", pid)).
-		CombinedOutput()
+	killOut, err := exec.Command("kill", fmt.Sprintf("-%s", signal), pidStr).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: kill %s (pid %d, signal %s): %s: %w", id, pid, signal, out, err)
+		return fmt.Errorf("manager: kill %s (pid %s, signal %s): %s: %w", id, pidStr, signal, killOut, err)
 	}
 	return nil
 }
 
 // RemoveContainer destroys a container and removes it from the store.
+// Uses lxc-destroy command instead of go-lxc CGO binding.
 func (m *Manager) RemoveContainer(id string) error {
-	c, err := m.openContainer(id)
-	if err != nil {
-		return err
-	}
-	if c.State() == liblxc.RUNNING {
+	state, _ := m.State(id)
+	if state == "running" {
 		return fmt.Errorf("manager: cannot remove running container %s; stop it first", id)
 	}
-	if err := c.Destroy(); err != nil {
-		return fmt.Errorf("manager: destroy %s: %w", id, err)
+	out, err := exec.Command("lxc-destroy", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("manager: destroy %s: %s: %w", id, out, err)
 	}
 	return m.store.RemoveContainer(id)
 }
@@ -432,24 +481,31 @@ func (m *Manager) RemoveImage(ref string) error {
 		return fmt.Errorf("manager: image %q not found", ref)
 	}
 	if m.containerExists(rec.TemplateName) {
-		tmpl, err := liblxc.NewContainer(rec.TemplateName, m.lxcPath)
+		out, err := exec.Command("lxc-destroy", "-n", rec.TemplateName, "--lxcpath", m.lxcPath).CombinedOutput()
 		if err != nil {
-			return err
-		}
-		if err := tmpl.Destroy(); err != nil {
-			return fmt.Errorf("manager: destroy template %s: %w", rec.TemplateName, err)
+			return fmt.Errorf("manager: destroy template %s: %s: %w", rec.TemplateName, out, err)
 		}
 	}
 	return m.store.RemoveImage(ref)
 }
 
-// State returns the LXC state string for a container ("running", "stopped", etc.).
+// State returns the Docker-compatible state string for a container.
+// Uses lxc-info command instead of go-lxc CGO binding to avoid thread contention.
+// Maps LXC states to Docker equivalents: RUNNING→"running", STOPPED→"exited".
 func (m *Manager) State(id string) (string, error) {
-	c, err := m.openContainer(id)
+	out, err := exec.Command("lxc-info", "-n", id, "--lxcpath", m.lxcPath, "-sH").Output()
 	if err != nil {
-		return "", err
+		return "exited", nil
 	}
-	return strings.ToLower(c.State().String()), nil
+	lxcState := strings.ToLower(strings.TrimSpace(string(out)))
+	switch lxcState {
+	case "running":
+		return "running", nil
+	case "stopped":
+		return "exited", nil
+	default:
+		return lxcState, nil
+	}
 }
 
 // Exec runs cmd inside the container using lxc-attach. It returns an
@@ -479,26 +535,15 @@ func (m *Manager) RootfsPath(id string) string {
 
 // destroyOrphan removes a cloned container that failed during CreateContainer.
 func (m *Manager) destroyOrphan(id string) {
-	if c, err := liblxc.NewContainer(id, m.lxcPath); err == nil {
-		c.Destroy()
-	}
-}
-
-func (m *Manager) openContainer(id string) (*liblxc.Container, error) {
-	c, err := liblxc.NewContainer(id, m.lxcPath)
-	if err != nil {
-		return nil, fmt.Errorf("manager: open container %s: %w", id, err)
-	}
-	return c, nil
+	exec.Command("lxc-destroy", "-n", id, "--lxcpath", m.lxcPath).Run()
 }
 
 func (m *Manager) containerExists(name string) bool {
-	for _, n := range liblxc.ContainerNames(m.lxcPath) {
-		if n == name {
-			return true
-		}
-	}
-	return false
+	// Check the filesystem directly instead of using the go-lxc CGO binding
+	// (liblxc.ContainerNames) to avoid contributing to CGO thread contention.
+	configPath := filepath.Join(m.lxcPath, name, "config")
+	_, err := os.Stat(configPath)
+	return err == nil
 }
 
 func waitRunning(c *liblxc.Container, timeout time.Duration) error {
@@ -539,4 +584,39 @@ func buildInstallCmd(distro string, packages []string) string {
 
 func imageID(distro, release string) string {
 	return distro + "_" + release
+}
+
+// restoreImageRecord reconstructs a store.ImageRecord for a template that
+// exists on disk but whose store entry was lost. For OCI images it reads the
+// oci-meta.json sidecar written at pull time; for distro/app images it
+// reconstructs from the resolved image metadata.
+func (m *Manager) restoreImageRecord(resolved *image.ResolvedImage) *store.ImageRecord {
+	if resolved.Kind == image.KindOCI {
+		// Try sidecar file first.
+		sidecar := filepath.Join(m.lxcPath, resolved.TemplateContainerName, "oci-meta.json")
+		if data, err := os.ReadFile(sidecar); err == nil {
+			var rec store.ImageRecord
+			if json.Unmarshal(data, &rec) == nil {
+				rec.Created = time.Now()
+				return &rec
+			}
+		}
+		// Fallback: minimal record without OCI metadata.
+		return &store.ImageRecord{
+			ID:           "oci_" + oci.SafeDirName(resolved.Ref),
+			Ref:          resolved.Ref,
+			Arch:         resolved.Arch,
+			TemplateName: resolved.TemplateContainerName,
+			Created:      time.Now(),
+		}
+	}
+	return &store.ImageRecord{
+		ID:           imageID(resolved.Distro, resolved.Release),
+		Ref:          resolved.Ref,
+		Distro:       resolved.Distro,
+		Release:      resolved.Release,
+		Arch:         resolved.Arch,
+		TemplateName: resolved.TemplateContainerName,
+		Created:      time.Now(),
+	}
 }

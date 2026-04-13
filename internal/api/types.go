@@ -20,14 +20,15 @@ type ContainerCreateRequest struct {
 
 // HostConfig holds the host-level container options.
 type HostConfig struct {
-	Binds       []string             `json:"Binds"`       // "host:container[:ro]"
-	Devices     []DeviceMapping      `json:"Devices"`
-	Memory      int64                `json:"Memory"`      // bytes, 0=unlimited
-	CPUShares   int64                `json:"CpuShares"`
-	NanoCPUs    int64                `json:"NanoCpus"`
-	NetworkMode string               `json:"NetworkMode"`
-	PortBindings map[string][]PortBinding `json:"PortBindings"`
-	RestartPolicy RestartPolicy      `json:"RestartPolicy"`
+	Binds            []string             `json:"Binds"`       // "host:container[:ro]"
+	Devices          []DeviceMapping      `json:"Devices"`
+	DeviceCgroupRules []string            `json:"DeviceCgroupRules"`
+	Memory           int64                `json:"Memory"`      // bytes, 0=unlimited
+	CPUShares        int64                `json:"CpuShares"`
+	NanoCPUs         int64                `json:"NanoCpus"`
+	NetworkMode      string               `json:"NetworkMode"`
+	PortBindings     map[string][]PortBinding `json:"PortBindings"`
+	RestartPolicy    RestartPolicy        `json:"RestartPolicy"`
 }
 
 // DeviceMapping is a single host→container device mapping.
@@ -59,14 +60,24 @@ type ContainerCreateResponse struct {
 
 // ContainerJSON is the body returned by GET /containers/{id}/json.
 type ContainerJSON struct {
-	ID              string          `json:"Id"`
-	Created         string          `json:"Created"`
-	Name            string          `json:"Name"`
-	State           ContainerState  `json:"State"`
-	Image           string          `json:"Image"`
+	ID              string           `json:"Id"`
+	Created         string           `json:"Created"`
+	Name            string           `json:"Name"`
+	State           ContainerState   `json:"State"`
+	Image           string           `json:"Image"`
 	Config          *ContainerConfig `json:"Config"`
-	HostConfig      *HostConfig     `json:"HostConfig"`
-	NetworkSettings NetworkSettings `json:"NetworkSettings"`
+	HostConfig      *HostConfig      `json:"HostConfig"`
+	Mounts          []MountJSON      `json:"Mounts"`
+	NetworkSettings NetworkSettings  `json:"NetworkSettings"`
+}
+
+// MountJSON represents a mount in the inspect response.
+type MountJSON struct {
+	Type        string `json:"Type"`
+	Source      string `json:"Source"`
+	Destination string `json:"Destination"`
+	Mode        string `json:"Mode"`
+	RW          bool   `json:"RW"`
 }
 
 // ContainerState holds the runtime state of a container.
@@ -84,6 +95,7 @@ type ContainerState struct {
 
 // ContainerConfig is the image-level config embedded in ContainerJSON.
 type ContainerConfig struct {
+	Hostname   string            `json:"Hostname"`
 	Image      string            `json:"Image"`
 	Cmd        []string          `json:"Cmd"`
 	Entrypoint []string          `json:"Entrypoint"`

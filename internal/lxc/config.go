@@ -18,14 +18,16 @@ type configItem struct {
 // translate into LXC config items. This is populated from the Docker API
 // container-create request body.
 type ContainerConfig struct {
-	Entrypoint []string
-	Cmd        []string
-	Env        []string
-	Mounts     []MountSpec  // bind mounts
-	Devices    []DeviceSpec // host devices to expose
-	MemoryBytes int64       // 0 = unlimited
-	CPUShares  int64        // 0 = unlimited (relative weight)
-	CPUQuota   int64        // microseconds per 100ms period, 0 = unlimited
+	Entrypoint        []string
+	Cmd               []string
+	Env               []string
+	Mounts            []MountSpec  // bind mounts
+	Devices           []DeviceSpec // host devices to expose
+	DeviceCgroupRules []string     // e.g. ["c 13:* rwm"]
+	NetworkMode       string       // "host" or "" (bridge)
+	MemoryBytes       int64        // 0 = unlimited
+	CPUShares         int64        // 0 = unlimited (relative weight)
+	CPUQuota          int64        // microseconds per 100ms period, 0 = unlimited
 	// LogFile is where the container console output is written.
 	// Set automatically by the manager.
 	LogFile string
@@ -85,7 +87,21 @@ func rewriteConfig(path string, cfg ContainerConfig, ip, containerName string) e
 
 	items := append([]configItem{
 		{"lxc.apparmor.profile", "unconfined"},
+		// Override common.conf's cgroup:mixed which fails on Proxmox cgroup v2.
+		// An empty value clears the inherited list; then we set what we need.
+		{"lxc.mount.auto", ""},
+		{"lxc.mount.auto", "proc:mixed sys:mixed"},
 	}, buildItems(cfg, ip)...)
+
+	// Resolve mount entry destinations against the container's rootfs so that
+	// any symlinks (e.g. /var/run → /run) are followed. LXC rejects mount
+	// entries whose destination paths traverse symlinks in the rootfs.
+	rootfs := filepath.Join(filepath.Dir(path), "rootfs")
+	for i, item := range items {
+		if item.key == "lxc.mount.entry" {
+			items[i].value = resolveMountDest(rootfs, item.value)
+		}
+	}
 
 	out, err := os.Create(path)
 	if err != nil {
@@ -104,11 +120,54 @@ func rewriteConfig(path string, cfg ContainerConfig, ip, containerName string) e
 	return w.Flush()
 }
 
+// resolveMountDest rewrites the destination field of an lxc.mount.entry so
+// that it does not traverse symlinks in the container rootfs. LXC's
+// open_without_symlink check rejects destinations that go through symlinks
+// (e.g. var/run → /run in modern Ubuntu-based images).
+func resolveMountDest(rootfs, entry string) string {
+	fields := strings.Fields(entry)
+	if len(fields) < 6 {
+		return entry
+	}
+	destRel := fields[1] // relative to rootfs (no leading slash)
+
+	// Walk each path component, following symlinks within the rootfs.
+	parts := strings.Split(filepath.Clean("/"+destRel), "/")
+	current := ""
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		next := filepath.Join(current, part)
+		fullPath := filepath.Join(rootfs, next)
+		if link, err := os.Readlink(fullPath); err == nil {
+			// This component is a symlink — resolve it.
+			if filepath.IsAbs(link) {
+				current = link
+			} else {
+				current = filepath.Join(filepath.Dir(next), link)
+			}
+		} else {
+			current = next
+		}
+	}
+	current = strings.TrimPrefix(current, "/")
+	fields[1] = current
+	return strings.Join(fields, " ")
+}
+
 func buildItems(cfg ContainerConfig, ip string) []configItem {
 	var items []configItem
 
-	// Network
-	items = append(items, NetworkConfig(ip)...)
+	// Network: host mode shares the host network namespace; otherwise bridge.
+	if cfg.NetworkMode == "host" {
+		// Share the host's network namespace by only cloning the other namespaces.
+		// lxc.namespace.clone lists which namespaces to CREATE; omitting net
+		// means the container inherits the host's network namespace.
+		items = append(items, configItem{"lxc.namespace.clone", "ipc mnt pid uts"})
+	} else {
+		items = append(items, NetworkConfig(ip)...)
+	}
 
 	// Environment variables — reject newlines to prevent config injection.
 	for _, e := range cfg.Env {
@@ -126,14 +185,28 @@ func buildItems(cfg ContainerConfig, ip string) []configItem {
 
 	// Bind mounts
 	for _, m := range cfg.Mounts {
-		opts := "bind,create=dir"
+		// Resolve symlinks in the source so LXC gets the real path.
+		// LXC rejects bind-mounting through symlinks (e.g. /var/run → /run).
+		source := m.Source
+		if real, err := filepath.EvalSymlinks(source); err == nil {
+			source = real
+		}
+
+		// Detect whether source is a directory or a file/socket so we use
+		// the correct create= option. LXC will refuse to mount a file onto a
+		// directory placeholder (or vice-versa).
+		createOpt := "create=dir"
+		if fi, err := os.Stat(source); err == nil && !fi.IsDir() {
+			createOpt = "create=file"
+		}
+		opts := "bind," + createOpt
 		if m.ReadOnly {
 			opts += ",ro"
 		}
 		// lxc.mount.entry format:
 		//   <source> <dest-relative-to-rootfs> <fs-type> <options> 0 0
 		dest := strings.TrimPrefix(m.Destination, "/")
-		entry := fmt.Sprintf("%s %s none %s 0 0", m.Source, dest, opts)
+		entry := fmt.Sprintf("%s %s none %s 0 0", source, dest, opts)
 		items = append(items, configItem{"lxc.mount.entry", entry})
 	}
 
@@ -143,16 +216,56 @@ func buildItems(cfg ContainerConfig, ip string) []configItem {
 		if dest == "" {
 			dest = d.PathOnHost
 		}
-		// Allow access in cgroup and bind-mount the device node
-		items = append(items, configItem{
-			"lxc.cgroup2.devices.allow",
-			deviceCgroupEntry(d.PathOnHost),
-		})
 		destRel := strings.TrimPrefix(dest, "/")
-		items = append(items, configItem{
-			"lxc.mount.entry",
-			fmt.Sprintf("%s %s none bind,create=file 0 0", d.PathOnHost, destRel),
-		})
+
+		// Resolve symlinks in the source path.
+		hostPath := d.PathOnHost
+		if real, err := filepath.EvalSymlinks(hostPath); err == nil {
+			hostPath = real
+		}
+
+		// Detect whether the source is a directory or a device node.
+		fi, err := os.Stat(hostPath)
+		isDir := err == nil && fi.IsDir()
+
+		if isDir {
+			// For device directories (e.g. /dev/dri), bind-mount the whole
+			// directory and add cgroup allow rules for each device node inside.
+			items = append(items, configItem{
+				"lxc.mount.entry",
+				fmt.Sprintf("%s %s none bind,create=dir 0 0", hostPath, destRel),
+			})
+			// Scan directory for device nodes and allow each one.
+			if entries, err := os.ReadDir(hostPath); err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() {
+						continue
+					}
+					entryPath := filepath.Join(hostPath, entry.Name())
+					if rule := deviceCgroupEntry(entryPath); rule != "" {
+						items = append(items, configItem{
+							"lxc.cgroup2.devices.allow", rule,
+						})
+					}
+				}
+			}
+		} else {
+			// For individual device nodes, add a precise cgroup allow rule.
+			if rule := deviceCgroupEntry(hostPath); rule != "" {
+				items = append(items, configItem{
+					"lxc.cgroup2.devices.allow", rule,
+				})
+			}
+			items = append(items, configItem{
+				"lxc.mount.entry",
+				fmt.Sprintf("%s %s none bind,create=file 0 0", hostPath, destRel),
+			})
+		}
+	}
+
+	// Device cgroup rules (e.g. "c 13:* rwm")
+	for _, rule := range cfg.DeviceCgroupRules {
+		items = append(items, configItem{"lxc.cgroup2.devices.allow", rule})
 	}
 
 	// Memory limit
@@ -226,11 +339,12 @@ func cpuSharesToWeight(shares int64) int64 {
 }
 
 // deviceCgroupEntry returns a cgroup2 device allow rule for a device path.
+// Returns "" if the path is not a device node (e.g. a regular file or directory).
 // We use "rwm" (read/write/mknod) for all devices passed through.
 func deviceCgroupEntry(path string) string {
 	major, minor := deviceNumbers(path)
-	if major < 0 {
-		return "a *:* rwm" // fallback: allow all (avoid failing silently)
+	if major < 0 || (major == 0 && minor == 0) {
+		return "" // not a device node — skip
 	}
 	return fmt.Sprintf("c %d:%d rwm", major, minor)
 }

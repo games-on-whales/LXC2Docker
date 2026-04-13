@@ -66,8 +66,10 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		if len(cmd) == 0 && len(imgRec.OCICmd) > 0 {
 			cmd = imgRec.OCICmd
 		}
-		if len(env) == 0 && len(imgRec.OCIEnv) > 0 {
-			env = imgRec.OCIEnv
+		// Merge OCI image env with request env. Image vars provide
+		// defaults; request vars override them (matching Docker behavior).
+		if len(imgRec.OCIEnv) > 0 {
+			env = mergeEnv(imgRec.OCIEnv, env)
 		}
 		// App registry defaults (if no OCI config and no user-provided cmd).
 		if len(entrypoint) == 0 && len(cmd) == 0 {
@@ -78,11 +80,13 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := lxc.ContainerConfig{
-		Entrypoint:  entrypoint,
-		Cmd:         cmd,
-		Env:         env,
-		MemoryBytes: req.HostConfig.Memory,
-		CPUShares:   req.HostConfig.CPUShares,
+		Entrypoint:        entrypoint,
+		Cmd:               cmd,
+		Env:               env,
+		DeviceCgroupRules: req.HostConfig.DeviceCgroupRules,
+		NetworkMode:       req.HostConfig.NetworkMode,
+		MemoryBytes:       req.HostConfig.Memory,
+		CPUShares:         req.HostConfig.CPUShares,
 	}
 
 	// Parse bind mounts ("host:container[:ro]")
@@ -155,11 +159,14 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("createContainer: creating LXC container %s (image=%s)", id[:12], req.Image)
 	if err := h.mgr.CreateContainer(id, normalizeImageRef(req.Image), cfg); err != nil {
+		log.Printf("createContainer: failed: %v", err)
 		h.store.RemoveContainer(id)
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	log.Printf("createContainer: success %s", id[:12])
 
 	jsonResponse(w, http.StatusCreated, ContainerCreateResponse{
 		ID:       id,
@@ -175,6 +182,9 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 	out := make([]ContainerSummary, 0, len(records))
 	for _, rec := range records {
 		state, _ := h.mgr.State(rec.ID)
+		if state == "exited" && rec.StartedAt == nil {
+			state = "created"
+		}
 		if !all && state != "running" {
 			continue
 		}
@@ -220,6 +230,33 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 	state, _ := h.mgr.State(id)
 	running := state == "running"
 
+	// A container that was never started should report "created", not "exited".
+	// Docker uses "created" for containers that exist but have never been started.
+	if state == "exited" && rec.StartedAt == nil {
+		state = "created"
+	}
+
+	startedAt := rec.Created.Format(time.RFC3339)
+	if rec.StartedAt != nil {
+		startedAt = rec.StartedAt.Format(time.RFC3339)
+	}
+
+	// Build Mounts array from stored mount specs.
+	mounts := make([]MountJSON, 0, len(rec.Mounts))
+	for _, m := range rec.Mounts {
+		mode := "rw"
+		if m.ReadOnly {
+			mode = "ro"
+		}
+		mounts = append(mounts, MountJSON{
+			Type:        "bind",
+			Source:      m.Source,
+			Destination: m.Destination,
+			Mode:        mode,
+			RW:          !m.ReadOnly,
+		})
+	}
+
 	resp := ContainerJSON{
 		ID:      rec.ID,
 		Created: rec.Created.Format(time.RFC3339),
@@ -227,11 +264,13 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		State: ContainerState{
 			Status:     state,
 			Running:    running,
-			StartedAt:  rec.Created.Format(time.RFC3339),
+			StartedAt:  startedAt,
 			FinishedAt: "0001-01-01T00:00:00Z",
 		},
-		Image: rec.Image,
+		Image:  rec.Image,
+		Mounts: mounts,
 		Config: &ContainerConfig{
+			Hostname:   rec.ID[:12],
 			Image:      rec.Image,
 			Cmd:        rec.Cmd,
 			Entrypoint: rec.Entrypoint,
@@ -263,6 +302,13 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 	if err := h.mgr.StartContainer(id); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+
+	// Record first-start timestamp so inspect can distinguish "created" from "exited".
+	if rec := h.store.GetContainer(id); rec != nil && rec.StartedAt == nil {
+		now := time.Now()
+		rec.StartedAt = &now
+		h.store.AddContainer(rec)
 	}
 
 	// Set up port forwarding rules after successful start.
@@ -719,7 +765,9 @@ func stateToStatus(state string, created time.Time) string {
 	switch state {
 	case "running":
 		return "Up " + humanDuration(time.Since(created))
-	case "stopped":
+	case "created":
+		return "Created"
+	case "exited":
 		return "Exited (0) " + humanDuration(time.Since(created)) + " ago"
 	default:
 		return state
@@ -764,4 +812,28 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 		hc.Binds = append(hc.Binds, bind)
 	}
 	return hc
+}
+
+// mergeEnv merges image-level env vars with request-level env vars.
+// Request vars override image vars with the same key (KEY=value format).
+func mergeEnv(imageEnv, requestEnv []string) []string {
+	m := make(map[string]string, len(imageEnv)+len(requestEnv))
+	order := make([]string, 0, len(imageEnv)+len(requestEnv))
+	for _, e := range imageEnv {
+		key, _, _ := strings.Cut(e, "=")
+		m[key] = e
+		order = append(order, key)
+	}
+	for _, e := range requestEnv {
+		key, _, _ := strings.Cut(e, "=")
+		if _, exists := m[key]; !exists {
+			order = append(order, key)
+		}
+		m[key] = e
+	}
+	result := make([]string, 0, len(order))
+	for _, key := range order {
+		result = append(result, m[key])
+	}
+	return result
 }
