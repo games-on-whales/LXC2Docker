@@ -19,10 +19,19 @@ import (
 	liblxc "github.com/lxc/go-lxc"
 )
 
+// LANConfig holds daemon-level LAN bridge settings for dual-NIC containers.
+type LANConfig struct {
+	Bridge  string // physical bridge name (e.g. "vmbr0"); empty = disabled
+	Prefix  string // IP prefix (e.g. "192.168.1"); VMID becomes last octet
+	Gateway string // LAN gateway (e.g. "192.168.1.1")
+	Subnet  int    // prefix length (e.g. 23 for /23)
+}
+
 // Manager owns all LXC operations on behalf of the daemon.
 type Manager struct {
 	lxcPath    string // e.g. /var/lib/lxc (legacy mode)
 	pveStorage string // Proxmox storage name (e.g. "large"); empty = legacy mode
+	lan        LANConfig
 	store      *store.Store
 }
 
@@ -33,16 +42,20 @@ func (m *Manager) UsePVE() bool { return m.pveStorage != "" }
 // If pveStorage is non-empty, containers are created as Proxmox CTs on
 // the named storage (e.g. "large" ZFS pool) and are visible in the
 // Proxmox web UI. Otherwise, raw lxc-* commands are used (legacy mode).
-func NewManager(lxcPath, pveStorage string, st *store.Store) (*Manager, error) {
+func NewManager(lxcPath, pveStorage string, lan LANConfig, st *store.Store) (*Manager, error) {
 	if err := os.MkdirAll(lxcPath, 0o755); err != nil {
 		return nil, fmt.Errorf("manager: mkdir %s: %w", lxcPath, err)
 	}
 	if err := EnsureBridge(); err != nil {
 		return nil, fmt.Errorf("manager: bridge: %w", err)
 	}
-	m := &Manager{lxcPath: lxcPath, pveStorage: pveStorage, store: st}
+	m := &Manager{lxcPath: lxcPath, pveStorage: pveStorage, lan: lan, store: st}
 	if pveStorage != "" {
 		log.Printf("Proxmox CT mode enabled (storage=%s)", pveStorage)
+	}
+	if lan.Bridge != "" {
+		log.Printf("LAN bridge enabled (bridge=%s, prefix=%s, gateway=%s, /%d)",
+			lan.Bridge, lan.Prefix, lan.Gateway, lan.Subnet)
 	}
 	m.reconcile()
 	return m, nil
@@ -390,6 +403,14 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 		return fmt.Errorf("manager: %w", err)
 	}
 
+	// Fill in LAN config from daemon settings before any networking setup.
+	if cfg.LAN && m.lan.Bridge != "" {
+		cfg.LANBridge = m.lan.Bridge
+		cfg.LANIP = fmt.Sprintf("%s.%d/%d", m.lan.Prefix, vmid, m.lan.Subnet)
+		cfg.LANGateway = m.lan.Gateway
+		log.Printf("CreateContainer[PVE]: LAN NIC on %s with IP %s", cfg.LANBridge, cfg.LANIP)
+	}
+
 	log.Printf("CreateContainer[PVE]: pct clone %d → VMID %d for %s", imgRec.TemplateVMID, vmid, id[:12])
 	out, err := exec.Command("pct", "clone",
 		fmt.Sprintf("%d", imgRec.TemplateVMID),
@@ -401,7 +422,7 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 		return fmt.Errorf("manager: pct clone %d → %d: %s: %w", imgRec.TemplateVMID, vmid, out, err)
 	}
 
-	// Allocate IP for bridge networking.
+	// Allocate IP for bridge networking (internal gow0).
 	var ip string
 	if cfg.NetworkMode != "host" {
 		ip, err = m.store.AllocateIP()

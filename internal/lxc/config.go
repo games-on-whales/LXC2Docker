@@ -37,6 +37,14 @@ type ContainerConfig struct {
 	// the container is created as an ephemeral raw-LXC container with a
 	// ZFS-cloned rootfs — invisible to Proxmox but still on the PVE storage.
 	ProxmoxCT bool
+	// LAN requests a second NIC on the physical LAN bridge (e.g. vmbr0).
+	// Only effective for Proxmox CTs — the LAN IP is derived from the VMID.
+	LAN bool
+	// LANBridge, LANIP, LANGateway are filled in by the manager (not the API
+	// layer) when LAN is true and the daemon has --lan-bridge configured.
+	LANBridge  string // e.g. "vmbr0"
+	LANIP      string // e.g. "192.168.1.106/23"
+	LANGateway string // e.g. "192.168.1.1"
 }
 
 // MountSpec describes a single bind mount.
@@ -169,8 +177,15 @@ func buildItems(cfg ContainerConfig, ip string) []configItem {
 	// by most graphical apps (Wayland/wlroots), IPC, and many libraries.
 	items = append(items, configItem{"lxc.mount.entry", "tmpfs dev/shm tmpfs rw,nosuid,nodev,create=dir 0 0"})
 
-	// Network: host mode shares the host network namespace; otherwise bridge.
-	if cfg.NetworkMode == "host" {
+	// Network configuration.
+	if cfg.LANBridge != "" {
+		// Dual-NIC: internal bridge (gow0, no gateway) + LAN bridge (default route).
+		// Used instead of host networking for containers that need LAN access
+		// (e.g. Moonlight mDNS discovery) but run as Proxmox CTs where
+		// lxc.namespace.clone is silently stripped.
+		items = append(items, InternalNetworkConfig(ip)...)
+		items = append(items, LANNetworkConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway)...)
+	} else if cfg.NetworkMode == "host" {
 		// Share the host's network namespace by only cloning the other namespaces.
 		// lxc.namespace.clone lists which namespaces to CREATE; omitting net
 		// means the container inherits the host's network namespace.
@@ -430,8 +445,12 @@ func buildPVEItems(cfg ContainerConfig, ip string) []configItem {
 	// /dev/shm
 	items = append(items, configItem{"lxc.mount.entry", "tmpfs dev/shm tmpfs rw,nosuid,nodev,create=dir 0 0"})
 
-	// Network: same raw lxc.net.0.* directives as for ephemeral containers.
-	if cfg.NetworkMode == "host" {
+	// Network configuration.
+	if cfg.LANBridge != "" {
+		// Dual-NIC: internal bridge (gow0) + physical LAN bridge.
+		items = append(items, InternalNetworkConfig(ip)...)
+		items = append(items, LANNetworkConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway)...)
+	} else if cfg.NetworkMode == "host" {
 		items = append(items, configItem{"lxc.namespace.clone", "ipc mnt pid uts"})
 	} else {
 		items = append(items, NetworkConfig(ip)...)

@@ -101,6 +101,12 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		MemoryBytes:       req.HostConfig.Memory,
 		CPUShares:         req.HostConfig.CPUShares,
 		ProxmoxCT:         req.Labels["gow.pve"] == "true",
+		LAN:               req.Labels["gow.lan"] == "true",
+	}
+	// LAN bridge replaces host networking: the container gets its own network
+	// namespace with dual NICs (internal + LAN) instead of sharing the host's.
+	if cfg.LAN && cfg.NetworkMode == "host" {
+		cfg.NetworkMode = ""
 	}
 
 	// Parse bind mounts ("host:container[:ro]")

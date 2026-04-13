@@ -22,6 +22,10 @@ func main() {
 	lxcPath := flag.String("lxcpath", "/var/lib/lxc", "LXC container storage path (legacy direct-LXC mode)")
 	pveStorage := flag.String("pve-storage", "", "Proxmox storage name for CT rootfs (e.g. 'large'); enables Proxmox CT mode")
 	statePath := flag.String("statepath", "/var/lib/docker-lxc-daemon", "Daemon state directory")
+	lanBridge := flag.String("lan-bridge", "", "Physical LAN bridge for dual-NIC containers (e.g. 'vmbr0')")
+	lanPrefix := flag.String("lan-prefix", "", "LAN IP prefix; VMID becomes last octet (e.g. '192.168.1')")
+	lanGateway := flag.String("lan-gateway", "", "LAN gateway (e.g. '192.168.1.1')")
+	lanSubnet := flag.Int("lan-subnet", 24, "LAN subnet prefix length (e.g. 23 for /23)")
 	flag.Parse()
 
 	if os.Geteuid() != 0 {
@@ -33,7 +37,13 @@ func main() {
 		log.Fatalf("store: %v", err)
 	}
 
-	mgr, err := lxc.NewManager(*lxcPath, *pveStorage, st)
+	lan := lxc.LANConfig{
+		Bridge:  *lanBridge,
+		Prefix:  *lanPrefix,
+		Gateway: *lanGateway,
+		Subnet:  *lanSubnet,
+	}
+	mgr, err := lxc.NewManager(*lxcPath, *pveStorage, lan, st)
 	if err != nil {
 		log.Fatalf("manager: %v", err)
 	}
