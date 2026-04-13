@@ -20,15 +20,16 @@ type ContainerCreateRequest struct {
 
 // HostConfig holds the host-level container options.
 type HostConfig struct {
-	Binds            []string             `json:"Binds"`       // "host:container[:ro]"
-	Devices          []DeviceMapping      `json:"Devices"`
-	DeviceCgroupRules []string            `json:"DeviceCgroupRules"`
-	Memory           int64                `json:"Memory"`      // bytes, 0=unlimited
-	CPUShares        int64                `json:"CpuShares"`
-	NanoCPUs         int64                `json:"NanoCpus"`
-	NetworkMode      string               `json:"NetworkMode"`
-	PortBindings     map[string][]PortBinding `json:"PortBindings"`
-	RestartPolicy    RestartPolicy        `json:"RestartPolicy"`
+	Binds             []string                 `json:"Binds"` // "host:container[:ro]"
+	Devices           []DeviceMapping          `json:"Devices"`
+	DeviceCgroupRules []string                 `json:"DeviceCgroupRules"`
+	Memory            int64                    `json:"Memory"` // bytes, 0=unlimited
+	CPUShares         int64                    `json:"CpuShares"`
+	NanoCPUs          int64                    `json:"NanoCpus"`
+	NetworkMode       string                   `json:"NetworkMode"`
+	IpcMode           string                   `json:"IpcMode"` // "host" or "" (private)
+	PortBindings      map[string][]PortBinding `json:"PortBindings"`
+	RestartPolicy     RestartPolicy            `json:"RestartPolicy"`
 }
 
 // DeviceMapping is a single host→container device mapping.
@@ -82,7 +83,7 @@ type MountJSON struct {
 
 // ContainerState holds the runtime state of a container.
 type ContainerState struct {
-	Status     string `json:"Status"`   // "running", "exited", "created"
+	Status     string `json:"Status"` // "running", "exited", "created"
 	Running    bool   `json:"Running"`
 	Paused     bool   `json:"Paused"`
 	Restarting bool   `json:"Restarting"`
@@ -106,16 +107,16 @@ type ContainerConfig struct {
 
 // NetworkSettings holds the IP and network info for a container.
 type NetworkSettings struct {
-	IPAddress string                     `json:"IPAddress"`
+	IPAddress string                      `json:"IPAddress"`
 	Networks  map[string]EndpointSettings `json:"Networks"`
 }
 
 // EndpointSettings is a per-network settings block.
 type EndpointSettings struct {
-	IPAddress   string `json:"IPAddress"`
-	Gateway     string `json:"Gateway"`
-	MacAddress  string `json:"MacAddress"`
-	NetworkID   string `json:"NetworkID"`
+	IPAddress  string `json:"IPAddress"`
+	Gateway    string `json:"Gateway"`
+	MacAddress string `json:"MacAddress"`
+	NetworkID  string `json:"NetworkID"`
 }
 
 // --- Container List ---
@@ -191,10 +192,10 @@ type ExecStartRequest struct {
 
 // ExecInspect is the body returned by GET /exec/{id}/json.
 type ExecInspect struct {
-	ID          string `json:"ID"`
-	ContainerID string `json:"ContainerID"`
-	Running     bool   `json:"Running"`
-	ExitCode    int    `json:"ExitCode"`
+	ID            string            `json:"ID"`
+	ContainerID   string            `json:"ContainerID"`
+	Running       bool              `json:"Running"`
+	ExitCode      int               `json:"ExitCode"`
 	ProcessConfig ExecProcessConfig `json:"ProcessConfig"`
 }
 
@@ -222,22 +223,22 @@ type VersionResponse struct {
 
 // InfoResponse is a trimmed body for GET /info.
 type InfoResponse struct {
-	ID                 string `json:"ID"`
-	Containers         int    `json:"Containers"`
-	ContainersRunning  int    `json:"ContainersRunning"`
-	ContainersStopped  int    `json:"ContainersStopped"`
-	Images             int    `json:"Images"`
-	Driver             string `json:"Driver"`
-	MemoryLimit        bool   `json:"MemoryLimit"`
-	SwapLimit          bool   `json:"SwapLimit"`
-	KernelVersion      string `json:"KernelVersion"`
-	OperatingSystem    string `json:"OperatingSystem"`
-	OSType             string `json:"OSType"`
-	Architecture       string `json:"Architecture"`
-	NCPU               int    `json:"NCPU"`
-	MemTotal           int64  `json:"MemTotal"`
-	DockerRootDir      string `json:"DockerRootDir"`
-	ServerVersion      string `json:"ServerVersion"`
+	ID                string `json:"ID"`
+	Containers        int    `json:"Containers"`
+	ContainersRunning int    `json:"ContainersRunning"`
+	ContainersStopped int    `json:"ContainersStopped"`
+	Images            int    `json:"Images"`
+	Driver            string `json:"Driver"`
+	MemoryLimit       bool   `json:"MemoryLimit"`
+	SwapLimit         bool   `json:"SwapLimit"`
+	KernelVersion     string `json:"KernelVersion"`
+	OperatingSystem   string `json:"OperatingSystem"`
+	OSType            string `json:"OSType"`
+	Architecture      string `json:"Architecture"`
+	NCPU              int    `json:"NCPU"`
+	MemTotal          int64  `json:"MemTotal"`
+	DockerRootDir     string `json:"DockerRootDir"`
+	ServerVersion     string `json:"ServerVersion"`
 }
 
 // ErrorResponse is the standard Docker API error body.

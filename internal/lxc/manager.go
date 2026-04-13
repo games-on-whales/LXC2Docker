@@ -4,6 +4,7 @@
 package lxc
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -82,6 +83,105 @@ func (m *Manager) reconcile() {
 			}
 			log.Printf("reconcile: container %s (%s) still running, port forwards restored",
 				rec.Name, rec.ID[:12])
+		}
+	}
+}
+
+// StartGC launches a background goroutine that periodically removes stopped
+// ephemeral containers. Compose-managed services (those with Docker Compose
+// labels) and Proxmox CTs (VMID > 0) are left alone. This handles the common
+// case where Wolf sessions end abnormally (e.g. daemon restart) and child
+// containers (PulseAudio, Steam, Wolf-UI) are left behind.
+func (m *Manager) StartGC(ctx context.Context) {
+	go func() {
+		// Run immediately on startup to clean leftovers, then periodically.
+		m.gc()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m.gc()
+			}
+		}
+	}()
+}
+
+func (m *Manager) gc() {
+	// Separate ephemeral containers into stopped (remove immediately) and
+	// running (check for orphans).
+	var stopped []*store.ContainerRecord
+	var runningSession []*store.ContainerRecord // Wolf-UI, WolfSteam, etc.
+	var runningSupport []*store.ContainerRecord // WolfPulseAudio, etc.
+
+	for _, rec := range m.store.ListContainers() {
+		// Never touch Proxmox CTs or compose-managed services.
+		if rec.VMID > 0 {
+			continue
+		}
+		if rec.Labels != nil {
+			if _, ok := rec.Labels["com.docker.compose.service"]; ok {
+				continue
+			}
+		}
+
+		state, _ := m.State(rec.ID)
+		if state == "exited" {
+			stopped = append(stopped, rec)
+		} else if state == "running" {
+			// Session containers have unique per-session names (Wolf-UI_<id>,
+			// WolfSteam_<id>). Support containers are generic (WolfPulseAudio).
+			if strings.Contains(rec.Name, "_") {
+				runningSession = append(runningSession, rec)
+			} else {
+				runningSupport = append(runningSupport, rec)
+			}
+		}
+	}
+
+	// Remove all stopped ephemeral containers.
+	for _, rec := range stopped {
+		log.Printf("GC: removing stopped container %s (%s)", rec.Name, rec.ID[:12])
+		if rec.IPAddress != "" {
+			RemovePortForwards(rec.IPAddress)
+		}
+		if err := m.RemoveContainer(rec.ID); err != nil {
+			log.Printf("GC: failed to remove %s: %v", rec.ID[:12], err)
+		}
+	}
+
+	// Orphan detection: if there are support containers (PulseAudio) but
+	// no session containers AND no running Proxmox CTs, the support
+	// containers are orphans from sessions that ended abnormally.
+	// PVE CTs (like Wolf) spawn support containers (PulseAudio) via the
+	// Docker API — we must not kill them while the CT is still running.
+	if len(runningSession) == 0 && len(runningSupport) > 0 {
+		pveCTRunning := false
+		for _, rec := range m.store.ListContainers() {
+			if rec.VMID > 0 {
+				if st, _ := m.State(rec.ID); st == "running" {
+					pveCTRunning = true
+					break
+				}
+			}
+		}
+		if !pveCTRunning {
+			for _, rec := range runningSupport {
+				log.Printf("GC: stopping orphaned container %s (%s, image=%s)",
+					rec.Name, rec.ID[:12], rec.Image)
+				if err := m.StopContainer(rec.ID, 5*time.Second); err != nil {
+					log.Printf("GC: failed to stop %s: %v", rec.ID[:12], err)
+					continue
+				}
+				if rec.IPAddress != "" {
+					RemovePortForwards(rec.IPAddress)
+				}
+				if err := m.RemoveContainer(rec.ID); err != nil {
+					log.Printf("GC: failed to remove %s: %v", rec.ID[:12], err)
+				}
+			}
 		}
 	}
 }

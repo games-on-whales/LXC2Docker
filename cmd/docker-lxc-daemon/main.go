@@ -86,6 +86,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	// Start background GC that removes stopped ephemeral containers.
+	mgr.StartGC(ctx)
+
 	go func() {
 		<-ctx.Done()
 		log.Println("shutting down")

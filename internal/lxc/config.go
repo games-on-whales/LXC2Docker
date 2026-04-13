@@ -25,6 +25,7 @@ type ContainerConfig struct {
 	Devices           []DeviceSpec // host devices to expose
 	DeviceCgroupRules []string     // e.g. ["c 13:* rwm"]
 	NetworkMode       string       // "host" or "" (bridge)
+	IpcMode           string       // "host" or "" (private)
 	MemoryBytes       int64        // 0 = unlimited
 	CPUShares         int64        // 0 = unlimited (relative weight)
 	CPUQuota          int64        // microseconds per 100ms period, 0 = unlimited
@@ -227,18 +228,26 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 
 	// Network configuration.
 	if cfg.LANBridge != "" {
-		// Dual-NIC: LAN bridge as net.0 (primary — mDNS advertises this IP)
-		// and internal gow0 as net.1. This replaces host networking for
-		// containers that need LAN access but run as Proxmox CTs where
-		// lxc.namespace.clone is silently stripped.
 		items = append(items, DualNICConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway, ip)...)
 	} else if cfg.NetworkMode == "host" {
-		// Share the host's network namespace by only cloning the other namespaces.
-		// lxc.namespace.clone lists which namespaces to CREATE; omitting net
-		// means the container inherits the host's network namespace.
-		items = append(items, configItem{"lxc.namespace.clone", "ipc mnt pid uts"})
+		// Handled below via lxc.namespace.clone.
 	} else {
 		items = append(items, NetworkConfig(ip)...)
+	}
+
+	// Namespace sharing: lxc.namespace.clone lists which namespaces to
+	// CREATE (clone). Omitting a namespace means the container shares the
+	// host's instance. We only set this when at least one namespace should
+	// be shared (Docker's NetworkMode:"host" or IpcMode:"host").
+	if cfg.NetworkMode == "host" || cfg.IpcMode == "host" {
+		ns := []string{"mnt", "pid", "uts"}
+		if cfg.NetworkMode != "host" {
+			ns = append(ns, "net")
+		}
+		if cfg.IpcMode != "host" {
+			ns = append(ns, "ipc")
+		}
+		items = append(items, configItem{"lxc.namespace.clone", strings.Join(ns, " ")})
 	}
 
 	// Environment variables — reject newlines to prevent config injection.
@@ -356,6 +365,11 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	for _, rule := range cfg.DeviceCgroupRules {
 		items = append(items, configItem{"lxc.cgroup2.devices.allow", rule})
 	}
+	// Auto-mount host device directories for wildcard cgroup rules. In
+	// Docker, cgroup rules + MKNOD cap are sufficient because containers
+	// share the host's devtmpfs (or Docker creates device nodes). In LXC
+	// the device files must physically exist in the container's /dev.
+	items = append(items, autoMountDeviceDirs(cfg.DeviceCgroupRules)...)
 
 	// Memory limit
 	if cfg.MemoryBytes > 0 {
@@ -434,6 +448,12 @@ func cpuSharesToWeight(shares int64) int64 {
 // the socket inside the directory mount is recorded in cfg.SocketLinks
 // for prepareRootfs to create.
 func appendSocketMount(items []configItem, cfg *ContainerConfig, source string, m MountSpec) []configItem {
+	// Ensure the socket is world-accessible. In Docker, all containers share
+	// the host UID namespace so file permissions on sockets are moot. In LXC
+	// each container has its own view, so we must explicitly allow all UIDs
+	// to connect() to shared sockets (e.g. Wayland, PulseAudio).
+	os.Chmod(source, 0o777)
+
 	parentDir := filepath.Dir(source)
 	socketName := filepath.Base(source)
 
@@ -441,10 +461,21 @@ func appendSocketMount(items []configItem, cfg *ContainerConfig, source string, 
 	// Use a path derived from the parent dir name to avoid collisions.
 	dirName := filepath.Base(parentDir)
 	mountDest := ".socket-dirs/" + dirName
-	escapedParent := strings.ReplaceAll(parentDir, " ", `\040`)
+
+	// Only add the directory mount entry once per parent directory.
+	alreadyMounted := false
 	escapedDest := strings.ReplaceAll(mountDest, " ", `\040`)
-	entry := fmt.Sprintf("%s %s none bind,create=dir 0 0", escapedParent, escapedDest)
-	items = append(items, configItem{"lxc.mount.entry", entry})
+	for _, item := range items {
+		if item.key == "lxc.mount.entry" && strings.Contains(item.value, " "+escapedDest+" ") {
+			alreadyMounted = true
+			break
+		}
+	}
+	if !alreadyMounted {
+		escapedParent := strings.ReplaceAll(parentDir, " ", `\040`)
+		entry := fmt.Sprintf("%s %s none bind,create=dir 0 0", escapedParent, escapedDest)
+		items = append(items, configItem{"lxc.mount.entry", entry})
+	}
 
 	// Record symlink for prepareRootfs: destination → socket in mounted dir.
 	if cfg.SocketLinks == nil {
@@ -452,6 +483,56 @@ func appendSocketMount(items []configItem, cfg *ContainerConfig, source string, 
 	}
 	cfg.SocketLinks[m.Destination] = "/" + mountDest + "/" + socketName
 
+	return items
+}
+
+// autoMountDeviceDirs inspects wildcard cgroup rules (like "c 13:* rwm") and
+// bind-mounts the corresponding host device directories so device nodes are
+// visible inside the container. In Docker, cgroup rules + MKNOD cap suffice
+// because Docker populates /dev from the host; LXC containers have their own
+// /dev from the rootfs, so the files must be explicitly mounted.
+func autoMountDeviceDirs(rules []string) []configItem {
+	// Map well-known device major numbers to host directories.
+	majorDirMap := map[string]string{
+		"13": "/dev/input", // evdev input devices (keyboard, mouse, gamepad)
+	}
+
+	var items []configItem
+	mounted := make(map[string]bool)
+	for _, rule := range rules {
+		fields := strings.Fields(rule) // e.g. ["c", "13:*", "rwm"]
+		if len(fields) < 2 {
+			continue
+		}
+		majMin := strings.SplitN(fields[1], ":", 2)
+		if len(majMin) != 2 || majMin[1] != "*" {
+			continue
+		}
+		dir, ok := majorDirMap[majMin[0]]
+		if !ok || mounted[dir] {
+			continue
+		}
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			continue
+		}
+		mounted[dir] = true
+		destRel := strings.TrimPrefix(dir, "/")
+		items = append(items, configItem{
+			"lxc.mount.entry",
+			fmt.Sprintf("%s %s none bind,create=dir 0 0", dir, destRel),
+		})
+		// Add per-device cgroup rules for each node in the directory.
+		if entries, err := os.ReadDir(dir); err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				if rule := deviceCgroupEntry(filepath.Join(dir, entry.Name())); rule != "" {
+					items = append(items, configItem{"lxc.cgroup2.devices.allow", rule})
+				}
+			}
+		}
+	}
 	return items
 }
 
@@ -531,12 +612,23 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 
 	// Network configuration.
 	if cfg.LANBridge != "" {
-		// Dual-NIC: LAN bridge as net.0 (primary) + internal gow0 as net.1.
 		items = append(items, DualNICConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway, ip)...)
 	} else if cfg.NetworkMode == "host" {
-		items = append(items, configItem{"lxc.namespace.clone", "ipc mnt pid uts"})
+		// Handled below via lxc.namespace.clone.
 	} else {
 		items = append(items, NetworkConfig(ip)...)
+	}
+
+	// Namespace sharing (see buildItems for explanation).
+	if cfg.NetworkMode == "host" || cfg.IpcMode == "host" {
+		ns := []string{"mnt", "pid", "uts"}
+		if cfg.NetworkMode != "host" {
+			ns = append(ns, "net")
+		}
+		if cfg.IpcMode != "host" {
+			ns = append(ns, "ipc")
+		}
+		items = append(items, configItem{"lxc.namespace.clone", strings.Join(ns, " ")})
 	}
 
 	// Environment variables.
@@ -628,6 +720,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	for _, rule := range cfg.DeviceCgroupRules {
 		items = append(items, configItem{"lxc.cgroup2.devices.allow", rule})
 	}
+	items = append(items, autoMountDeviceDirs(cfg.DeviceCgroupRules)...)
 
 	// CPU (memory handled by Proxmox-native "memory:" line).
 	if cfg.CPUShares > 0 {

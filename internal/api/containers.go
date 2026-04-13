@@ -98,6 +98,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		WorkingDir:        workingDir,
 		DeviceCgroupRules: req.HostConfig.DeviceCgroupRules,
 		NetworkMode:       req.HostConfig.NetworkMode,
+		IpcMode:           req.HostConfig.IpcMode,
 		MemoryBytes:       req.HostConfig.Memory,
 		CPUShares:         req.HostConfig.CPUShares,
 		ProxmoxCT:         req.Labels["gow.pve"] == "true",
@@ -133,15 +134,15 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 
 	// Persist record before creating so the IP is allocated.
 	rec := &store.ContainerRecord{
-		ID:      id,
-		Name:    name,
-		Image:   req.Image,
-		ImageID: normalizeImageRef(req.Image),
-		Created: time.Now(),
+		ID:         id,
+		Name:       name,
+		Image:      req.Image,
+		ImageID:    normalizeImageRef(req.Image),
+		Created:    time.Now(),
 		Entrypoint: entrypoint,
-		Cmd:     cmd,
-		Env:     env,
-		Labels:  req.Labels,
+		Cmd:        cmd,
+		Env:        env,
+		Labels:     req.Labels,
 	}
 	for _, m := range cfg.Mounts {
 		rec.Mounts = append(rec.Mounts, store.MountSpec{
@@ -302,9 +303,9 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			IPAddress: rec.IPAddress,
 			Networks: map[string]EndpointSettings{
 				"gow": {
-					IPAddress:  rec.IPAddress,
-					Gateway:    lxc.BridgeGW,
-					NetworkID:  "gow",
+					IPAddress: rec.IPAddress,
+					Gateway:   lxc.BridgeGW,
+					NetworkID: "gow",
 				},
 			},
 		},
