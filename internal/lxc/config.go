@@ -110,7 +110,24 @@ func rewriteConfig(path string, cfg ContainerConfig, ip, containerName string) e
 	// Resolve mount entry destinations against the container's rootfs so that
 	// any symlinks (e.g. /var/run → /run) are followed. LXC rejects mount
 	// entries whose destination paths traverse symlinks in the rootfs.
+	// Parse the actual rootfs path from the config (lxc.rootfs.path = dir:/path)
+	// rather than assuming config_dir/rootfs — ephemeral ZFS clones use a
+	// separate mountpoint.
 	rootfs := filepath.Join(filepath.Dir(path), "rootfs")
+	for _, line := range kept {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "lxc.rootfs.path") {
+			parts := strings.SplitN(trimmed, "=", 2)
+			if len(parts) == 2 {
+				val := strings.TrimSpace(parts[1])
+				// Strip "dir:" prefix if present.
+				val = strings.TrimPrefix(val, "dir:")
+				if val != "" {
+					rootfs = val
+				}
+			}
+		}
+	}
 	for i, item := range items {
 		if item.key == "lxc.mount.entry" {
 			items[i].value = resolveMountDest(rootfs, item.value)
