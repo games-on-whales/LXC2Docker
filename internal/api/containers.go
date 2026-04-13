@@ -35,6 +35,10 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if reqJSON, err := json.Marshal(req); err == nil {
+		log.Printf("createContainer: request body: %s", reqJSON)
+	}
+
 	if req.Image == "" {
 		errResponse(w, http.StatusBadRequest, "Image is required")
 		return
@@ -79,14 +83,24 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Working directory: request overrides image default.
+	workingDir := req.WorkingDir
+	if workingDir == "" {
+		if imgRec := h.store.GetImage(normalizeImageRef(req.Image)); imgRec != nil {
+			workingDir = imgRec.OCIWorkingDir
+		}
+	}
+
 	cfg := lxc.ContainerConfig{
 		Entrypoint:        entrypoint,
 		Cmd:               cmd,
 		Env:               env,
+		WorkingDir:        workingDir,
 		DeviceCgroupRules: req.HostConfig.DeviceCgroupRules,
 		NetworkMode:       req.HostConfig.NetworkMode,
 		MemoryBytes:       req.HostConfig.Memory,
 		CPUShares:         req.HostConfig.CPUShares,
+		ProxmoxCT:         req.Labels["gow.pve"] == "true",
 	}
 
 	// Parse bind mounts ("host:container[:ro]")

@@ -20,7 +20,8 @@ const defaultPath = "/var/lib/docker-lxc-daemon"
 
 // ContainerRecord holds Docker-layer metadata for a single container.
 type ContainerRecord struct {
-	ID         string            `json:"id"`          // LXC container name, doubles as Docker short ID
+	ID         string            `json:"id"`          // Docker hex ID (API-facing)
+	VMID       int               `json:"vmid"`        // Proxmox CT VMID (0 = legacy direct LXC)
 	Name       string            `json:"name"`        // Docker-style name (no leading slash)
 	Image      string            `json:"image"`       // Original image:tag as requested
 	ImageID    string            `json:"image_id"`    // Resolved image identifier
@@ -49,15 +50,16 @@ type MountSpec struct {
 	ReadOnly    bool   `json:"read_only"`
 }
 
-// ImageRecord holds metadata for a pulled image (backed by an LXC template
-// container named __template_<ID>).
+// ImageRecord holds metadata for a pulled image (backed by a Proxmox CT
+// template on ZFS, or a legacy LXC template container).
 type ImageRecord struct {
 	ID           string    `json:"id"`            // e.g. "ubuntu_22.04"
 	Ref          string    `json:"ref"`           // original "ubuntu:22.04"
 	Distro       string    `json:"distro"`        // "ubuntu"
 	Release      string    `json:"release"`       // "jammy"
 	Arch         string    `json:"arch"`          // "amd64"
-	TemplateName string    `json:"template_name"` // LXC container used as clone source
+	TemplateName string    `json:"template_name"` // LXC container used as clone source (legacy)
+	TemplateVMID int       `json:"template_vmid"` // Proxmox CT VMID of the template (0 = legacy)
 	Created      time.Time `json:"created"`
 	// OCI image metadata (populated only for OCI-pulled images).
 	OCIEntrypoint []string `json:"oci_entrypoint,omitempty"`

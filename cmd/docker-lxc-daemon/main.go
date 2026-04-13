@@ -19,7 +19,8 @@ import (
 
 func main() {
 	socketPath := flag.String("socket", "/var/run/docker.sock", "Unix socket path to listen on")
-	lxcPath := flag.String("lxcpath", "/var/lib/lxc", "LXC container storage path")
+	lxcPath := flag.String("lxcpath", "/var/lib/lxc", "LXC container storage path (legacy direct-LXC mode)")
+	pveStorage := flag.String("pve-storage", "", "Proxmox storage name for CT rootfs (e.g. 'large'); enables Proxmox CT mode")
 	statePath := flag.String("statepath", "/var/lib/docker-lxc-daemon", "Daemon state directory")
 	flag.Parse()
 
@@ -32,7 +33,7 @@ func main() {
 		log.Fatalf("store: %v", err)
 	}
 
-	mgr, err := lxc.NewManager(*lxcPath, st)
+	mgr, err := lxc.NewManager(*lxcPath, *pveStorage, st)
 	if err != nil {
 		log.Fatalf("manager: %v", err)
 	}

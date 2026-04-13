@@ -28,9 +28,15 @@ type ContainerConfig struct {
 	MemoryBytes       int64        // 0 = unlimited
 	CPUShares         int64        // 0 = unlimited (relative weight)
 	CPUQuota          int64        // microseconds per 100ms period, 0 = unlimited
+	WorkingDir        string       // container cwd; maps to lxc.init.cwd
 	// LogFile is where the container console output is written.
 	// Set automatically by the manager.
 	LogFile string
+	// ProxmoxCT requests that this container be created as a Proxmox CT
+	// (visible in the Proxmox web UI). When false and PVE mode is active,
+	// the container is created as an ephemeral raw-LXC container with a
+	// ZFS-cloned rootfs — invisible to Proxmox but still on the PVE storage.
+	ProxmoxCT bool
 }
 
 // MountSpec describes a single bind mount.
@@ -159,6 +165,10 @@ func resolveMountDest(rootfs, entry string) string {
 func buildItems(cfg ContainerConfig, ip string) []configItem {
 	var items []configItem
 
+	// Docker-compatible default mounts: /dev/shm (shared memory) is required
+	// by most graphical apps (Wayland/wlroots), IPC, and many libraries.
+	items = append(items, configItem{"lxc.mount.entry", "tmpfs dev/shm tmpfs rw,nosuid,nodev,create=dir 0 0"})
+
 	// Network: host mode shares the host network namespace; otherwise bridge.
 	if cfg.NetworkMode == "host" {
 		// Share the host's network namespace by only cloning the other namespaces.
@@ -183,6 +193,11 @@ func buildItems(cfg ContainerConfig, ip string) []configItem {
 		items = append(items, configItem{"lxc.init.cmd", combined})
 	}
 
+	// Working directory: maps to lxc.init.cwd (Docker's WorkingDir / OCI WORKDIR).
+	if cfg.WorkingDir != "" {
+		items = append(items, configItem{"lxc.init.cwd", cfg.WorkingDir})
+	}
+
 	// Bind mounts
 	for _, m := range cfg.Mounts {
 		// Resolve symlinks in the source so LXC gets the real path.
@@ -203,10 +218,13 @@ func buildItems(cfg ContainerConfig, ip string) []configItem {
 		if m.ReadOnly {
 			opts += ",ro"
 		}
-		// lxc.mount.entry format:
+		// lxc.mount.entry format (fstab-style, space-delimited):
 		//   <source> <dest-relative-to-rootfs> <fs-type> <options> 0 0
+		// Spaces in paths must be escaped as \040 (octal, like /etc/fstab).
 		dest := strings.TrimPrefix(m.Destination, "/")
-		entry := fmt.Sprintf("%s %s none %s 0 0", source, dest, opts)
+		escapedSource := strings.ReplaceAll(source, " ", `\040`)
+		escapedDest := strings.ReplaceAll(dest, " ", `\040`)
+		entry := fmt.Sprintf("%s %s none %s 0 0", escapedSource, escapedDest, opts)
 		items = append(items, configItem{"lxc.mount.entry", entry})
 	}
 
@@ -357,6 +375,171 @@ func deviceNumbers(path string) (int, int) {
 		return -1, -1
 	}
 	return int(stat.major), int(stat.minor)
+}
+
+// writePVEConfig writes a Proxmox CT config to /etc/pve/lxc/<vmid>.conf.
+// It uses Proxmox-native syntax for core options and raw lxc.* pass-through
+// for everything else. The rootfsSpec should be like "large:subvol-260-disk-0,size=4G".
+func writePVEConfig(vmid int, hostname, rootfsSpec string, cfg ContainerConfig, ip string) error {
+	path := fmt.Sprintf("/etc/pve/lxc/%d.conf", vmid)
+
+	var lines []string
+	lines = append(lines, "arch: amd64")
+	if hostname != "" {
+		lines = append(lines, fmt.Sprintf("hostname: %s", hostname))
+	}
+	if cfg.MemoryBytes > 0 {
+		lines = append(lines, fmt.Sprintf("memory: %d", cfg.MemoryBytes/(1024*1024)))
+	} else {
+		lines = append(lines, "memory: 4096")
+	}
+	lines = append(lines, "ostype: unmanaged")
+	lines = append(lines, fmt.Sprintf("rootfs: %s", rootfsSpec))
+	lines = append(lines, "unprivileged: 0")
+
+	// Network: Proxmox-native net0 for bridge mode.
+	if cfg.NetworkMode != "host" && ip != "" {
+		lines = append(lines, fmt.Sprintf(
+			"net0: name=eth0,bridge=%s,ip=%s/24,gw=%s,type=veth",
+			BridgeName, ip, BridgeGW))
+	}
+
+	// Raw lxc.* pass-through items. Build the same items as for raw LXC
+	// but skip network items (handled by net0 above) and memory/cpu
+	// (handled by Proxmox-native options).
+	items := buildPVEItems(cfg, ip)
+
+	// Resolve mount destinations against the rootfs.
+	// For PVE containers, rootfs is at /<storage>/subvol-<vmid>-disk-0.
+	// We'll resolve symlinks at start time; just write the entries as-is.
+	for _, item := range items {
+		lines = append(lines, fmt.Sprintf("%s: %s", item.key, item.value))
+	}
+
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+}
+
+// buildPVEItems returns the lxc.* config items for a Proxmox CT config.
+// It excludes network items (net0 is Proxmox-native) and cgroup memory/cpu
+// items (also Proxmox-native), but includes everything else from buildItems.
+func buildPVEItems(cfg ContainerConfig, ip string) []configItem {
+	var items []configItem
+
+	items = append(items, configItem{"lxc.apparmor.profile", "unconfined"})
+	items = append(items, configItem{"lxc.mount.auto", ""})
+	items = append(items, configItem{"lxc.mount.auto", "proc:mixed sys:mixed"})
+
+	// /dev/shm
+	items = append(items, configItem{"lxc.mount.entry", "tmpfs dev/shm tmpfs rw,nosuid,nodev,create=dir 0 0"})
+
+	// Host network mode: share host network namespace.
+	if cfg.NetworkMode == "host" {
+		items = append(items, configItem{"lxc.namespace.clone", "ipc mnt pid uts"})
+	}
+
+	// Environment variables.
+	for _, e := range cfg.Env {
+		if strings.ContainsAny(e, "\n\r") {
+			continue
+		}
+		items = append(items, configItem{"lxc.environment", e})
+	}
+
+	// Init command.
+	if combined := combinedCmd(cfg.Entrypoint, cfg.Cmd); combined != "" {
+		items = append(items, configItem{"lxc.init.cmd", combined})
+	}
+
+	// Working directory.
+	if cfg.WorkingDir != "" {
+		items = append(items, configItem{"lxc.init.cwd", cfg.WorkingDir})
+	}
+
+	// Bind mounts — use raw lxc.mount.entry (works in Proxmox configs).
+	for _, m := range cfg.Mounts {
+		source := m.Source
+		if real, err := filepath.EvalSymlinks(source); err == nil {
+			source = real
+		}
+		createOpt := "create=dir"
+		if fi, err := os.Stat(source); err == nil && !fi.IsDir() {
+			createOpt = "create=file"
+		}
+		opts := "bind," + createOpt
+		if m.ReadOnly {
+			opts += ",ro"
+		}
+		dest := strings.TrimPrefix(m.Destination, "/")
+		escapedSource := strings.ReplaceAll(source, " ", `\040`)
+		escapedDest := strings.ReplaceAll(dest, " ", `\040`)
+		entry := fmt.Sprintf("%s %s none %s 0 0", escapedSource, escapedDest, opts)
+		items = append(items, configItem{"lxc.mount.entry", entry})
+	}
+
+	// Devices.
+	for _, d := range cfg.Devices {
+		dest := d.PathInContainer
+		if dest == "" {
+			dest = d.PathOnHost
+		}
+		destRel := strings.TrimPrefix(dest, "/")
+		hostPath := d.PathOnHost
+		if real, err := filepath.EvalSymlinks(hostPath); err == nil {
+			hostPath = real
+		}
+		fi, err := os.Stat(hostPath)
+		isDir := err == nil && fi.IsDir()
+		if isDir {
+			items = append(items, configItem{
+				"lxc.mount.entry",
+				fmt.Sprintf("%s %s none bind,create=dir 0 0", hostPath, destRel),
+			})
+			if entries, err := os.ReadDir(hostPath); err == nil {
+				for _, entry := range entries {
+					if entry.IsDir() {
+						continue
+					}
+					if rule := deviceCgroupEntry(filepath.Join(hostPath, entry.Name())); rule != "" {
+						items = append(items, configItem{"lxc.cgroup2.devices.allow", rule})
+					}
+				}
+			}
+		} else {
+			if rule := deviceCgroupEntry(hostPath); rule != "" {
+				items = append(items, configItem{"lxc.cgroup2.devices.allow", rule})
+			}
+			items = append(items, configItem{
+				"lxc.mount.entry",
+				fmt.Sprintf("%s %s none bind,create=file 0 0", hostPath, destRel),
+			})
+		}
+	}
+
+	// Device cgroup rules.
+	for _, rule := range cfg.DeviceCgroupRules {
+		items = append(items, configItem{"lxc.cgroup2.devices.allow", rule})
+	}
+
+	// CPU (memory handled by Proxmox-native "memory:" line).
+	if cfg.CPUShares > 0 {
+		items = append(items, configItem{
+			"lxc.cgroup2.cpu.weight",
+			fmt.Sprintf("%d", cpuSharesToWeight(cfg.CPUShares)),
+		})
+	}
+	if cfg.CPUQuota > 0 {
+		items = append(items, configItem{
+			"lxc.cgroup2.cpu.max",
+			fmt.Sprintf("%d 100000", cfg.CPUQuota),
+		})
+	}
+
+	// Console log.
+	if cfg.LogFile != "" {
+		items = append(items, configItem{"lxc.console.logfile", cfg.LogFile})
+	}
+
+	return items
 }
 
 // LogFilePath returns the canonical console log file path for a container.

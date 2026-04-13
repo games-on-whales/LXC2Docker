@@ -21,22 +21,29 @@ import (
 
 // Manager owns all LXC operations on behalf of the daemon.
 type Manager struct {
-	lxcPath string // e.g. /var/lib/lxc
-	store   *store.Store
+	lxcPath    string // e.g. /var/lib/lxc (legacy mode)
+	pveStorage string // Proxmox storage name (e.g. "large"); empty = legacy mode
+	store      *store.Store
 }
 
+// UsePVE returns true when Proxmox CT mode is active.
+func (m *Manager) UsePVE() bool { return m.pveStorage != "" }
+
 // NewManager creates a Manager that stores containers under lxcPath.
-// It ensures the network bridge exists and reconciles state from the
-// store with actual LXC container state (e.g. re-applying port forwards
-// for containers that are still running after a daemon restart).
-func NewManager(lxcPath string, st *store.Store) (*Manager, error) {
+// If pveStorage is non-empty, containers are created as Proxmox CTs on
+// the named storage (e.g. "large" ZFS pool) and are visible in the
+// Proxmox web UI. Otherwise, raw lxc-* commands are used (legacy mode).
+func NewManager(lxcPath, pveStorage string, st *store.Store) (*Manager, error) {
 	if err := os.MkdirAll(lxcPath, 0o755); err != nil {
 		return nil, fmt.Errorf("manager: mkdir %s: %w", lxcPath, err)
 	}
 	if err := EnsureBridge(); err != nil {
 		return nil, fmt.Errorf("manager: bridge: %w", err)
 	}
-	m := &Manager{lxcPath: lxcPath, store: st}
+	m := &Manager{lxcPath: lxcPath, pveStorage: pveStorage, store: st}
+	if pveStorage != "" {
+		log.Printf("Proxmox CT mode enabled (storage=%s)", pveStorage)
+	}
 	m.reconcile()
 	return m, nil
 }
@@ -221,7 +228,8 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 }
 
 // pullOCI pulls an arbitrary OCI/Docker image via skopeo + umoci, unpacks it
-// to a rootfs, and creates an LXC template container from it.
+// to a rootfs, and creates a template from it. In PVE mode the template is a
+// Proxmox CT on the configured storage; otherwise a direct LXC template.
 func (m *Manager) pullOCI(r *image.ResolvedImage, progress func(string)) error {
 	ociStoreDir := filepath.Join(filepath.Dir(m.lxcPath), "docker-lxc-daemon", "oci")
 
@@ -230,58 +238,117 @@ func (m *Manager) pullOCI(r *image.ResolvedImage, progress func(string)) error {
 		return fmt.Errorf("manager: oci pull: %w", err)
 	}
 
-	// Create the LXC template container directory and move the rootfs into it.
-	progress("Creating LXC template from OCI rootfs")
-	templateDir := filepath.Join(m.lxcPath, r.TemplateContainerName)
-	templateRootfs := filepath.Join(templateDir, "rootfs")
-	if err := os.MkdirAll(templateDir, 0o755); err != nil {
-		return fmt.Errorf("manager: mkdir template: %w", err)
-	}
+	var templateVMID int
 
-	// Move the unpacked rootfs into the LXC container directory.
-	if err := os.Rename(rootfsPath, templateRootfs); err != nil {
-		// Rename fails across filesystems; fall back to copy.
-		out, cpErr := exec.Command("cp", "-a", rootfsPath, templateRootfs).CombinedOutput()
-		if cpErr != nil {
-			return fmt.Errorf("manager: copy rootfs: %s: %w", out, cpErr)
+	if m.UsePVE() {
+		// --- Proxmox CT mode ---
+		// Create a tarball from the rootfs, then use pct create to make a
+		// Proxmox CT template on the configured storage (ZFS).
+		progress("Creating Proxmox CT template from OCI rootfs")
+
+		tarball := filepath.Join(os.TempDir(), "oci-template-"+oci.SafeDirName(r.Ref)+".tar.gz")
+		defer os.Remove(tarball)
+
+		out, err := exec.Command("tar", "czf", tarball, "-C", rootfsPath, ".").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("manager: create tarball: %s: %w", out, err)
 		}
-	}
 
-	// Write a minimal LXC config for the template.
-	minimalConfig := fmt.Sprintf(`lxc.include = /usr/share/lxc/config/common.conf
+		vmid, err := allocateVMID()
+		if err != nil {
+			return err
+		}
+		templateVMID = vmid
+
+		hostname := "tmpl-" + oci.SafeDirName(r.Ref)
+		if len(hostname) > 63 {
+			hostname = hostname[:63]
+		}
+
+		out, err = exec.Command("pct", "create", fmt.Sprintf("%d", vmid), tarball,
+			"--storage", m.pveStorage,
+			"--ostype", "unmanaged",
+			"--arch", "amd64",
+			"--hostname", hostname,
+			"--unprivileged", "0",
+			"--rootfs", fmt.Sprintf("%s:4", m.pveStorage),
+		).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("manager: pct create template %d: %s: %w", vmid, out, err)
+		}
+
+		// Mark it as a template so it can't be accidentally started.
+		exec.Command("pct", "template", fmt.Sprintf("%d", vmid)).Run()
+
+		// Create a ZFS snapshot for instant ephemeral container cloning.
+		// Ephemeral containers (not Proxmox CTs) clone from this snapshot
+		// so they stay off the Proxmox UI while still using PVE storage.
+		snapDataset := fmt.Sprintf("%s/subvol-%d-disk-0@tmpl", m.pveStorage, vmid)
+		if snapOut, snapErr := exec.Command("zfs", "snapshot", snapDataset).CombinedOutput(); snapErr != nil {
+			log.Printf("pullOCI: warning: could not create ZFS snapshot %s: %s: %v", snapDataset, snapOut, snapErr)
+		} else {
+			log.Printf("pullOCI: created ZFS snapshot %s for ephemeral cloning", snapDataset)
+		}
+
+		// Write resolv.conf into the template rootfs.
+		templateRootfs := m.pveRootfsPath(vmid)
+		resolvPath := filepath.Join(templateRootfs, "etc", "resolv.conf")
+		os.Remove(resolvPath)
+		os.MkdirAll(filepath.Dir(resolvPath), 0o755)
+		os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644)
+
+		// Clean up the OCI working directory.
+		os.RemoveAll(rootfsPath)
+		oci.Cleanup(ociStoreDir, r.Ref)
+
+		log.Printf("pullOCI: created Proxmox template VMID %d for %s", vmid, r.Ref)
+	} else {
+		// --- Legacy direct-LXC mode ---
+		progress("Creating LXC template from OCI rootfs")
+		templateDir := filepath.Join(m.lxcPath, r.TemplateContainerName)
+		templateRootfs := filepath.Join(templateDir, "rootfs")
+		if err := os.MkdirAll(templateDir, 0o755); err != nil {
+			return fmt.Errorf("manager: mkdir template: %w", err)
+		}
+
+		if err := os.Rename(rootfsPath, templateRootfs); err != nil {
+			out, cpErr := exec.Command("cp", "-a", rootfsPath, templateRootfs).CombinedOutput()
+			if cpErr != nil {
+				return fmt.Errorf("manager: copy rootfs: %s: %w", out, cpErr)
+			}
+		}
+
+		minimalConfig := fmt.Sprintf(`lxc.include = /usr/share/lxc/config/common.conf
 lxc.arch = linux64
 lxc.rootfs.path = dir:%s
 lxc.uts.name = %s
 `, templateRootfs, r.TemplateContainerName)
 
-	configPath := filepath.Join(templateDir, "config")
-	if err := os.WriteFile(configPath, []byte(minimalConfig), 0o644); err != nil {
-		return fmt.Errorf("manager: write template config: %w", err)
-	}
+		configPath := filepath.Join(templateDir, "config")
+		if err := os.WriteFile(configPath, []byte(minimalConfig), 0o644); err != nil {
+			return fmt.Errorf("manager: write template config: %w", err)
+		}
 
-	// Write resolv.conf into rootfs.
-	resolvPath := filepath.Join(templateRootfs, "etc", "resolv.conf")
-	os.Remove(resolvPath)
-	os.MkdirAll(filepath.Dir(resolvPath), 0o755)
-	os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644)
+		resolvPath := filepath.Join(templateRootfs, "etc", "resolv.conf")
+		os.Remove(resolvPath)
+		os.MkdirAll(filepath.Dir(resolvPath), 0o755)
+		os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644)
 
-	// Clean up the OCI layout/bundle now that rootfs is in place.
-	oci.Cleanup(ociStoreDir, r.Ref)
+		oci.Cleanup(ociStoreDir, r.Ref)
 
-	// Write a metadata sidecar so we can restore the store record if
-	// state.json is ever lost (e.g. daemon state directory cleared).
-	if data, err := json.Marshal(store.ImageRecord{
-		ID:            "oci_" + oci.SafeDirName(r.Ref),
-		Ref:           r.Ref,
-		Arch:          r.Arch,
-		TemplateName:  r.TemplateContainerName,
-		OCIEntrypoint: cfg.Entrypoint,
-		OCICmd:        cfg.Cmd,
-		OCIEnv:        cfg.Env,
-		OCIWorkingDir: cfg.WorkingDir,
-		OCIPorts:      cfg.Ports,
-	}); err == nil {
-		os.WriteFile(filepath.Join(templateDir, "oci-meta.json"), data, 0o644)
+		if data, err := json.Marshal(store.ImageRecord{
+			ID:            "oci_" + oci.SafeDirName(r.Ref),
+			Ref:           r.Ref,
+			Arch:          r.Arch,
+			TemplateName:  r.TemplateContainerName,
+			OCIEntrypoint: cfg.Entrypoint,
+			OCICmd:        cfg.Cmd,
+			OCIEnv:        cfg.Env,
+			OCIWorkingDir: cfg.WorkingDir,
+			OCIPorts:      cfg.Ports,
+		}); err == nil {
+			os.WriteFile(filepath.Join(templateDir, "oci-meta.json"), data, 0o644)
+		}
 	}
 
 	progress("Image ready")
@@ -290,6 +357,7 @@ lxc.uts.name = %s
 		Ref:           r.Ref,
 		Arch:          r.Arch,
 		TemplateName:  r.TemplateContainerName,
+		TemplateVMID:  templateVMID,
 		Created:       time.Now(),
 		OCIEntrypoint: cfg.Entrypoint,
 		OCICmd:        cfg.Cmd,
@@ -300,31 +368,174 @@ lxc.uts.name = %s
 }
 
 // CreateContainer clones the image template, applies the given config, and
-// prepares (but does not start) the container.
+// prepares (but does not start) the container. In PVE mode, containers marked
+// with ProxmoxCT are created as full Proxmox CTs (visible in the web UI);
+// all others are ephemeral raw-LXC containers with ZFS-cloned rootfs.
 func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) error {
 	rec := m.store.GetImage(imageRef)
 	if rec == nil {
 		return fmt.Errorf("manager: image %q not found; run pull first", imageRef)
 	}
 
-	// Clone template → new container using lxc-copy command instead of the
-	// go-lxc Clone() CGO binding. The CGO call can deadlock the Go runtime
-	// when other liblxc CGO calls are in flight on other goroutines (the C
-	// library acquires internal locks that block all OS threads).
-	log.Printf("CreateContainer: cloning %s → %s", rec.TemplateName, id)
+	if m.UsePVE() && cfg.ProxmoxCT && rec.TemplateVMID > 0 {
+		return m.createPVEContainer(id, rec, cfg)
+	}
+	if m.UsePVE() && rec.TemplateVMID > 0 {
+		return m.createEphemeralPVE(id, rec, cfg)
+	}
+	return m.createLegacyContainer(id, rec, cfg)
+}
+
+// createPVEContainer creates a full Proxmox CT via pct clone. The container
+// is visible in the Proxmox web UI and managed via pct commands.
+func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
+	vmid, err := allocateVMID()
+	if err != nil {
+		return fmt.Errorf("manager: %w", err)
+	}
+
+	log.Printf("CreateContainer[PVE]: pct clone %d → VMID %d for %s", imgRec.TemplateVMID, vmid, id[:12])
+	out, err := exec.Command("pct", "clone",
+		fmt.Sprintf("%d", imgRec.TemplateVMID),
+		fmt.Sprintf("%d", vmid),
+		"--full",
+		"--storage", m.pveStorage,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("manager: pct clone %d → %d: %s: %w", imgRec.TemplateVMID, vmid, out, err)
+	}
+
+	// Allocate IP for bridge networking.
+	var ip string
+	if cfg.NetworkMode != "host" {
+		ip, err = m.store.AllocateIP()
+		if err != nil {
+			exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run()
+			return fmt.Errorf("manager: allocate IP: %w", err)
+		}
+	}
+
+	// Set console log path.
+	cfg.LogFile = LogFilePath(m.lxcPath, id)
+	if err := os.MkdirAll(filepath.Dir(cfg.LogFile), 0o755); err != nil {
+		return fmt.Errorf("manager: mkdir log dir: %w", err)
+	}
+
+	// Determine the container hostname (use Docker name, truncated for DNS).
+	hostname := id[:12]
+	if storeRec := m.store.GetContainer(id); storeRec != nil {
+		hostname = storeRec.Name
+	}
+	if len(hostname) > 63 {
+		hostname = hostname[:63]
+	}
+
+	// Build rootfs spec for Proxmox config.
+	rootfsSpec := fmt.Sprintf("%s:subvol-%d-disk-0,size=4G", m.pveStorage, vmid)
+
+	// Write the Proxmox CT config.
+	if err := writePVEConfig(vmid, hostname, rootfsSpec, cfg, ip); err != nil {
+		exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run()
+		return fmt.Errorf("manager: write PVE config: %w", err)
+	}
+
+	// Prepare rootfs: runtime dirs, resolv.conf.
+	rootfs := m.pveRootfsPath(vmid)
+	m.prepareRootfs(rootfs, cfg)
+
+	// Update store record with IP and VMID.
+	if storeRec := m.store.GetContainer(id); storeRec != nil {
+		storeRec.IPAddress = ip
+		storeRec.VMID = vmid
+		return m.store.AddContainer(storeRec)
+	}
+	return nil
+}
+
+// createEphemeralPVE creates a raw-LXC container by ZFS-cloning the PVE
+// template's rootfs. The container is NOT visible in the Proxmox UI but its
+// rootfs lives on the PVE storage pool (ZFS).
+func (m *Manager) createEphemeralPVE(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
+	// ZFS clone the template rootfs for instant provisioning.
+	snapDataset := fmt.Sprintf("%s/subvol-%d-disk-0@tmpl", m.pveStorage, imgRec.TemplateVMID)
+	cloneDataset := fmt.Sprintf("%s/lxc-%s", m.pveStorage, id)
+	cloneMountpoint := fmt.Sprintf("/%s/lxc-%s", m.pveStorage, id)
+
+	log.Printf("CreateContainer[ephemeral]: ZFS clone %s → %s", snapDataset, cloneDataset)
+	out, err := exec.Command("zfs", "clone",
+		"-o", fmt.Sprintf("mountpoint=%s", cloneMountpoint),
+		snapDataset, cloneDataset,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("manager: zfs clone %s → %s: %s: %w", snapDataset, cloneDataset, out, err)
+	}
+
+	// Create the LXC config directory.
+	containerDir := filepath.Join(m.lxcPath, id)
+	if err := os.MkdirAll(containerDir, 0o755); err != nil {
+		exec.Command("zfs", "destroy", cloneDataset).Run()
+		return fmt.Errorf("manager: mkdir %s: %w", containerDir, err)
+	}
+
+	// Write a minimal LXC config that references the ZFS clone as rootfs.
+	minimalConfig := fmt.Sprintf(`lxc.include = /usr/share/lxc/config/common.conf
+lxc.arch = linux64
+lxc.rootfs.path = dir:%s
+lxc.uts.name = %s
+`, cloneMountpoint, id)
+	configPath := filepath.Join(containerDir, "config")
+	if err := os.WriteFile(configPath, []byte(minimalConfig), 0o644); err != nil {
+		exec.Command("zfs", "destroy", cloneDataset).Run()
+		return fmt.Errorf("manager: write config: %w", err)
+	}
+
+	// Allocate IP for bridge networking.
+	var ip string
+	if cfg.NetworkMode != "host" {
+		ip, err = m.store.AllocateIP()
+		if err != nil {
+			exec.Command("zfs", "destroy", cloneDataset).Run()
+			os.RemoveAll(containerDir)
+			return fmt.Errorf("manager: allocate IP: %w", err)
+		}
+	}
+
+	// Set console log path.
+	cfg.LogFile = LogFilePath(m.lxcPath, id)
+	if err := os.MkdirAll(filepath.Dir(cfg.LogFile), 0o755); err != nil {
+		return fmt.Errorf("manager: mkdir log dir: %w", err)
+	}
+
+	// Rewrite config with full daemon-managed settings.
+	if err := rewriteConfig(configPath, cfg, ip, id); err != nil {
+		return fmt.Errorf("manager: rewrite config: %w", err)
+	}
+
+	// Prepare rootfs: runtime dirs, resolv.conf.
+	m.prepareRootfs(cloneMountpoint, cfg)
+
+	// Update store record with IP (VMID stays 0 for ephemeral).
+	if storeRec := m.store.GetContainer(id); storeRec != nil {
+		storeRec.IPAddress = ip
+		return m.store.AddContainer(storeRec)
+	}
+	return nil
+}
+
+// createLegacyContainer clones via lxc-copy (no Proxmox, no ZFS).
+func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
+	log.Printf("CreateContainer[legacy]: cloning %s → %s", imgRec.TemplateName, id)
 	out, err := exec.Command("lxc-copy",
-		"-n", rec.TemplateName,
+		"-n", imgRec.TemplateName,
 		"-N", id,
 		"--lxcpath", m.lxcPath,
 		"--newpath", m.lxcPath,
 	).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: clone %s → %s: %s: %w", rec.TemplateName, id, out, err)
+		return fmt.Errorf("manager: clone %s → %s: %s: %w", imgRec.TemplateName, id, out, err)
 	}
-	log.Printf("CreateContainer: clone complete for %s", id)
 
-	// Allocate IP for bridge networking. Host-network containers share the
-	// host network namespace and don't get a bridge IP.
+	// Allocate IP for bridge networking.
 	var ip string
 	if cfg.NetworkMode != "host" {
 		ip, err = m.store.AllocateIP()
@@ -340,43 +551,15 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 		return fmt.Errorf("manager: mkdir log dir: %w", err)
 	}
 
-	// Rewrite the cloned config file directly. The go-lxc SetConfigItem
-	// API doesn't reliably override settings inherited from lxc.include
-	// directives, so we read-modify-write the text config instead.
+	// Rewrite the cloned config.
 	configPath := filepath.Join(m.lxcPath, id, "config")
 	if err := rewriteConfig(configPath, cfg, ip, id); err != nil {
 		return fmt.Errorf("manager: rewrite config: %w", err)
 	}
 
-	// Ensure runtime directories referenced by environment variables exist
-	// in the rootfs. Docker images often rely on XDG_RUNTIME_DIR existing
-	// but don't create it at build time. Wolf, for example, expects
-	// /run/user/wolf to exist for its API server Unix socket.
+	// Prepare rootfs.
 	rootfs := filepath.Join(m.lxcPath, id, "rootfs")
-	for _, e := range cfg.Env {
-		if strings.HasPrefix(e, "XDG_RUNTIME_DIR=") {
-			dir := strings.TrimPrefix(e, "XDG_RUNTIME_DIR=")
-			if dir != "" {
-				runtimeDir := filepath.Join(rootfs, dir)
-				if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
-					log.Printf("CreateContainer: warning: mkdir XDG_RUNTIME_DIR %s: %v", runtimeDir, err)
-				}
-			}
-		}
-	}
-
-	// Ensure the container has working DNS resolution by writing resolv.conf
-	// into the rootfs before first start. Ubuntu uses a symlink to
-	// systemd-resolved which won't exist in the container, so remove any
-	// existing symlink first.
-	resolvPath := filepath.Join(rootfs, "etc", "resolv.conf")
-	os.Remove(resolvPath) // remove symlink or stale file; ignore error
-	if err := os.MkdirAll(filepath.Dir(resolvPath), 0o755); err != nil {
-		return fmt.Errorf("manager: mkdir etc in rootfs: %w", err)
-	}
-	if err := os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644); err != nil {
-		return fmt.Errorf("manager: write resolv.conf: %w", err)
-	}
+	m.prepareRootfs(rootfs, cfg)
 
 	// Update store record with IP.
 	if storeRec := m.store.GetContainer(id); storeRec != nil {
@@ -386,24 +569,86 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 	return nil
 }
 
+// prepareRootfs ensures runtime directories and resolv.conf exist in the rootfs.
+func (m *Manager) prepareRootfs(rootfs string, cfg ContainerConfig) {
+	// Ensure runtime directories referenced by XDG_RUNTIME_DIR.
+	for _, e := range cfg.Env {
+		if strings.HasPrefix(e, "XDG_RUNTIME_DIR=") {
+			dir := strings.TrimPrefix(e, "XDG_RUNTIME_DIR=")
+			if dir != "" {
+				runtimeDir := filepath.Join(rootfs, dir)
+				if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
+					log.Printf("prepareRootfs: warning: mkdir XDG_RUNTIME_DIR %s: %v", runtimeDir, err)
+				}
+			}
+		}
+	}
+
+	// Ensure resolv.conf for DNS resolution.
+	resolvPath := filepath.Join(rootfs, "etc", "resolv.conf")
+	os.Remove(resolvPath)
+	os.MkdirAll(filepath.Dir(resolvPath), 0o755)
+	if err := os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644); err != nil {
+		log.Printf("prepareRootfs: warning: write resolv.conf: %v", err)
+	}
+}
+
 // StartContainer starts a stopped container.
-// Uses lxc-start command instead of go-lxc CGO binding to avoid thread contention.
+// For Proxmox CTs (VMID > 0), uses pct start; otherwise lxc-start.
 func (m *Manager) StartContainer(id string) error {
 	state, _ := m.State(id)
 	if state == "running" {
 		return nil
 	}
-	log.Printf("StartContainer: starting %s", id)
-	out, err := exec.Command("lxc-start", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("manager: start %s: %s: %w", id, out, err)
+
+	rec := m.store.GetContainer(id)
+	if rec != nil && rec.VMID > 0 {
+		return m.startPVEContainer(id, rec.VMID)
 	}
-	// Wait for the container to reach RUNNING state.
+	return m.startLXCContainer(id)
+}
+
+func (m *Manager) startPVEContainer(id string, vmid int) error {
+	log.Printf("StartContainer[PVE]: pct start %d (%s)", vmid, id[:12])
+	out, err := exec.Command("pct", "start", fmt.Sprintf("%d", vmid)).CombinedOutput()
+	if err != nil {
+		// Dump config for debugging.
+		if cfgData, readErr := os.ReadFile(pveConfigPath(vmid)); readErr == nil {
+			log.Printf("StartContainer[PVE]: FAILED config for VMID %d:\n%s", vmid, cfgData)
+		}
+		return fmt.Errorf("manager: pct start %d: %s: %w", vmid, out, err)
+	}
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		state, _ := m.State(id)
 		if state == "running" {
-			log.Printf("StartContainer: %s is running", id)
+			log.Printf("StartContainer[PVE]: VMID %d (%s) is running", vmid, id[:12])
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("manager: VMID %d did not reach RUNNING within 30s", vmid)
+}
+
+func (m *Manager) startLXCContainer(id string) error {
+	log.Printf("StartContainer[LXC]: starting %s", id)
+	out, err := exec.Command("lxc-start", "-n", id, "--lxcpath", m.lxcPath,
+		"--logfile", filepath.Join(m.lxcPath, id, "lxc-start.log"),
+		"--logpriority", "DEBUG").CombinedOutput()
+	if err != nil {
+		if cfgData, readErr := os.ReadFile(filepath.Join(m.lxcPath, id, "config")); readErr == nil {
+			log.Printf("StartContainer[LXC]: FAILED config for %s:\n%s", id, cfgData)
+		}
+		if logData, readErr := os.ReadFile(filepath.Join(m.lxcPath, id, "lxc-start.log")); readErr == nil {
+			log.Printf("StartContainer[LXC]: lxc-start log for %s:\n%s", id, logData)
+		}
+		return fmt.Errorf("manager: start %s: %s: %w", id, out, err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		state, _ := m.State(id)
+		if state == "running" {
+			log.Printf("StartContainer[LXC]: %s is running", id)
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -412,12 +657,28 @@ func (m *Manager) StartContainer(id string) error {
 }
 
 // StopContainer stops a running container gracefully, waiting up to timeout.
-// Uses lxc-stop command instead of go-lxc CGO binding to avoid thread contention.
+// For Proxmox CTs uses pct shutdown; otherwise lxc-stop.
 func (m *Manager) StopContainer(id string, timeout time.Duration) error {
 	state, _ := m.State(id)
 	if state != "running" {
 		return nil
 	}
+
+	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+		out, err := exec.Command("pct", "shutdown",
+			fmt.Sprintf("%d", rec.VMID),
+			"--timeout", fmt.Sprintf("%d", int(timeout.Seconds())),
+		).CombinedOutput()
+		if err != nil {
+			// Fall back to forced stop.
+			out2, err2 := exec.Command("pct", "stop", fmt.Sprintf("%d", rec.VMID)).CombinedOutput()
+			if err2 != nil {
+				return fmt.Errorf("manager: pct stop %d: %s (shutdown: %s): %w", rec.VMID, out2, out, err2)
+			}
+		}
+		return nil
+	}
+
 	out, err := exec.Command("lxc-stop", "-n", id, "--lxcpath", m.lxcPath,
 		"-t", fmt.Sprintf("%d", int(timeout.Seconds()))).CombinedOutput()
 	if err != nil {
@@ -427,14 +688,23 @@ func (m *Manager) StopContainer(id string, timeout time.Duration) error {
 }
 
 // KillContainer sends a signal to the container's init process. For SIGKILL
-// it uses lxc-stop --kill; for other signals it sends them directly to the
-// container's init PID.
+// it uses pct stop (PVE) or lxc-stop --kill; for other signals it sends them
+// directly to the container's init PID.
 func (m *Manager) KillContainer(id, signal string) error {
 	if signal == "" {
 		signal = "KILL"
 	}
 
+	rec := m.store.GetContainer(id)
+
 	if signal == "KILL" || signal == "9" || signal == "SIGKILL" {
+		if rec != nil && rec.VMID > 0 {
+			out, err := exec.Command("pct", "stop", fmt.Sprintf("%d", rec.VMID)).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("manager: pct stop %d: %s: %w", rec.VMID, out, err)
+			}
+			return nil
+		}
 		out, err := exec.Command("lxc-stop", "--kill", "-n", id, "--lxcpath", m.lxcPath).
 			CombinedOutput()
 		if err != nil {
@@ -443,9 +713,18 @@ func (m *Manager) KillContainer(id, signal string) error {
 		return nil
 	}
 
-	// For other signals, get the init PID via lxc-info (avoids CGO) and
-	// send the signal directly.
-	pidOut, err := exec.Command("lxc-info", "-n", id, "--lxcpath", m.lxcPath, "-pH").Output()
+	// For other signals, get the init PID and send the signal directly.
+	// Works for both PVE and raw LXC containers since the init PID is
+	// visible on the host either way.
+	var pidOut []byte
+	var err error
+	if rec != nil && rec.VMID > 0 {
+		// For PVE containers, lxc-info works with the VMID as name
+		// using the default lxcpath (/var/lib/lxc).
+		pidOut, err = exec.Command("lxc-info", "-n", fmt.Sprintf("%d", rec.VMID), "-pH").Output()
+	} else {
+		pidOut, err = exec.Command("lxc-info", "-n", id, "--lxcpath", m.lxcPath, "-pH").Output()
+	}
 	if err != nil {
 		return fmt.Errorf("manager: kill %s: cannot get init pid: %w", id, err)
 	}
@@ -461,12 +740,39 @@ func (m *Manager) KillContainer(id, signal string) error {
 }
 
 // RemoveContainer destroys a container and removes it from the store.
-// Uses lxc-destroy command instead of go-lxc CGO binding.
+// Routes to pct destroy (PVE CT), ZFS destroy (ephemeral PVE), or
+// lxc-destroy (legacy) based on container type.
 func (m *Manager) RemoveContainer(id string) error {
 	state, _ := m.State(id)
 	if state == "running" {
 		return fmt.Errorf("manager: cannot remove running container %s; stop it first", id)
 	}
+
+	rec := m.store.GetContainer(id)
+
+	if rec != nil && rec.VMID > 0 {
+		// Proxmox CT — destroy via pct.
+		out, err := exec.Command("pct", "destroy", fmt.Sprintf("%d", rec.VMID), "--force").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("manager: pct destroy %d: %s: %w", rec.VMID, out, err)
+		}
+		return m.store.RemoveContainer(id)
+	}
+
+	if m.UsePVE() {
+		// Ephemeral container with ZFS-cloned rootfs — destroy the ZFS
+		// dataset, then remove the LXC config directory.
+		cloneDataset := fmt.Sprintf("%s/lxc-%s", m.pveStorage, id)
+		out, err := exec.Command("zfs", "destroy", cloneDataset).CombinedOutput()
+		if err != nil {
+			log.Printf("RemoveContainer: zfs destroy %s: %s: %v (continuing)", cloneDataset, out, err)
+		}
+		containerDir := filepath.Join(m.lxcPath, id)
+		os.RemoveAll(containerDir)
+		return m.store.RemoveContainer(id)
+	}
+
+	// Legacy: lxc-destroy.
 	out, err := exec.Command("lxc-destroy", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("manager: destroy %s: %s: %w", id, out, err)
@@ -480,6 +786,20 @@ func (m *Manager) RemoveImage(ref string) error {
 	if rec == nil {
 		return fmt.Errorf("manager: image %q not found", ref)
 	}
+
+	if rec.TemplateVMID > 0 {
+		// PVE template — first destroy any ZFS snapshots (used by ephemeral
+		// clones), then destroy the CT template via pct.
+		snapDataset := fmt.Sprintf("%s/subvol-%d-disk-0@tmpl", m.pveStorage, rec.TemplateVMID)
+		exec.Command("zfs", "destroy", snapDataset).Run() // best-effort
+		out, err := exec.Command("pct", "destroy", fmt.Sprintf("%d", rec.TemplateVMID), "--force").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("manager: pct destroy template %d: %s: %w", rec.TemplateVMID, out, err)
+		}
+		return m.store.RemoveImage(ref)
+	}
+
+	// Legacy template — lxc-destroy.
 	if m.containerExists(rec.TemplateName) {
 		out, err := exec.Command("lxc-destroy", "-n", rec.TemplateName, "--lxcpath", m.lxcPath).CombinedOutput()
 		if err != nil {
@@ -490,9 +810,26 @@ func (m *Manager) RemoveImage(ref string) error {
 }
 
 // State returns the Docker-compatible state string for a container.
-// Uses lxc-info command instead of go-lxc CGO binding to avoid thread contention.
-// Maps LXC states to Docker equivalents: RUNNING→"running", STOPPED→"exited".
+// For PVE CTs uses pct status; otherwise lxc-info.
 func (m *Manager) State(id string) (string, error) {
+	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+		out, err := exec.Command("pct", "status", fmt.Sprintf("%d", rec.VMID)).Output()
+		if err != nil {
+			return "exited", nil
+		}
+		// pct status output: "status: running" or "status: stopped"
+		status := strings.TrimSpace(string(out))
+		status = strings.TrimPrefix(status, "status: ")
+		switch status {
+		case "running":
+			return "running", nil
+		case "stopped":
+			return "exited", nil
+		default:
+			return status, nil
+		}
+	}
+
 	out, err := exec.Command("lxc-info", "-n", id, "--lxcpath", m.lxcPath, "-sH").Output()
 	if err != nil {
 		return "exited", nil
@@ -508,9 +845,16 @@ func (m *Manager) State(id string) (string, error) {
 	}
 }
 
-// Exec runs cmd inside the container using lxc-attach. It returns an
-// *exec.Cmd that is not yet started so the caller can wire up stdin/stdout.
+// Exec runs cmd inside the container. For PVE CTs uses pct exec;
+// otherwise lxc-attach. Returns an *exec.Cmd not yet started.
 func (m *Manager) Exec(id string, cmd []string, env []string) *exec.Cmd {
+	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+		args := []string{"exec", fmt.Sprintf("%d", rec.VMID), "--"}
+		args = append(args, cmd...)
+		c := exec.Command("pct", args...)
+		c.Env = env
+		return c
+	}
 	args := []string{"-n", id, "--lxcpath", m.lxcPath, "--"}
 	args = append(args, cmd...)
 	c := exec.Command("lxc-attach", args...)
@@ -527,20 +871,80 @@ func (m *Manager) LogPath(id string) string {
 func (m *Manager) LXCPath() string { return m.lxcPath }
 
 // RootfsPath returns the rootfs path for a container.
+// For PVE CTs returns the ZFS subvol path; otherwise the lxcpath rootfs.
 func (m *Manager) RootfsPath(id string) string {
+	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+		return m.pveRootfsPath(rec.VMID)
+	}
+	// For ephemeral PVE containers, the rootfs is a ZFS clone mounted
+	// directly. Check if it exists before falling back to lxcpath/rootfs.
+	if m.UsePVE() {
+		clonePath := fmt.Sprintf("/%s/lxc-%s", m.pveStorage, id)
+		if fi, err := os.Stat(clonePath); err == nil && fi.IsDir() {
+			return clonePath
+		}
+	}
 	return filepath.Join(m.lxcPath, id, "rootfs")
 }
 
 // --- helpers ---
 
+// allocateVMID requests the next available Proxmox VMID.
+func allocateVMID() (int, error) {
+	out, err := exec.Command("pvesh", "get", "/cluster/nextid").Output()
+	if err != nil {
+		return 0, fmt.Errorf("allocate VMID: %w", err)
+	}
+	var vmid int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &vmid); err != nil {
+		return 0, fmt.Errorf("parse VMID %q: %w", string(out), err)
+	}
+	return vmid, nil
+}
+
+// pveRootfsPath returns the rootfs path for a Proxmox CT on ZFS storage.
+// For ZFS pool "large" and VMID 260: /large/subvol-260-disk-0
+func (m *Manager) pveRootfsPath(vmid int) string {
+	// Proxmox ZFS storage mounts datasets at /<pool>/subvol-<vmid>-disk-0.
+	// Determine the ZFS mountpoint by checking pvesm.
+	return fmt.Sprintf("/%s/subvol-%d-disk-0", m.pveStorage, vmid)
+}
+
+// pveConfigPath returns the Proxmox config path for a VMID.
+func pveConfigPath(vmid int) string {
+	return fmt.Sprintf("/etc/pve/lxc/%d.conf", vmid)
+}
+
 // destroyOrphan removes a cloned container that failed during CreateContainer.
 func (m *Manager) destroyOrphan(id string) {
+	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+		exec.Command("pct", "destroy", fmt.Sprintf("%d", rec.VMID), "--force").Run()
+		return
+	}
+	if m.UsePVE() {
+		// Ephemeral ZFS clone.
+		cloneDataset := fmt.Sprintf("%s/lxc-%s", m.pveStorage, id)
+		exec.Command("zfs", "destroy", cloneDataset).Run()
+		os.RemoveAll(filepath.Join(m.lxcPath, id))
+		return
+	}
 	exec.Command("lxc-destroy", "-n", id, "--lxcpath", m.lxcPath).Run()
 }
 
 func (m *Manager) containerExists(name string) bool {
-	// Check the filesystem directly instead of using the go-lxc CGO binding
-	// (liblxc.ContainerNames) to avoid contributing to CGO thread contention.
+	// Check store for PVE container by ID.
+	if rec := m.store.GetContainer(name); rec != nil && rec.VMID > 0 {
+		_, err := os.Stat(pveConfigPath(rec.VMID))
+		return err == nil
+	}
+	// Check image records for PVE template by name.
+	for _, img := range m.store.ListImages() {
+		if img.TemplateName == name && img.TemplateVMID > 0 {
+			_, err := os.Stat(pveConfigPath(img.TemplateVMID))
+			return err == nil
+		}
+	}
+	// Raw LXC container — check lxcPath.
 	configPath := filepath.Join(m.lxcPath, name, "config")
 	_, err := os.Stat(configPath)
 	return err == nil
