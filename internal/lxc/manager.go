@@ -188,7 +188,7 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 	}
 	defer m.store.FreeIP(ip) // Template doesn't need a permanent IP.
 
-	if err := rewriteConfig(templateCfgPath, templateCfg, ip, r.TemplateContainerName); err != nil {
+	if err := rewriteConfig(templateCfgPath, &templateCfg, ip, r.TemplateContainerName); err != nil {
 		return fmt.Errorf("manager: rewrite app template config: %w", err)
 	}
 	templateRootfs := filepath.Join(m.lxcPath, r.TemplateContainerName, "rootfs")
@@ -450,7 +450,7 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	rootfsPath := m.pveRootfsPath(vmid)
 
 	// Write the Proxmox CT config.
-	if err := writePVEConfig(vmid, hostname, rootfsSpec, rootfsPath, cfg, ip); err != nil {
+	if err := writePVEConfig(vmid, hostname, rootfsSpec, rootfsPath, &cfg, ip); err != nil {
 		exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run()
 		return fmt.Errorf("manager: write PVE config: %w", err)
 	}
@@ -524,11 +524,12 @@ lxc.uts.name = %s
 	}
 
 	// Rewrite config with full daemon-managed settings.
-	if err := rewriteConfig(configPath, cfg, ip, id); err != nil {
+	// Note: rewriteConfig may populate cfg.SocketLinks for socket bind mounts.
+	if err := rewriteConfig(configPath, &cfg, ip, id); err != nil {
 		return fmt.Errorf("manager: rewrite config: %w", err)
 	}
 
-	// Prepare rootfs: runtime dirs, resolv.conf.
+	// Prepare rootfs: runtime dirs, resolv.conf, socket symlinks.
 	m.prepareRootfs(cloneMountpoint, cfg)
 
 	// Update store record with IP (VMID stays 0 for ephemeral).
@@ -570,7 +571,7 @@ func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cf
 
 	// Rewrite the cloned config.
 	configPath := filepath.Join(m.lxcPath, id, "config")
-	if err := rewriteConfig(configPath, cfg, ip, id); err != nil {
+	if err := rewriteConfig(configPath, &cfg, ip, id); err != nil {
 		return fmt.Errorf("manager: rewrite config: %w", err)
 	}
 
@@ -607,6 +608,27 @@ func (m *Manager) prepareRootfs(rootfs string, cfg ContainerConfig) {
 	os.MkdirAll(filepath.Dir(resolvPath), 0o755)
 	if err := os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644); err != nil {
 		log.Printf("prepareRootfs: warning: write resolv.conf: %v", err)
+	}
+
+	// Create symlinks for socket bind-mounts. Socket mounts use a directory
+	// mount instead of a file mount (see appendSocketMount), so the
+	// application needs a symlink from the expected path to the socket
+	// inside the mounted directory.
+	for dest, target := range cfg.SocketLinks {
+		linkPath := filepath.Join(rootfs, strings.TrimPrefix(dest, "/"))
+		// Follow symlinks in the link's parent directory within the rootfs.
+		// E.g. /var/run → /run in many container images.
+		linkDir := filepath.Dir(linkPath)
+		if resolved, err := resolveInRootfs(rootfs, filepath.Dir(dest)); err == nil {
+			linkDir = filepath.Join(rootfs, resolved)
+		}
+		linkPath = filepath.Join(linkDir, filepath.Base(dest))
+
+		os.MkdirAll(linkDir, 0o755)
+		os.Remove(linkPath) // remove any existing file/symlink
+		if err := os.Symlink(target, linkPath); err != nil {
+			log.Printf("prepareRootfs: warning: symlink %s → %s: %v", linkPath, target, err)
+		}
 	}
 }
 

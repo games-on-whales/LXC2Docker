@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 )
 
 func main() {
-	socketPath := flag.String("socket", "/var/run/docker.sock", "Unix socket path to listen on")
+	socketPath := flag.String("socket", "/run/docker-lxc-daemon/docker.sock", "Unix socket path to listen on")
 	lxcPath := flag.String("lxcpath", "/var/lib/lxc", "LXC container storage path (legacy direct-LXC mode)")
 	pveStorage := flag.String("pve-storage", "", "Proxmox storage name for CT rootfs (e.g. 'large'); enables Proxmox CT mode")
 	statePath := flag.String("statepath", "/var/lib/docker-lxc-daemon", "Daemon state directory")
@@ -50,6 +51,12 @@ func main() {
 
 	handler := api.NewHandler(mgr, st)
 
+	// Ensure socket directory exists.
+	socketDir := filepath.Dir(*socketPath)
+	if err := os.MkdirAll(socketDir, 0o755); err != nil {
+		log.Fatalf("mkdir socket dir %s: %v", socketDir, err)
+	}
+
 	// Remove stale socket if present.
 	os.Remove(*socketPath)
 
@@ -61,6 +68,16 @@ func main() {
 	// restricts access in production; for GoW we keep it simple).
 	if err := os.Chmod(*socketPath, 0o666); err != nil {
 		log.Printf("warning: chmod socket: %v", err)
+	}
+
+	// Create a compatibility symlink at /var/run/docker.sock so Docker
+	// clients and compose files work without modification.
+	compatSocket := "/var/run/docker.sock"
+	if *socketPath != compatSocket {
+		os.Remove(compatSocket)
+		if err := os.Symlink(*socketPath, compatSocket); err != nil {
+			log.Printf("warning: symlink %s → %s: %v", compatSocket, *socketPath, err)
+		}
 	}
 
 	srv := &http.Server{Handler: handler}

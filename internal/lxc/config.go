@@ -32,6 +32,12 @@ type ContainerConfig struct {
 	// LogFile is where the container console output is written.
 	// Set automatically by the manager.
 	LogFile string
+	// SocketLinks records symlinks to create in prepareRootfs for socket
+	// bind mounts. Maps in-container destination path → symlink target
+	// (absolute in-container path inside the directory mount). Populated
+	// automatically by buildItems / buildPVEItems when they replace a
+	// socket file bind-mount with a directory mount.
+	SocketLinks map[string]string
 	// ProxmoxCT requests that this container be created as a Proxmox CT
 	// (visible in the Proxmox web UI). When false and PVE mode is active,
 	// the container is created as an ephemeral raw-LXC container with a
@@ -65,7 +71,7 @@ type DeviceSpec struct {
 // and appends the daemon-managed config items. This is more reliable than
 // the go-lxc SetConfigItem API because lxc.include directives are processed
 // at container start time and can override in-memory changes.
-func rewriteConfig(path string, cfg ContainerConfig, ip, containerName string) error {
+func rewriteConfig(path string, cfg *ContainerConfig, ip, containerName string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("read config: %w", err)
@@ -106,6 +112,7 @@ func rewriteConfig(path string, cfg ContainerConfig, ip, containerName string) e
 		{"lxc.mount.auto", ""},
 		{"lxc.mount.auto", "proc:mixed sys:mixed"},
 	}, buildItems(cfg, ip)...)
+	// Note: buildItems may populate cfg.SocketLinks (for socket bind mounts).
 
 	// Resolve mount entry destinations against the container's rootfs so that
 	// any symlinks (e.g. /var/run → /run) are followed. LXC rejects mount
@@ -187,7 +194,31 @@ func resolveMountDest(rootfs, entry string) string {
 	return strings.Join(fields, " ")
 }
 
-func buildItems(cfg ContainerConfig, ip string) []configItem {
+// resolveInRootfs resolves a container-absolute path by following symlinks
+// within the rootfs. Returns the resolved path (relative, no leading slash).
+func resolveInRootfs(rootfs, containerPath string) (string, error) {
+	parts := strings.Split(filepath.Clean(containerPath), "/")
+	current := ""
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		next := filepath.Join(current, part)
+		fullPath := filepath.Join(rootfs, next)
+		if link, err := os.Readlink(fullPath); err == nil {
+			if filepath.IsAbs(link) {
+				current = strings.TrimPrefix(link, "/")
+			} else {
+				current = filepath.Join(filepath.Dir(next), link)
+			}
+		} else {
+			current = next
+		}
+	}
+	return current, nil
+}
+
+func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	var items []configItem
 
 	// Docker-compatible default mounts: /dev/shm (shared memory) is required
@@ -238,7 +269,16 @@ func buildItems(cfg ContainerConfig, ip string) []configItem {
 			source = real
 		}
 
-		// Detect whether source is a directory or a file/socket so we use
+		// Unix socket special handling: mount the parent directory instead
+		// of the socket file. File bind-mounts follow inodes, so if the
+		// socket is recreated (e.g. daemon restart), a file mount goes
+		// stale. A directory mount sees the new file automatically.
+		if fi, err := os.Stat(source); err == nil && fi.Mode()&os.ModeSocket != 0 {
+			items = appendSocketMount(items, cfg, source, m)
+			continue
+		}
+
+		// Detect whether source is a directory or a file so we use
 		// the correct create= option. LXC will refuse to mount a file onto a
 		// directory placeholder (or vice-versa).
 		createOpt := "create=dir"
@@ -387,6 +427,34 @@ func cpuSharesToWeight(shares int64) int64 {
 	return w
 }
 
+// appendSocketMount replaces a file bind-mount of a Unix socket with a
+// directory bind-mount of the socket's parent directory. This survives
+// socket recreation (e.g. daemon restart) because directory mounts see
+// new files at the same path. A symlink from the original destination to
+// the socket inside the directory mount is recorded in cfg.SocketLinks
+// for prepareRootfs to create.
+func appendSocketMount(items []configItem, cfg *ContainerConfig, source string, m MountSpec) []configItem {
+	parentDir := filepath.Dir(source)
+	socketName := filepath.Base(source)
+
+	// Mount the parent directory at a hidden location in the container.
+	// Use a path derived from the parent dir name to avoid collisions.
+	dirName := filepath.Base(parentDir)
+	mountDest := ".socket-dirs/" + dirName
+	escapedParent := strings.ReplaceAll(parentDir, " ", `\040`)
+	escapedDest := strings.ReplaceAll(mountDest, " ", `\040`)
+	entry := fmt.Sprintf("%s %s none bind,create=dir 0 0", escapedParent, escapedDest)
+	items = append(items, configItem{"lxc.mount.entry", entry})
+
+	// Record symlink for prepareRootfs: destination → socket in mounted dir.
+	if cfg.SocketLinks == nil {
+		cfg.SocketLinks = make(map[string]string)
+	}
+	cfg.SocketLinks[m.Destination] = "/" + mountDest + "/" + socketName
+
+	return items
+}
+
 // deviceCgroupEntry returns a cgroup2 device allow rule for a device path.
 // Returns "" if the path is not a device node (e.g. a regular file or directory).
 // We use "rwm" (read/write/mknod) for all devices passed through.
@@ -411,7 +479,7 @@ func deviceNumbers(path string) (int, int) {
 // writePVEConfig writes a Proxmox CT config to /etc/pve/lxc/<vmid>.conf.
 // It uses Proxmox-native syntax for core options and raw lxc.* pass-through
 // for everything else. The rootfsSpec should be like "large:subvol-260-disk-0,size=4G".
-func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg ContainerConfig, ip string) error {
+func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg *ContainerConfig, ip string) error {
 	path := fmt.Sprintf("/etc/pve/lxc/%d.conf", vmid)
 
 	var lines []string
@@ -451,7 +519,7 @@ func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg Conta
 // Uses raw lxc.* directives for all settings including networking, since
 // Proxmox-native net0: doesn't reliably configure interfaces in unmanaged
 // OS-type containers.
-func buildPVEItems(cfg ContainerConfig, ip string) []configItem {
+func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	var items []configItem
 
 	items = append(items, configItem{"lxc.apparmor.profile", "unconfined"})
@@ -495,6 +563,13 @@ func buildPVEItems(cfg ContainerConfig, ip string) []configItem {
 		if real, err := filepath.EvalSymlinks(source); err == nil {
 			source = real
 		}
+
+		// Unix socket: mount parent directory (see buildItems comment).
+		if fi, err := os.Stat(source); err == nil && fi.Mode()&os.ModeSocket != 0 {
+			items = appendSocketMount(items, cfg, source, m)
+			continue
+		}
+
 		createOpt := "create=dir"
 		if fi, err := os.Stat(source); err == nil && !fi.IsDir() {
 			createOpt = "create=file"
