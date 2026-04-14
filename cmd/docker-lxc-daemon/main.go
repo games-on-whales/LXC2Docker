@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -18,9 +19,14 @@ import (
 )
 
 func main() {
-	socketPath := flag.String("socket", "/var/run/docker.sock", "Unix socket path to listen on")
-	lxcPath := flag.String("lxcpath", "/var/lib/lxc", "LXC container storage path")
+	socketPath := flag.String("socket", "/run/docker-lxc-daemon/docker.sock", "Unix socket path to listen on")
+	lxcPath := flag.String("lxcpath", "/var/lib/lxc", "LXC container storage path (legacy direct-LXC mode)")
+	pveStorage := flag.String("pve-storage", "", "Proxmox storage name for CT rootfs (e.g. 'large'); enables Proxmox CT mode")
 	statePath := flag.String("statepath", "/var/lib/docker-lxc-daemon", "Daemon state directory")
+	lanBridge := flag.String("lan-bridge", "", "Physical LAN bridge for dual-NIC containers (e.g. 'vmbr0')")
+	lanPrefix := flag.String("lan-prefix", "", "LAN IP prefix; VMID becomes last octet (e.g. '192.168.1')")
+	lanGateway := flag.String("lan-gateway", "", "LAN gateway (e.g. '192.168.1.1')")
+	lanSubnet := flag.Int("lan-subnet", 24, "LAN subnet prefix length (e.g. 23 for /23)")
 	flag.Parse()
 
 	if os.Geteuid() != 0 {
@@ -32,12 +38,24 @@ func main() {
 		log.Fatalf("store: %v", err)
 	}
 
-	mgr, err := lxc.NewManager(*lxcPath, st)
+	lan := lxc.LANConfig{
+		Bridge:  *lanBridge,
+		Prefix:  *lanPrefix,
+		Gateway: *lanGateway,
+		Subnet:  *lanSubnet,
+	}
+	mgr, err := lxc.NewManager(*lxcPath, *pveStorage, lan, st)
 	if err != nil {
 		log.Fatalf("manager: %v", err)
 	}
 
 	handler := api.NewHandler(mgr, st)
+
+	// Ensure socket directory exists.
+	socketDir := filepath.Dir(*socketPath)
+	if err := os.MkdirAll(socketDir, 0o755); err != nil {
+		log.Fatalf("mkdir socket dir %s: %v", socketDir, err)
+	}
 
 	// Remove stale socket if present.
 	os.Remove(*socketPath)
@@ -52,11 +70,24 @@ func main() {
 		log.Printf("warning: chmod socket: %v", err)
 	}
 
+	// Create a compatibility symlink at /var/run/docker.sock so Docker
+	// clients and compose files work without modification.
+	compatSocket := "/var/run/docker.sock"
+	if *socketPath != compatSocket {
+		os.Remove(compatSocket)
+		if err := os.Symlink(*socketPath, compatSocket); err != nil {
+			log.Printf("warning: symlink %s → %s: %v", compatSocket, *socketPath, err)
+		}
+	}
+
 	srv := &http.Server{Handler: handler}
 
 	// Graceful shutdown on SIGTERM/SIGINT.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	// Start background GC that removes stopped ephemeral containers.
+	mgr.StartGC(ctx)
 
 	go func() {
 		<-ctx.Done()
