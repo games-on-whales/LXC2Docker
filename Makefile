@@ -24,6 +24,8 @@ build:
 install: build
 	install -m 0755 $(BUILD_DIR)/$(BINARY) /usr/local/bin/$(BINARY)
 	install -m 0644 systemd/$(BINARY).service /etc/systemd/system/
+	install -m 0644 systemd/wolf-run-dirs.conf /etc/tmpfiles.d/
+	systemd-tmpfiles --create /etc/tmpfiles.d/wolf-run-dirs.conf
 	systemctl daemon-reload
 	@echo "Run 'systemctl enable --now docker-lxc-daemon' to start."
 
@@ -33,6 +35,7 @@ uninstall:
 	systemctl disable $(BINARY) || true
 	rm -f /usr/local/bin/$(BINARY)
 	rm -f /etc/systemd/system/$(BINARY).service
+	rm -f /etc/tmpfiles.d/wolf-run-dirs.conf
 	systemctl daemon-reload
 
 clean:
