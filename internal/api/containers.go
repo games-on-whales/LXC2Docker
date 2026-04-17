@@ -78,7 +78,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		// App registry defaults (if no OCI config and no user-provided cmd).
 		if len(entrypoint) == 0 && len(cmd) == 0 {
-			if resolved, err := image.Resolve(imgRec.Ref, "amd64"); err == nil && resolved.App != nil && resolved.App.DefaultCmd != "" {
+			if resolved, err := image.Resolve(imgRec.Ref, "amd64", false); err == nil && resolved.App != nil && resolved.App.DefaultCmd != "" {
 				cmd = []string{"/bin/sh", "-c", resolved.App.DefaultCmd}
 			}
 		}
@@ -92,6 +92,17 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Default mode is PERMANENT (PVE CT, visible in the PVE UI). Opt out
+	// of permanence — making the container ephemeral, reapable by the GC
+	// after it exits — via Docker's --rm (HostConfig.AutoRemove) or the
+	// vendor-neutral "dld.ephemeral=true" label. The legacy "dld.pve=true"
+	// / "gow.pve=true" labels still force permanence (a no-op now since
+	// permanence is the default, but kept so existing manifests work).
+	ephemeral := req.HostConfig.AutoRemove || labelBool(req.Labels, "dld.ephemeral")
+	if labelBool(req.Labels, "dld.pve", "gow.pve") {
+		ephemeral = false
+	}
+
 	cfg := lxc.ContainerConfig{
 		Entrypoint:        entrypoint,
 		Cmd:               cmd,
@@ -102,7 +113,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		IpcMode:           req.HostConfig.IpcMode,
 		MemoryBytes:       req.HostConfig.Memory,
 		CPUShares:         req.HostConfig.CPUShares,
-		ProxmoxCT:         labelBool(req.Labels, "dld.pve", "gow.pve"),
+		ProxmoxCT:         !ephemeral,
 		LAN:               labelBool(req.Labels, "dld.lan", "gow.lan"),
 		Bridge:            labelString(req.Labels, "dld.bridge"),
 		Storage:           labelString(req.Labels, "dld.storage"),

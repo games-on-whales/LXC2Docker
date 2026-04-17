@@ -167,9 +167,14 @@ func (m *Manager) gc() {
 }
 
 // isReapable returns true only when every safety check confirms the
-// container was created by this daemon as ephemeral. Any single failed
-// check returns false — and logs why, so unexpected state on the host is
-// visible rather than silently destroyed.
+// container was created by this daemon as ephemeral AND has actually run
+// at least once. Any single failed check returns false — and logs why, so
+// unexpected state on the host is visible rather than silently destroyed.
+//
+// The StartedAt check matters: a container whose start failed (or whose
+// owner has not yet called start) sits in state "exited" with all other
+// ephemeral markers in place. Reaping it would silently swallow user
+// intent to retry or debug.
 func (m *Manager) isReapable(rec *store.ContainerRecord) bool {
 	if rec == nil {
 		return false
@@ -180,6 +185,10 @@ func (m *Manager) isReapable(rec *store.ContainerRecord) bool {
 	if rec.VMID != 0 {
 		log.Printf("GC: skip %s (%s) — Ephemeral=true but VMID=%d (state inconsistent)",
 			rec.Name, rec.ID[:12], rec.VMID)
+		return false
+	}
+	if rec.StartedAt == nil {
+		// Never started — leave alone so the owner can retry or inspect.
 		return false
 	}
 	if !m.hasEphemeralMarker(rec.ID) {
@@ -212,7 +221,7 @@ func (m *Manager) hasEphemeralMarker(id string) bool {
 // For app images it creates the base template, starts it, installs packages,
 // then stops it — producing a ready-to-clone template.
 func (m *Manager) PullImage(ref, arch string, progress func(string)) error {
-	resolved, err := image.Resolve(ref, arch)
+	resolved, err := image.Resolve(ref, arch, m.UsePVE())
 	if err != nil {
 		return err
 	}
@@ -275,7 +284,7 @@ func (m *Manager) pullDistro(r *image.ResolvedImage, progress func(string)) erro
 func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 	// 1. Ensure the base distro template exists.
 	progress(fmt.Sprintf("Pulling base image %s for %s", r.BaseRef, r.Ref))
-	baseResolved, err := image.Resolve(r.BaseRef, r.Arch)
+	baseResolved, err := image.Resolve(r.BaseRef, r.Arch, false)
 	if err != nil {
 		return err
 	}
