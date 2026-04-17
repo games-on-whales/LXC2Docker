@@ -95,7 +95,7 @@ func (h *Handler) snapshotContainerStats(id string) ContainerStats {
 		PidsStats: PidsStats{
 			Current: pids,
 		},
-		BlkioStats:   map[string][]any{},
+		BlkioStats:   readBlkioStats(filepath.Join("/sys/fs/cgroup", cg, "io.stat")),
 		NumProcs:     pids,
 		StorageStats: map[string]any{},
 		CPUStats: CPUStats{
@@ -175,6 +175,71 @@ func (h *Handler) snapshotNetStats(id string) map[string]NetStats {
 func parseUint64(s string) uint64 {
 	n, _ := strconv.ParseUint(s, 10, 64)
 	return n
+}
+
+// readBlkioStats parses cgroup v2's io.stat format into Docker's BlkioStats
+// shape. io.stat has one line per device:
+//
+//	8:0 rbytes=123 wbytes=456 rios=10 wios=20 dbytes=0 dios=0
+//
+// Docker's legacy shape is a map of named arrays. We populate
+// io_service_bytes_recursive (Read/Write/Total) and io_serviced_recursive
+// (Read/Write/Total), which is what Portainer's disk-IO chart reads.
+func readBlkioStats(path string) map[string][]any {
+	out := map[string][]any{
+		"io_service_bytes_recursive": []any{},
+		"io_serviced_recursive":      []any{},
+		"io_queue_recursive":         []any{},
+		"io_service_time_recursive":  []any{},
+		"io_wait_time_recursive":     []any{},
+		"io_merged_recursive":        []any{},
+		"io_time_recursive":          []any{},
+		"sectors_recursive":          []any{},
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		majorMinor := strings.SplitN(fields[0], ":", 2)
+		if len(majorMinor) != 2 {
+			continue
+		}
+		major, _ := strconv.ParseUint(majorMinor[0], 10, 64)
+		minor, _ := strconv.ParseUint(majorMinor[1], 10, 64)
+		vals := map[string]uint64{}
+		for _, kv := range fields[1:] {
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok {
+				continue
+			}
+			vals[k] = parseUint64(v)
+		}
+		out["io_service_bytes_recursive"] = append(out["io_service_bytes_recursive"],
+			blkioEntry(major, minor, "Read", vals["rbytes"]),
+			blkioEntry(major, minor, "Write", vals["wbytes"]),
+			blkioEntry(major, minor, "Total", vals["rbytes"]+vals["wbytes"]),
+		)
+		out["io_serviced_recursive"] = append(out["io_serviced_recursive"],
+			blkioEntry(major, minor, "Read", vals["rios"]),
+			blkioEntry(major, minor, "Write", vals["wios"]),
+			blkioEntry(major, minor, "Total", vals["rios"]+vals["wios"]),
+		)
+	}
+	return out
+}
+
+func blkioEntry(major, minor uint64, op string, value uint64) map[string]any {
+	return map[string]any{
+		"major": major,
+		"minor": minor,
+		"op":    op,
+		"value": value,
+	}
 }
 
 func mountTypeForSource(st *store.Store, source string) string {
