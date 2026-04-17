@@ -383,6 +383,16 @@ func imageConfigFromRecord(rec *store.ImageRecord) *ImageConfig {
 			exposed[p] = struct{}{}
 		}
 	}
+	volumes := map[string]struct{}{}
+	for _, v := range rec.OCIVolumes {
+		if v != "" {
+			volumes[v] = struct{}{}
+		}
+	}
+	var volumesMap map[string]struct{}
+	if len(volumes) > 0 {
+		volumesMap = volumes
+	}
 	return &ImageConfig{
 		Hostname:     "",
 		Image:        rec.Ref,
@@ -392,6 +402,7 @@ func imageConfigFromRecord(rec *store.ImageRecord) *ImageConfig {
 		WorkingDir:   rec.OCIWorkingDir,
 		Labels:       copyLabels(rec.OCILabels),
 		ExposedPorts: exposed,
+		Volumes:      volumesMap,
 		User:         rec.OCIUser,
 		StopSignal:   rec.OCIStopSignal,
 		Healthcheck:  healthcheckFromRecord(rec.OCIHealthcheck),

@@ -292,6 +292,7 @@ type ImageConfig struct {
 	WorkingDir   string              `json:"WorkingDir"`
 	Labels       map[string]string   `json:"Labels"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+	Volumes      map[string]struct{} `json:"Volumes,omitempty"`
 	User         string              `json:"User,omitempty"`
 	StopSignal   string              `json:"StopSignal,omitempty"`
 	Healthcheck  *HealthConfig       `json:"Healthcheck,omitempty"`

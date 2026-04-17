@@ -206,6 +206,7 @@ type ImageRecord struct {
 	OCIUser        string             `json:"oci_user,omitempty"`
 	OCIStopSignal  string             `json:"oci_stop_signal,omitempty"`
 	OCIHealthcheck *HealthcheckConfig `json:"oci_healthcheck,omitempty"`
+	OCIVolumes     []string           `json:"oci_volumes,omitempty"`
 }
 
 type state struct {
