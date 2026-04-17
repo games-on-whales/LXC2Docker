@@ -122,6 +122,7 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/images/{name:.*}/history", h.imageHistory).Methods(http.MethodGet)
 		sub.HandleFunc("/images/{name:.*}/tag", h.tagImage).Methods(http.MethodPost)
 		sub.HandleFunc("/images/{name:.*}/push", h.pushImage).Methods(http.MethodPost)
+		sub.HandleFunc("/images/get", h.saveImages).Methods(http.MethodGet)
 		sub.HandleFunc("/images/{name:.*}/get", h.saveImage).Methods(http.MethodGet)
 		sub.HandleFunc("/images/load", h.loadImage).Methods(http.MethodPost)
 		sub.HandleFunc("/images/prune", h.pruneImages).Methods(http.MethodPost)

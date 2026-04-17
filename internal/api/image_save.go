@@ -19,14 +19,7 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// GET /images/{name}/get — Docker save: stream a tar bundle usable by
-// `docker load` or Portainer's "Download image" button.
-//
-// The emitted tar carries:
-//   - layer.tar         — the rootfs as a flat tar
-//   - <configSHA>.json  — an OCI image config we synthesise from the store
-//   - manifest.json     — [{"Config":"<sha>.json","RepoTags":[...],"Layers":["layer.tar"]}]
-//   - repositories      — legacy v1 tag map so older docker CLIs load it
+// GET /images/{name}/get — Docker save single image.
 func (h *Handler) saveImage(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 	rec := h.store.GetImage(normalizeImageRef(name))
@@ -34,16 +27,47 @@ func (h *Handler) saveImage(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
 		return
 	}
+	h.writeSaveBundle(w, []*store.ImageRecord{rec})
+}
 
-	rootfs, cleanup, err := h.openImageRootfs(rec)
-	if err != nil {
-		errResponse(w, http.StatusInternalServerError, "resolve rootfs: "+err.Error())
+// GET /images/get?names=a,b,c — Docker's multi-image save.
+func (h *Handler) saveImages(w http.ResponseWriter, r *http.Request) {
+	raw := r.URL.Query()["names"]
+	// Portainer's bulk save submits comma-separated values inside a single
+	// `names` key; docker CLI sends a repeated `names=` query string.
+	// Accept both shapes.
+	var names []string
+	for _, v := range raw {
+		for _, n := range strings.Split(v, ",") {
+			n = strings.TrimSpace(n)
+			if n != "" {
+				names = append(names, n)
+			}
+		}
+	}
+	if len(names) == 0 {
+		errResponse(w, http.StatusBadRequest, "names query parameter is required")
 		return
 	}
-	defer cleanup()
+	recs := make([]*store.ImageRecord, 0, len(names))
+	for _, n := range names {
+		rec := h.store.GetImage(normalizeImageRef(n))
+		if rec == nil {
+			errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", n))
+			return
+		}
+		recs = append(recs, rec)
+	}
+	h.writeSaveBundle(w, recs)
+}
 
-	// Stage the layer tar in a temp dir so we can hash it before emitting
-	// the outer manifest (the manifest references layer.tar by its sha).
+// writeSaveBundle streams a Docker-save-format tar carrying one or more
+// images. The emitted tar contains:
+//   - <layerID>/layer.tar    — the rootfs as a flat tar (one dir per image)
+//   - <configSHA>.json       — an OCI image config per image
+//   - manifest.json          — one entry per image
+//   - repositories           — legacy v1 tag map so older docker CLIs load it
+func (h *Handler) writeSaveBundle(w http.ResponseWriter, recs []*store.ImageRecord) {
 	stage, err := os.MkdirTemp("", "dld-save-*")
 	if err != nil {
 		errResponse(w, http.StatusInternalServerError, "stage: "+err.Error())
@@ -51,71 +75,114 @@ func (h *Handler) saveImage(w http.ResponseWriter, r *http.Request) {
 	}
 	defer os.RemoveAll(stage)
 
-	layerPath := filepath.Join(stage, "layer.tar")
-	layerSHA, err := writeLayerTar(r.Context(), rootfs, layerPath)
-	if err != nil {
-		errResponse(w, http.StatusInternalServerError, "tar rootfs: "+err.Error())
-		return
+	type perImage struct {
+		rec       *store.ImageRecord
+		layerPath string
+		layerDir  string
+		layerSHA  string
+		cfgBytes  []byte
+		cfgSHA    string
 	}
+	images := make([]perImage, 0, len(recs))
 
-	configBytes, configSHA, err := synthesiseImageConfig(rec, layerSHA)
-	if err != nil {
-		errResponse(w, http.StatusInternalServerError, "synthesise config: "+err.Error())
-		return
+	for _, rec := range recs {
+		rootfs, cleanup, err := h.openImageRootfs(rec)
+		if err != nil {
+			errResponse(w, http.StatusInternalServerError, "resolve rootfs: "+err.Error())
+			return
+		}
+		defer cleanup()
+
+		layerDir := filepath.Join(stage, "layer-"+oci.SafeDirName(rec.Ref))
+		if err := os.MkdirAll(layerDir, 0o755); err != nil {
+			errResponse(w, http.StatusInternalServerError, "stage: "+err.Error())
+			return
+		}
+		layerPath := filepath.Join(layerDir, "layer.tar")
+		layerSHA, err := writeLayerTar(nil, rootfs, layerPath)
+		if err != nil {
+			errResponse(w, http.StatusInternalServerError, "tar rootfs: "+err.Error())
+			return
+		}
+		cfgBytes, cfgSHA, err := synthesiseImageConfig(rec, layerSHA)
+		if err != nil {
+			errResponse(w, http.StatusInternalServerError, "synthesise config: "+err.Error())
+			return
+		}
+		images = append(images, perImage{
+			rec:       rec,
+			layerPath: layerPath,
+			layerDir:  filepath.Base(layerDir),
+			layerSHA:  layerSHA,
+			cfgBytes:  cfgBytes,
+			cfgSHA:    cfgSHA,
+		})
 	}
 
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.WriteHeader(http.StatusOK)
-
 	tw := tar.NewWriter(w)
 	defer tw.Close()
 
-	// manifest.json
-	manifest := []map[string]any{{
-		"Config":   configSHA + ".json",
-		"RepoTags": []string{rec.Ref},
-		"Layers":   []string{"layer.tar"},
-	}}
+	// manifest.json — one entry per image; layer paths prefixed by per-
+	// image dir so bundles with duplicate layer.tar filenames don't clash.
+	manifest := make([]map[string]any, 0, len(images))
+	repositories := map[string]map[string]string{}
+	for _, img := range images {
+		manifest = append(manifest, map[string]any{
+			"Config":   img.cfgSHA + ".json",
+			"RepoTags": []string{img.rec.Ref},
+			"Layers":   []string{img.layerDir + "/layer.tar"},
+		})
+		repo, tag := splitImageRef(img.rec.Ref)
+		if repositories[repo] == nil {
+			repositories[repo] = map[string]string{}
+		}
+		repositories[repo][tag] = img.cfgSHA
+	}
 	manifestJSON, _ := json.Marshal(manifest)
 	if err := writeTarFile(tw, "manifest.json", manifestJSON, 0o644); err != nil {
 		return
-	}
-
-	// repositories — legacy v1 tag map (docker load still consumes it).
-	repo, tag := splitImageRef(rec.Ref)
-	repositories := map[string]map[string]string{
-		repo: {tag: configSHA},
 	}
 	repositoriesJSON, _ := json.Marshal(repositories)
 	if err := writeTarFile(tw, "repositories", repositoriesJSON, 0o644); err != nil {
 		return
 	}
-
-	// <configSHA>.json
-	if err := writeTarFile(tw, configSHA+".json", configBytes, 0o644); err != nil {
-		return
+	for _, img := range images {
+		if err := writeTarFile(tw, img.cfgSHA+".json", img.cfgBytes, 0o644); err != nil {
+			return
+		}
+		// Emit the per-image layer dir entry first, then the layer.tar,
+		// so tar unpackers that require parent dirs don't trip up.
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     img.layerDir + "/",
+			Mode:     0o755,
+			Typeflag: tar.TypeDir,
+			ModTime:  time.Now(),
+		}); err != nil {
+			return
+		}
+		f, err := os.Open(img.layerPath)
+		if err != nil {
+			return
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return
+		}
+		if err := tw.WriteHeader(&tar.Header{
+			Name:    img.layerDir + "/layer.tar",
+			Size:    fi.Size(),
+			Mode:    0o644,
+			ModTime: time.Now(),
+		}); err != nil {
+			f.Close()
+			return
+		}
+		_, _ = io.Copy(tw, f)
+		f.Close()
 	}
-
-	// layer.tar (stream from staging)
-	f, err := os.Open(layerPath)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return
-	}
-	hdr := &tar.Header{
-		Name:    "layer.tar",
-		Size:    fi.Size(),
-		Mode:    0o644,
-		ModTime: time.Now(),
-	}
-	if err := tw.WriteHeader(hdr); err != nil {
-		return
-	}
-	_, _ = io.Copy(tw, f)
 }
 
 // openImageRootfs resolves an image's rootfs to a directory path and
