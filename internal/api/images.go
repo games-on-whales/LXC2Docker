@@ -143,13 +143,75 @@ func (h *Handler) imageHistory(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
 		return
 	}
-	jsonResponse(w, http.StatusOK, []ImageHistoryItem{{
-		ID:        "sha256:" + rec.ID,
-		Created:   rec.Created.Unix(),
+	size := h.imageSize(rec)
+	history := synthesizeImageHistory(rec, size)
+	jsonResponse(w, http.StatusOK, history)
+}
+
+// synthesizeImageHistory reconstructs a Dockerfile-style history list from
+// the OCI config we captured at pull time. Portainer's image "History" tab
+// shows the CreatedBy column, so one row per OCI directive (ENV/WORKDIR/
+// EXPOSE/ENTRYPOINT/CMD) is much more informative than a single "import"
+// row. The top entry carries the size; intermediate entries are marked 0.
+func synthesizeImageHistory(rec *store.ImageRecord, size int64) []ImageHistoryItem {
+	created := rec.Created.Unix()
+	id := "sha256:" + rec.ID
+	tags := []string{rec.Ref}
+	items := []ImageHistoryItem{{
+		ID:        id,
+		Created:   created,
 		CreatedBy: "docker-lxc-daemon import",
-		Tags:      []string{rec.Ref},
+		Tags:      tags,
+		Size:      size,
 		Comment:   "Imported into LXC template store",
-	}})
+	}}
+	for _, env := range rec.OCIEnv {
+		items = append(items, ImageHistoryItem{
+			ID:        "<missing>",
+			Created:   created,
+			CreatedBy: "/bin/sh -c #(nop)  ENV " + env,
+		})
+	}
+	if rec.OCIWorkingDir != "" {
+		items = append(items, ImageHistoryItem{
+			ID:        "<missing>",
+			Created:   created,
+			CreatedBy: "/bin/sh -c #(nop) WORKDIR " + rec.OCIWorkingDir,
+		})
+	}
+	for _, port := range rec.OCIPorts {
+		items = append(items, ImageHistoryItem{
+			ID:        "<missing>",
+			Created:   created,
+			CreatedBy: "/bin/sh -c #(nop)  EXPOSE " + port,
+		})
+	}
+	if len(rec.OCIEntrypoint) > 0 {
+		items = append(items, ImageHistoryItem{
+			ID:        "<missing>",
+			Created:   created,
+			CreatedBy: "/bin/sh -c #(nop)  ENTRYPOINT " + dockerJSONList(rec.OCIEntrypoint),
+		})
+	}
+	if len(rec.OCICmd) > 0 {
+		items = append(items, ImageHistoryItem{
+			ID:        "<missing>",
+			Created:   created,
+			CreatedBy: "/bin/sh -c #(nop)  CMD " + dockerJSONList(rec.OCICmd),
+		})
+	}
+	return items
+}
+
+// dockerJSONList renders a slice the way Docker's history column does:
+// ["/bin/sh","-c","..."] with quoted members. Kept tiny and self-contained
+// — the real encoding/json would add escaping we don't need here.
+func dockerJSONList(xs []string) string {
+	parts := make([]string, 0, len(xs))
+	for _, x := range xs {
+		parts = append(parts, `"`+strings.ReplaceAll(x, `"`, `\"`)+`"`)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
 }
 
 func (h *Handler) tagImage(w http.ResponseWriter, r *http.Request) {
