@@ -196,14 +196,52 @@ type ImageSummary struct {
 
 // ImageInspect is the body returned by GET /images/{name}/json.
 type ImageInspect struct {
-	ID           string            `json:"Id"`
-	RepoTags     []string          `json:"RepoTags"`
-	Created      string            `json:"Created"`
-	Architecture string            `json:"Architecture"`
-	Os           string            `json:"Os"`
-	Size         int64             `json:"Size"`
-	VirtualSize  int64             `json:"VirtualSize"`
-	Labels       map[string]string `json:"Labels"`
+	ID              string            `json:"Id"`
+	RepoTags        []string          `json:"RepoTags"`
+	RepoDigests     []string          `json:"RepoDigests"`
+	Parent          string            `json:"Parent"`
+	Comment         string            `json:"Comment"`
+	Created         string            `json:"Created"`
+	Container       string            `json:"Container"`
+	DockerVersion   string            `json:"DockerVersion"`
+	Author          string            `json:"Author"`
+	Architecture    string            `json:"Architecture"`
+	Os              string            `json:"Os"`
+	Size            int64             `json:"Size"`
+	VirtualSize     int64             `json:"VirtualSize"`
+	Labels          map[string]string `json:"Labels"`
+	Config          *ImageConfig      `json:"Config"`
+	ContainerConfig *ImageConfig      `json:"ContainerConfig"`
+	RootFS          ImageRootFS       `json:"RootFS"`
+	GraphDriver     ImageGraphDriver  `json:"GraphDriver"`
+}
+
+// ImageConfig mirrors the OCI image config block Portainer reads for the
+// image detail page (Entrypoint/Cmd/Env tabs, Exposed ports, WorkingDir).
+type ImageConfig struct {
+	Hostname     string              `json:"Hostname"`
+	Image        string              `json:"Image"`
+	Env          []string            `json:"Env"`
+	Cmd          []string            `json:"Cmd"`
+	Entrypoint   []string            `json:"Entrypoint"`
+	WorkingDir   string              `json:"WorkingDir"`
+	Labels       map[string]string   `json:"Labels"`
+	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+}
+
+// ImageRootFS describes an image's layer list. We do not track layer
+// checksums, so we emit a single synthetic layer pointing at the image ID —
+// enough for Portainer to render the RootFS tab.
+type ImageRootFS struct {
+	Type   string   `json:"Type"`
+	Layers []string `json:"Layers"`
+}
+
+// ImageGraphDriver describes the storage backend of an image. Portainer
+// displays Name on the image detail page.
+type ImageGraphDriver struct {
+	Name string            `json:"Name"`
+	Data map[string]string `json:"Data"`
 }
 
 // MountRequest is a mount entry in the Docker container-create request body.

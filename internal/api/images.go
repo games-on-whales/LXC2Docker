@@ -95,15 +95,30 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	size := h.imageSize(rec)
+	id := "sha256:" + rec.ID
+	config := imageConfigFromRecord(rec)
 	jsonResponse(w, http.StatusOK, ImageInspect{
-		ID:           "sha256:" + rec.ID,
-		RepoTags:     []string{rec.Ref},
-		Created:      rec.Created.Format(time.RFC3339),
-		Architecture: rec.Arch,
-		Os:           "linux",
-		Size:         size,
-		VirtualSize:  size,
-		Labels:       map[string]string{},
+		ID:              id,
+		RepoTags:        []string{rec.Ref},
+		RepoDigests:     []string{},
+		Created:         rec.Created.Format(time.RFC3339),
+		Architecture:    rec.Arch,
+		Os:              "linux",
+		Size:            size,
+		VirtualSize:     size,
+		Labels:          config.Labels,
+		DockerVersion:   "24.0.0",
+		Author:          "docker-lxc-daemon",
+		Config:          config,
+		ContainerConfig: config,
+		RootFS: ImageRootFS{
+			Type:   "layers",
+			Layers: []string{id},
+		},
+		GraphDriver: ImageGraphDriver{
+			Name: "lxc",
+			Data: map[string]string{},
+		},
 	})
 }
 
@@ -215,6 +230,28 @@ func (h *Handler) pushImage(w http.ResponseWriter, r *http.Request) {
 		"error":       "image push is not supported",
 		"errorDetail": map[string]string{"message": "image push is not supported"},
 	})
+}
+
+// imageConfigFromRecord materialises an ImageConfig from the OCI metadata
+// captured during pull. ExposedPorts is built from OCIPorts (strings like
+// "80/tcp") using the map-of-empty-struct shape Docker returns.
+func imageConfigFromRecord(rec *store.ImageRecord) *ImageConfig {
+	exposed := map[string]struct{}{}
+	for _, p := range rec.OCIPorts {
+		if p != "" {
+			exposed[p] = struct{}{}
+		}
+	}
+	return &ImageConfig{
+		Hostname:     "",
+		Image:        rec.Ref,
+		Env:          append([]string{}, rec.OCIEnv...),
+		Cmd:          append([]string{}, rec.OCICmd...),
+		Entrypoint:   append([]string{}, rec.OCIEntrypoint...),
+		WorkingDir:   rec.OCIWorkingDir,
+		Labels:       map[string]string{},
+		ExposedPorts: exposed,
+	}
 }
 
 // imageSize returns a best-effort on-disk size for an image. ZFS-backed
