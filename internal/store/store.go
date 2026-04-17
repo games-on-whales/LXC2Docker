@@ -34,6 +34,14 @@ type ContainerRecord struct {
 	PortBindings []PortBinding    `json:"port_bindings,omitempty"`
 	Mounts       []MountSpec      `json:"mounts"`
 	StartedAt    *time.Time        `json:"started_at,omitempty"` // nil until first start; distinguishes "created" from "exited"
+	// Ephemeral is true only for daemon-created raw-LXC containers that the
+	// GC is permitted to reap. Permanent Proxmox CTs (visible in PVE UI) and
+	// any pre-existing records that lack this flag are left strictly alone.
+	Ephemeral bool `json:"ephemeral,omitempty"`
+	// Storage records the PVE storage pool this container's rootfs lives
+	// on. Used by RemoveContainer for ephemeral containers (the ZFS clone
+	// dataset path includes the pool name) and for diagnostics on PVE CTs.
+	Storage string `json:"storage,omitempty"`
 }
 
 // PortBinding records a single host→container port mapping.
@@ -50,17 +58,20 @@ type MountSpec struct {
 	ReadOnly    bool   `json:"read_only"`
 }
 
-// ImageRecord holds metadata for a pulled image (backed by a Proxmox CT
-// template on ZFS, or a legacy LXC template container).
+// ImageRecord holds metadata for a pulled image. Templates can be backed
+// by a raw ZFS dataset (preferred — invisible to the PVE UI), a Proxmox
+// CT template VMID (legacy from pre-Apr-2026 daemons; cluttered the UI),
+// or a directory-based LXC template container (legacy mode without PVE).
 type ImageRecord struct {
-	ID           string    `json:"id"`            // e.g. "ubuntu_22.04"
-	Ref          string    `json:"ref"`           // original "ubuntu:22.04"
-	Distro       string    `json:"distro"`        // "ubuntu"
-	Release      string    `json:"release"`       // "jammy"
-	Arch         string    `json:"arch"`          // "amd64"
-	TemplateName string    `json:"template_name"` // LXC container used as clone source (legacy)
-	TemplateVMID int       `json:"template_vmid"` // Proxmox CT VMID of the template (0 = legacy)
-	Created      time.Time `json:"created"`
+	ID              string    `json:"id"`               // e.g. "ubuntu_22.04"
+	Ref             string    `json:"ref"`              // original "ubuntu:22.04"
+	Distro          string    `json:"distro"`           // "ubuntu"
+	Release         string    `json:"release"`          // "jammy"
+	Arch            string    `json:"arch"`             // "amd64"
+	TemplateName    string    `json:"template_name"`    // LXC container used as clone source (legacy)
+	TemplateVMID    int       `json:"template_vmid"`    // Proxmox CT VMID of the template (legacy; cluttered PVE UI)
+	TemplateDataset string    `json:"template_dataset"` // ZFS dataset path of the template (preferred for new pulls; e.g. "large/dld-templates/nginx-alpine")
+	Created         time.Time `json:"created"`
 	// OCI image metadata (populated only for OCI-pulled images).
 	OCIEntrypoint []string `json:"oci_entrypoint,omitempty"`
 	OCICmd        []string `json:"oci_cmd,omitempty"`

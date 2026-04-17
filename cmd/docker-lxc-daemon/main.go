@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,15 +20,31 @@ import (
 	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
 )
 
+// bridgeFlag accumulates repeated --bridge values into a slice.
+type bridgeFlag []string
+
+func (b *bridgeFlag) String() string     { return strings.Join(*b, ",") }
+func (b *bridgeFlag) Set(v string) error { *b = append(*b, v); return nil }
+
 func main() {
 	socketPath := flag.String("socket", "/run/docker-lxc-daemon/docker.sock", "Unix socket path to listen on")
 	lxcPath := flag.String("lxcpath", "/var/lib/lxc", "LXC container storage path (legacy direct-LXC mode)")
-	pveStorage := flag.String("pve-storage", "", "Proxmox storage name for CT rootfs (e.g. 'large'); enables Proxmox CT mode")
+	pveStorage := flag.String("pve-storage", "", "Default Proxmox storage name for CT rootfs (e.g. 'large'); enables Proxmox CT mode. Per-container override via 'dld.storage' label.")
 	statePath := flag.String("statepath", "/var/lib/docker-lxc-daemon", "Daemon state directory")
-	lanBridge := flag.String("lan-bridge", "", "Physical LAN bridge for dual-NIC containers (e.g. 'vmbr0')")
-	lanPrefix := flag.String("lan-prefix", "", "LAN IP prefix; VMID becomes last octet (e.g. '192.168.1')")
-	lanGateway := flag.String("lan-gateway", "", "LAN gateway (e.g. '192.168.1.1')")
-	lanSubnet := flag.Int("lan-subnet", 24, "LAN subnet prefix length (e.g. 23 for /23)")
+
+	// Multi-bridge configuration. Repeatable; first value is the default
+	// bridge used when a container requests LAN networking without naming
+	// a specific bridge via the 'dld.bridge' label.
+	var bridges bridgeFlag
+	flag.Var(&bridges, "bridge",
+		"LAN bridge spec 'name=prefix/subnet:gateway' (e.g. 'vmbr0=192.168.1/23:192.168.1.1'); repeatable. The first value is the default.")
+
+	// Legacy single-bridge flags (backwards compatible). When --bridge is
+	// not used, these populate the single default bridge entry.
+	lanBridge := flag.String("lan-bridge", "", "DEPRECATED: use --bridge. Default LAN bridge name.")
+	lanPrefix := flag.String("lan-prefix", "", "DEPRECATED: use --bridge. Default LAN IP prefix.")
+	lanGateway := flag.String("lan-gateway", "", "DEPRECATED: use --bridge. Default LAN gateway.")
+	lanSubnet := flag.Int("lan-subnet", 24, "DEPRECATED: use --bridge. Default LAN subnet prefix length.")
 	flag.Parse()
 
 	if os.Geteuid() != 0 {
@@ -38,11 +56,9 @@ func main() {
 		log.Fatalf("store: %v", err)
 	}
 
-	lan := lxc.LANConfig{
-		Bridge:  *lanBridge,
-		Prefix:  *lanPrefix,
-		Gateway: *lanGateway,
-		Subnet:  *lanSubnet,
+	lan, err := buildLANConfig(bridges, *lanBridge, *lanPrefix, *lanGateway, *lanSubnet)
+	if err != nil {
+		log.Fatalf("bridge config: %v", err)
 	}
 	mgr, err := lxc.NewManager(*lxcPath, *pveStorage, lan, st)
 	if err != nil {
@@ -102,4 +118,70 @@ func main() {
 	if err := srv.Serve(l); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+// buildLANConfig assembles the daemon's bridge catalog from the new
+// repeatable --bridge flag and the legacy single-bridge flags. Each
+// --bridge value parses as 'name=prefix/subnet:gateway'. The legacy
+// flags, if any are set, become an additional entry; the first entry
+// added becomes the default. Returns an empty config (no bridges) when
+// neither form is provided — the daemon is then LAN-disabled and any
+// container requesting LAN will fail at create time.
+func buildLANConfig(specs []string, legacyName, legacyPrefix, legacyGateway string, legacySubnet int) (lxc.LANConfig, error) {
+	cfg := lxc.LANConfig{Bridges: map[string]lxc.BridgeSpec{}}
+	for _, raw := range specs {
+		spec, err := parseBridgeSpec(raw)
+		if err != nil {
+			return cfg, err
+		}
+		if _, dup := cfg.Bridges[spec.Name]; dup {
+			return cfg, fmt.Errorf("duplicate bridge %q", spec.Name)
+		}
+		cfg.Bridges[spec.Name] = spec
+		if cfg.Default == "" {
+			cfg.Default = spec.Name
+		}
+	}
+	if legacyName != "" {
+		if _, exists := cfg.Bridges[legacyName]; !exists {
+			cfg.Bridges[legacyName] = lxc.BridgeSpec{
+				Name:    legacyName,
+				Prefix:  legacyPrefix,
+				Gateway: legacyGateway,
+				Subnet:  legacySubnet,
+			}
+			if cfg.Default == "" {
+				cfg.Default = legacyName
+			}
+		}
+	}
+	return cfg, nil
+}
+
+// parseBridgeSpec parses 'name=prefix/subnet:gateway' into a BridgeSpec.
+// Example: 'vmbr0=192.168.1/23:192.168.1.1'.
+func parseBridgeSpec(raw string) (lxc.BridgeSpec, error) {
+	nameRest := strings.SplitN(raw, "=", 2)
+	if len(nameRest) != 2 || nameRest[0] == "" {
+		return lxc.BridgeSpec{}, fmt.Errorf("bridge spec %q: expected 'name=prefix/subnet:gateway'", raw)
+	}
+	name := nameRest[0]
+	netGw := strings.SplitN(nameRest[1], ":", 2)
+	if len(netGw) != 2 {
+		return lxc.BridgeSpec{}, fmt.Errorf("bridge spec %q: missing ':gateway'", raw)
+	}
+	prefSub := strings.SplitN(netGw[0], "/", 2)
+	if len(prefSub) != 2 {
+		return lxc.BridgeSpec{}, fmt.Errorf("bridge spec %q: prefix must be 'prefix/subnet'", raw)
+	}
+	subnet, err := strconv.Atoi(prefSub[1])
+	if err != nil {
+		return lxc.BridgeSpec{}, fmt.Errorf("bridge spec %q: invalid subnet: %w", raw, err)
+	}
+	return lxc.BridgeSpec{
+		Name:    name,
+		Prefix:  prefSub[0],
+		Gateway: netGw[1],
+		Subnet:  subnet,
+	}, nil
 }

@@ -30,6 +30,10 @@ type HostConfig struct {
 	IpcMode           string                   `json:"IpcMode"` // "host" or "" (private)
 	PortBindings      map[string][]PortBinding `json:"PortBindings"`
 	RestartPolicy     RestartPolicy            `json:"RestartPolicy"`
+	// AutoRemove mirrors Docker's --rm flag. When true, the daemon creates
+	// the container as ephemeral (no PVE UI presence; reaped by GC after
+	// it exits). Default false → permanent PVE CT in PVE mode.
+	AutoRemove bool `json:"AutoRemove"`
 }
 
 // DeviceMapping is a single host→container device mapping.

@@ -44,14 +44,36 @@ type ContainerConfig struct {
 	// the container is created as an ephemeral raw-LXC container with a
 	// ZFS-cloned rootfs — invisible to Proxmox but still on the PVE storage.
 	ProxmoxCT bool
-	// LAN requests a second NIC on the physical LAN bridge (e.g. vmbr0).
-	// Only effective for Proxmox CTs — the LAN IP is derived from the VMID.
+	// LAN requests a second NIC on a LAN bridge. Only effective for
+	// Proxmox CTs. The bridge is selected by Bridge (or daemon default
+	// if Bridge is empty); the IP is derived from VMID and the bridge spec.
 	LAN bool
-	// LANBridge, LANIP, LANGateway are filled in by the manager (not the API
-	// layer) when LAN is true and the daemon has --lan-bridge configured.
-	LANBridge  string // e.g. "vmbr0"
-	LANIP      string // e.g. "192.168.1.106/23"
-	LANGateway string // e.g. "192.168.1.1"
+	// Bridge names which configured LAN bridge to attach when LAN is true.
+	// Empty means use the daemon's default bridge. Set from "dld.bridge"
+	// label.
+	Bridge string
+	// Storage is the per-container PVE storage override for rootfs (only
+	// honored for permanent CTs; ephemeral containers must use the
+	// template's storage because ZFS clones are pool-local). Empty means
+	// the daemon default. Set from "dld.storage" label.
+	Storage string
+	// ISOs are read-only ISO files bind-mounted into the container.
+	// The daemon resolves each Storage:VolumeID via `pvesm path` and binds
+	// the resulting file to Destination. Set from "dld.iso" label
+	// (comma-separated list of "storage:volid[:dest]").
+	ISOs []ISOMount
+	// LANBridge, LANIP, LANGateway are filled in by the manager (not the
+	// API layer) once Bridge has been resolved against LANConfig.
+	LANBridge  string
+	LANIP      string
+	LANGateway string
+}
+
+// ISOMount describes one read-only ISO bind-mount.
+type ISOMount struct {
+	Storage     string // PVE storage name (e.g. "isos")
+	VolumeID    string // path within storage (e.g. "iso/Win11.iso")
+	Destination string // path inside the container (e.g. "/mnt/win11.iso")
 }
 
 // MountSpec describes a single bind mount.
@@ -67,12 +89,33 @@ type DeviceSpec struct {
 	PathInContainer string
 }
 
+// EphemeralMarker is a comment line written into the on-disk LXC config for
+// every ephemeral container created by this daemon. The GC requires this
+// marker to be present before destroying a container — it is the positive
+// identification that a container was created as ephemeral by this daemon.
+// Permanent Proxmox CTs (writePVEConfig) never receive this marker.
+const EphemeralMarker = "# docker-lxc-daemon: ephemeral"
+
+// ManagedTag is the Proxmox CT tag the daemon writes onto every permanent
+// container it creates. It also serves as the opt-in adoption marker:
+// any pre-existing PVE CT carrying this tag (added by the operator via
+// the PVE UI or `pct set <vmid> --tags ...`) is surfaced to Docker
+// clients via this daemon as if the daemon owned it.
+//
+// Untagged PVE CTs are invisible to the daemon — listContainers does not
+// return them and lifecycle calls against their VMIDs are rejected.
+// Removing the tag from a CT releases it from daemon management.
+const ManagedTag = "dld-managed"
+
 // rewriteConfig reads the cloned LXC config file, strips problematic lines
 // inherited from the download template (userns, apparmor, duplicate network),
 // and appends the daemon-managed config items. This is more reliable than
 // the go-lxc SetConfigItem API because lxc.include directives are processed
 // at container start time and can override in-memory changes.
-func rewriteConfig(path string, cfg *ContainerConfig, ip, containerName string) error {
+//
+// If ephemeral is true, writes EphemeralMarker into the config so the GC
+// can positively identify this container as GC-eligible.
+func rewriteConfig(path string, cfg *ContainerConfig, ip, containerName string, ephemeral bool) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("read config: %w", err)
@@ -153,6 +196,9 @@ func rewriteConfig(path string, cfg *ContainerConfig, ip, containerName string) 
 		fmt.Fprintln(w, line)
 	}
 	fmt.Fprintln(w, "\n# docker-lxc-daemon managed config")
+	if ephemeral {
+		fmt.Fprintln(w, EphemeralMarker)
+	}
 	for _, item := range items {
 		fmt.Fprintf(w, "%s = %s\n", item.key, item.value)
 	}
@@ -576,6 +622,10 @@ func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg *Cont
 	lines = append(lines, "ostype: unmanaged")
 	lines = append(lines, fmt.Sprintf("rootfs: %s", rootfsSpec))
 	lines = append(lines, "unprivileged: 0")
+	// Mark the CT as daemon-managed so listContainers / Portainer surface
+	// it. Removing this tag (via PVE UI or `pct set --tags ...`) releases
+	// the CT from daemon management.
+	lines = append(lines, "tags: "+ManagedTag)
 
 	// Raw lxc.* pass-through items (including network config).
 	items := buildPVEItems(cfg, ip)

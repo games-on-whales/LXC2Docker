@@ -5,12 +5,15 @@ package lxc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,12 +23,36 @@ import (
 	liblxc "github.com/lxc/go-lxc"
 )
 
-// LANConfig holds daemon-level LAN bridge settings for dual-NIC containers.
-type LANConfig struct {
-	Bridge  string // physical bridge name (e.g. "vmbr0"); empty = disabled
-	Prefix  string // IP prefix (e.g. "192.168.1"); VMID becomes last octet
-	Gateway string // LAN gateway (e.g. "192.168.1.1")
+// BridgeSpec describes a single LAN bridge known to the daemon. A daemon
+// can advertise multiple bridges; containers select one with the
+// "dld.bridge=<name>" label.
+type BridgeSpec struct {
+	Name    string // bridge name (e.g. "vmbr0")
+	Prefix  string // IPv4 prefix; VMID becomes last octet (e.g. "192.168.1")
+	Gateway string // gateway address (e.g. "192.168.1.1")
 	Subnet  int    // prefix length (e.g. 23 for /23)
+}
+
+// LANConfig holds daemon-level LAN bridge settings. Bridges is the full
+// catalog of known bridges (keyed by name). Default names the bridge used
+// when a container requests LAN networking without specifying which
+// bridge — empty Default means "no daemon-level LAN".
+type LANConfig struct {
+	Bridges map[string]BridgeSpec
+	Default string
+}
+
+// Lookup returns the spec for name, or the default bridge if name is empty.
+// Returns ok=false if the requested bridge is unknown.
+func (c LANConfig) Lookup(name string) (BridgeSpec, bool) {
+	if name == "" {
+		name = c.Default
+	}
+	if name == "" {
+		return BridgeSpec{}, false
+	}
+	spec, ok := c.Bridges[name]
+	return spec, ok
 }
 
 // Manager owns all LXC operations on behalf of the daemon.
@@ -54,9 +81,15 @@ func NewManager(lxcPath, pveStorage string, lan LANConfig, st *store.Store) (*Ma
 	if pveStorage != "" {
 		log.Printf("Proxmox CT mode enabled (storage=%s)", pveStorage)
 	}
-	if lan.Bridge != "" {
-		log.Printf("LAN bridge enabled (bridge=%s, prefix=%s, gateway=%s, /%d)",
-			lan.Bridge, lan.Prefix, lan.Gateway, lan.Subnet)
+	if len(lan.Bridges) > 0 {
+		for name, b := range lan.Bridges {
+			marker := ""
+			if name == lan.Default {
+				marker = " (default)"
+			}
+			log.Printf("LAN bridge%s registered: %s prefix=%s gateway=%s /%d",
+				marker, b.Name, b.Prefix, b.Gateway, b.Subnet)
+		}
 	}
 	m.reconcile()
 	return m, nil
@@ -66,12 +99,20 @@ func NewManager(lxcPath, pveStorage string, lan LANConfig, st *store.Store) (*Ma
 // containers that are still running, it re-applies port forwarding rules
 // (which may have been lost if nft state was cleared). For containers
 // whose LXC directory no longer exists, it cleans them from the store.
+// For permanent PVE CTs that pre-date the tag-based ownership scheme,
+// it backfills the ManagedTag onto the .conf so they remain visible
+// after operators rely on the tag as the source of truth.
 func (m *Manager) reconcile() {
 	for _, rec := range m.store.ListContainers() {
 		if !m.containerExists(rec.ID) {
 			log.Printf("reconcile: removing orphaned store entry %s (%s)", rec.Name, rec.ID[:12])
 			m.store.RemoveContainer(rec.ID)
 			continue
+		}
+		if rec.VMID > 0 {
+			if err := ensureManagedTag(rec.VMID); err != nil {
+				log.Printf("reconcile: tag backfill VMID %d: %v", rec.VMID, err)
+			}
 		}
 		state, _ := m.State(rec.ID)
 		if state == "running" && rec.IPAddress != "" {
@@ -87,11 +128,52 @@ func (m *Manager) reconcile() {
 	}
 }
 
-// StartGC launches a background goroutine that periodically removes stopped
-// ephemeral containers. Compose-managed services (those with Docker Compose
-// labels) and Proxmox CTs (VMID > 0) are left alone. This handles the common
-// case where Wolf sessions end abnormally (e.g. daemon restart) and child
-// containers (PulseAudio, Steam, Wolf-UI) are left behind.
+// ensureManagedTag idempotently adds ManagedTag to the tags line of the
+// given PVE CT's .conf. Used during reconcile to backfill CTs created
+// before tag-based ownership existed.
+func ensureManagedTag(vmid int) error {
+	path := pveConfigPath(vmid)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+	tagsIdx := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, "[") {
+			break
+		}
+		if strings.HasPrefix(line, "tags:") {
+			tagsIdx = i
+			break
+		}
+	}
+	if tagsIdx >= 0 {
+		_, tags, _ := readPVEHostnameAndTags(path)
+		if hasTag(tags, ManagedTag) {
+			return nil
+		}
+		tags = append(tags, ManagedTag)
+		lines[tagsIdx] = "tags: " + strings.Join(tags, ",")
+	} else {
+		lines = append(lines, "tags: "+ManagedTag)
+	}
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644)
+}
+
+// StartGC launches a background goroutine that periodically reaps stopped
+// ephemeral containers created by this daemon.
+//
+// Safety: the GC ONLY destroys a container when ALL of the following hold:
+//   - the store record exists with rec.Ephemeral == true
+//   - rec.VMID == 0 (i.e. not a Proxmox CT)
+//   - the on-disk LXC config contains EphemeralMarker
+//   - the container is in state "exited"
+//
+// Any record missing any of these checks is left strictly alone. The GC
+// never enumerates lxc-ls / pct list — it works only from the store.
+// This makes it safe to run on a Proxmox host that contains permanent
+// PVE CTs and other LXC containers it did not create.
 func (m *Manager) StartGC(ctx context.Context) {
 	go func() {
 		// Run immediately on startup to clean leftovers, then periodically.
@@ -110,40 +192,15 @@ func (m *Manager) StartGC(ctx context.Context) {
 }
 
 func (m *Manager) gc() {
-	// Separate ephemeral containers into stopped (remove immediately) and
-	// running (check for orphans).
-	var stopped []*store.ContainerRecord
-	var runningSession []*store.ContainerRecord // Wolf-UI, WolfSteam, etc.
-	var runningSupport []*store.ContainerRecord // WolfPulseAudio, etc.
-
 	for _, rec := range m.store.ListContainers() {
-		// Never touch Proxmox CTs or compose-managed services.
-		if rec.VMID > 0 {
+		if !m.isReapable(rec) {
 			continue
 		}
-		if rec.Labels != nil {
-			if _, ok := rec.Labels["com.docker.compose.service"]; ok {
-				continue
-			}
-		}
-
 		state, _ := m.State(rec.ID)
-		if state == "exited" {
-			stopped = append(stopped, rec)
-		} else if state == "running" {
-			// Session containers have unique per-session names (Wolf-UI_<id>,
-			// WolfSteam_<id>). Support containers are generic (WolfPulseAudio).
-			if strings.Contains(rec.Name, "_") {
-				runningSession = append(runningSession, rec)
-			} else {
-				runningSupport = append(runningSupport, rec)
-			}
+		if state != "exited" {
+			continue
 		}
-	}
-
-	// Remove all stopped ephemeral containers.
-	for _, rec := range stopped {
-		log.Printf("GC: removing stopped container %s (%s)", rec.Name, rec.ID[:12])
+		log.Printf("GC: removing stopped ephemeral %s (%s)", rec.Name, rec.ID[:12])
 		if rec.IPAddress != "" {
 			RemovePortForwards(rec.IPAddress)
 		}
@@ -151,39 +208,182 @@ func (m *Manager) gc() {
 			log.Printf("GC: failed to remove %s: %v", rec.ID[:12], err)
 		}
 	}
+}
 
-	// Orphan detection: if there are support containers (PulseAudio) but
-	// no session containers AND no running Proxmox CTs, the support
-	// containers are orphans from sessions that ended abnormally.
-	// PVE CTs (like Wolf) spawn support containers (PulseAudio) via the
-	// Docker API — we must not kill them while the CT is still running.
-	if len(runningSession) == 0 && len(runningSupport) > 0 {
-		pveCTRunning := false
-		for _, rec := range m.store.ListContainers() {
-			if rec.VMID > 0 {
-				if st, _ := m.State(rec.ID); st == "running" {
-					pveCTRunning = true
-					break
-				}
-			}
+// isReapable returns true only when every safety check confirms the
+// container was created by this daemon as ephemeral AND has actually run
+// at least once. Any single failed check returns false — and logs why, so
+// unexpected state on the host is visible rather than silently destroyed.
+//
+// The StartedAt check matters: a container whose start failed (or whose
+// owner has not yet called start) sits in state "exited" with all other
+// ephemeral markers in place. Reaping it would silently swallow user
+// intent to retry or debug.
+func (m *Manager) isReapable(rec *store.ContainerRecord) bool {
+	if rec == nil {
+		return false
+	}
+	if !rec.Ephemeral {
+		return false
+	}
+	if rec.VMID != 0 {
+		log.Printf("GC: skip %s (%s) — Ephemeral=true but VMID=%d (state inconsistent)",
+			rec.Name, rec.ID[:12], rec.VMID)
+		return false
+	}
+	if rec.StartedAt == nil {
+		// Never started — leave alone so the owner can retry or inspect.
+		return false
+	}
+	if !m.hasEphemeralMarker(rec.ID) {
+		log.Printf("GC: skip %s (%s) — on-disk config missing EphemeralMarker",
+			rec.Name, rec.ID[:12])
+		return false
+	}
+	return true
+}
+
+// hasEphemeralMarker reports whether the on-disk LXC config for id contains
+// the EphemeralMarker comment. This is the second source of truth (the
+// store record is the first) — both must agree before the GC will act.
+func (m *Manager) hasEphemeralMarker(id string) bool {
+	configPath := filepath.Join(m.lxcPath, id, "config")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == EphemeralMarker {
+			return true
 		}
-		if !pveCTRunning {
-			for _, rec := range runningSupport {
-				log.Printf("GC: stopping orphaned container %s (%s, image=%s)",
-					rec.Name, rec.ID[:12], rec.Image)
-				if err := m.StopContainer(rec.ID, 5*time.Second); err != nil {
-					log.Printf("GC: failed to stop %s: %v", rec.ID[:12], err)
-					continue
-				}
-				if rec.IPAddress != "" {
-					RemovePortForwards(rec.IPAddress)
-				}
-				if err := m.RemoveContainer(rec.ID); err != nil {
-					log.Printf("GC: failed to remove %s: %v", rec.ID[:12], err)
+	}
+	return false
+}
+
+// adoptedID returns a deterministic Docker-style 64-hex ID for a Proxmox
+// CT discovered via tag adoption. Hashing a constant prefix with the VMID
+// guarantees: (1) stable across daemon restarts, (2) no collision with
+// daemon-generated IDs (which use crypto/rand), (3) reversible only if
+// the daemon enumerates VMIDs (no need for a persistent map).
+func adoptedID(vmid int) string {
+	sum := sha256.Sum256([]byte("dld-adopted:" + strconv.Itoa(vmid)))
+	return hex.EncodeToString(sum[:])
+}
+
+// discoverAdopted scans /etc/pve/lxc/*.conf for CTs carrying the
+// ManagedTag and returns synthesized records for those NOT already
+// represented in the daemon's own store. Daemon-created CTs already
+// have store records (with full Docker metadata) and are skipped here.
+//
+// Synthesized records have minimal Docker metadata — Image is "adopted",
+// Mounts/Env/PortBindings are unknown. Lifecycle ops on adopted CTs
+// route through pct via the recorded VMID exactly like daemon-created
+// permanent CTs.
+func (m *Manager) discoverAdopted() map[string]*store.ContainerRecord {
+	out := map[string]*store.ContainerRecord{}
+	if !m.UsePVE() {
+		return out
+	}
+	known := map[int]bool{}
+	for _, rec := range m.store.ListContainers() {
+		if rec.VMID > 0 {
+			known[rec.VMID] = true
+		}
+	}
+	files, err := filepath.Glob("/etc/pve/lxc/*.conf")
+	if err != nil {
+		return out
+	}
+	for _, path := range files {
+		base := strings.TrimSuffix(filepath.Base(path), ".conf")
+		vmid, err := strconv.Atoi(base)
+		if err != nil || vmid == 0 || known[vmid] {
+			continue
+		}
+		hostname, tags, ok := readPVEHostnameAndTags(path)
+		if !ok || !hasTag(tags, ManagedTag) {
+			continue
+		}
+		fi, _ := os.Stat(path)
+		created := time.Now()
+		if fi != nil {
+			created = fi.ModTime()
+		}
+		id := adoptedID(vmid)
+		if hostname == "" {
+			hostname = fmt.Sprintf("ct-%d", vmid)
+		}
+		out[id] = &store.ContainerRecord{
+			ID:        id,
+			VMID:      vmid,
+			Name:      hostname,
+			Image:     "adopted",
+			Created:   created,
+			Ephemeral: false,
+		}
+	}
+	return out
+}
+
+// readPVEHostnameAndTags parses just the hostname and tags fields out of
+// a Proxmox CT .conf. Returns ok=false on read failure. Other fields are
+// ignored — discovery only needs identity and the adoption marker.
+func readPVEHostnameAndTags(path string) (hostname string, tags []string, ok bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", nil, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		// PVE configs use "[section]" headers (e.g. "[snapshot]") to
+		// separate per-snapshot blocks. Stop at the first one — we only
+		// want the active config in the file head.
+		if strings.HasPrefix(line, "[") {
+			break
+		}
+		if v, found := strings.CutPrefix(line, "hostname:"); found {
+			hostname = strings.TrimSpace(v)
+		} else if v, found := strings.CutPrefix(line, "tags:"); found {
+			for _, t := range strings.Split(strings.TrimSpace(v), ",") {
+				if t = strings.TrimSpace(t); t != "" {
+					tags = append(tags, t)
 				}
 			}
 		}
 	}
+	return hostname, tags, true
+}
+
+func hasTag(tags []string, want string) bool {
+	for _, t := range tags {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
+// ListContainers returns the union of the daemon's own store records and
+// records synthesized for adopted (operator-tagged) Proxmox CTs.
+// Use this in API handlers instead of the bare store.
+func (m *Manager) ListContainers() []*store.ContainerRecord {
+	out := m.store.ListContainers()
+	for _, rec := range m.discoverAdopted() {
+		out = append(out, rec)
+	}
+	return out
+}
+
+// GetContainer resolves an ID against the daemon's store first, falling
+// back to adopted (tagged) CT discovery. Returns nil when neither source
+// has the ID.
+func (m *Manager) GetContainer(id string) *store.ContainerRecord {
+	if rec := m.store.GetContainer(id); rec != nil {
+		return rec
+	}
+	if rec, ok := m.discoverAdopted()[id]; ok {
+		return rec
+	}
+	return nil
 }
 
 // PullImage ensures a template container exists for the given image ref.
@@ -191,7 +391,7 @@ func (m *Manager) gc() {
 // For app images it creates the base template, starts it, installs packages,
 // then stops it — producing a ready-to-clone template.
 func (m *Manager) PullImage(ref, arch string, progress func(string)) error {
-	resolved, err := image.Resolve(ref, arch)
+	resolved, err := image.Resolve(ref, arch, m.UsePVE())
 	if err != nil {
 		return err
 	}
@@ -254,7 +454,7 @@ func (m *Manager) pullDistro(r *image.ResolvedImage, progress func(string)) erro
 func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 	// 1. Ensure the base distro template exists.
 	progress(fmt.Sprintf("Pulling base image %s for %s", r.BaseRef, r.Ref))
-	baseResolved, err := image.Resolve(r.BaseRef, r.Arch)
+	baseResolved, err := image.Resolve(r.BaseRef, r.Arch, false)
 	if err != nil {
 		return err
 	}
@@ -288,7 +488,7 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 	}
 	defer m.store.FreeIP(ip) // Template doesn't need a permanent IP.
 
-	if err := rewriteConfig(templateCfgPath, &templateCfg, ip, r.TemplateContainerName); err != nil {
+	if err := rewriteConfig(templateCfgPath, &templateCfg, ip, r.TemplateContainerName, false); err != nil {
 		return fmt.Errorf("manager: rewrite app template config: %w", err)
 	}
 	templateRootfs := filepath.Join(m.lxcPath, r.TemplateContainerName, "rootfs")
@@ -351,66 +551,59 @@ func (m *Manager) pullOCI(r *image.ResolvedImage, progress func(string)) error {
 		return fmt.Errorf("manager: oci pull: %w", err)
 	}
 
-	var templateVMID int
+	var templateDataset string
 
 	if m.UsePVE() {
-		// --- Proxmox CT mode ---
-		// Create a tarball from the rootfs, then use pct create to make a
-		// Proxmox CT template on the configured storage (ZFS).
-		progress("Creating Proxmox CT template from OCI rootfs")
+		// --- Proxmox CT mode (ZFS-only template, invisible to PVE UI) ---
+		// We do NOT register the template as a Proxmox CT (no `pct create`,
+		// no template VMID). Instead the rootfs lives in a ZFS dataset
+		// under <storage>/dld-templates/<safe-name>, with a snapshot
+		// `@tmpl` that permanent and ephemeral containers clone from.
+		progress("Creating ZFS template from OCI rootfs")
 
-		tarball := filepath.Join(os.TempDir(), "oci-template-"+oci.SafeDirName(r.Ref)+".tar.gz")
-		defer os.Remove(tarball)
+		safeName := oci.SafeDirName(r.Ref)
+		parentDS := m.pveStorage + "/dld-templates"
+		templateDataset = parentDS + "/" + safeName
+		mountPoint := "/" + templateDataset
 
-		out, err := exec.Command("tar", "czf", tarball, "-C", rootfsPath, ".").CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("manager: create tarball: %s: %w", out, err)
-		}
+		// Ensure parent dataset exists (idempotent).
+		exec.Command("zfs", "create", "-p", "-o", "mountpoint=none", parentDS).Run()
 
-		vmid, err := allocateVMID()
-		if err != nil {
-			return err
-		}
-		templateVMID = vmid
-
-		hostname := sanitizeHostname("tmpl-" + oci.SafeDirName(r.Ref))
-
-		out, err = exec.Command("pct", "create", fmt.Sprintf("%d", vmid), tarball,
-			"--storage", m.pveStorage,
-			"--ostype", "unmanaged",
-			"--arch", "amd64",
-			"--hostname", hostname,
-			"--unprivileged", "0",
-			"--rootfs", fmt.Sprintf("%s:4", m.pveStorage),
+		// Create the per-image dataset, mounted so we can populate it.
+		out, err := exec.Command("zfs", "create",
+			"-o", "mountpoint="+mountPoint,
+			templateDataset,
 		).CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("manager: pct create template %d: %s: %w", vmid, out, err)
+			return fmt.Errorf("manager: zfs create %s: %s: %w", templateDataset, out, err)
 		}
 
-		// Mark it as a template so it can't be accidentally started.
-		exec.Command("pct", "template", fmt.Sprintf("%d", vmid)).Run()
-
-		// Create a ZFS snapshot for instant ephemeral container cloning.
-		// pct template converts subvol → basevol, so snapshot the basevol.
-		snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, vmid)
-		if snapOut, snapErr := exec.Command("zfs", "snapshot", snapDataset).CombinedOutput(); snapErr != nil {
-			log.Printf("pullOCI: warning: could not create ZFS snapshot %s: %s: %v", snapDataset, snapOut, snapErr)
-		} else {
-			log.Printf("pullOCI: created ZFS snapshot %s for ephemeral cloning", snapDataset)
+		// Populate it with the OCI rootfs.
+		out, err = exec.Command("cp", "-a", rootfsPath+"/.", mountPoint+"/").CombinedOutput()
+		if err != nil {
+			exec.Command("zfs", "destroy", templateDataset).Run()
+			return fmt.Errorf("manager: copy OCI rootfs into %s: %s: %w", mountPoint, out, err)
 		}
 
-		// Write resolv.conf into the template rootfs.
-		templateRootfs := m.pveRootfsPath(vmid)
-		resolvPath := filepath.Join(templateRootfs, "etc", "resolv.conf")
+		// Bake DNS resolution into the template.
+		resolvPath := filepath.Join(mountPoint, "etc", "resolv.conf")
 		os.Remove(resolvPath)
 		os.MkdirAll(filepath.Dir(resolvPath), 0o755)
 		os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644)
+
+		// Snapshot for instant cloning by both permanent and ephemeral CTs.
+		out, err = exec.Command("zfs", "snapshot", templateDataset+"@tmpl").CombinedOutput()
+		if err != nil {
+			exec.Command("zfs", "destroy", "-r", templateDataset).Run()
+			return fmt.Errorf("manager: zfs snapshot %s@tmpl: %s: %w", templateDataset, out, err)
+		}
 
 		// Clean up the OCI working directory.
 		os.RemoveAll(rootfsPath)
 		oci.Cleanup(ociStoreDir, r.Ref)
 
-		log.Printf("pullOCI: created Proxmox template VMID %d for %s", vmid, r.Ref)
+		log.Printf("pullOCI: created ZFS template %s@tmpl for %s (no PVE CT registered)",
+			templateDataset, r.Ref)
 	} else {
 		// --- Legacy direct-LXC mode ---
 		progress("Creating LXC template from OCI rootfs")
@@ -462,17 +655,17 @@ lxc.uts.name = %s
 
 	progress("Image ready")
 	return m.store.AddImage(&store.ImageRecord{
-		ID:            "oci_" + oci.SafeDirName(r.Ref),
-		Ref:           r.Ref,
-		Arch:          r.Arch,
-		TemplateName:  r.TemplateContainerName,
-		TemplateVMID:  templateVMID,
-		Created:       time.Now(),
-		OCIEntrypoint: cfg.Entrypoint,
-		OCICmd:        cfg.Cmd,
-		OCIEnv:        cfg.Env,
-		OCIWorkingDir: cfg.WorkingDir,
-		OCIPorts:      cfg.Ports,
+		ID:              "oci_" + oci.SafeDirName(r.Ref),
+		Ref:             r.Ref,
+		Arch:            r.Arch,
+		TemplateName:    r.TemplateContainerName,
+		TemplateDataset: templateDataset,
+		Created:         time.Now(),
+		OCIEntrypoint:   cfg.Entrypoint,
+		OCICmd:          cfg.Cmd,
+		OCIEnv:          cfg.Env,
+		OCIWorkingDir:   cfg.WorkingDir,
+		OCIPorts:        cfg.Ports,
 	})
 }
 
@@ -486,40 +679,112 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 		return fmt.Errorf("manager: image %q not found; run pull first", imageRef)
 	}
 
-	if m.UsePVE() && cfg.ProxmoxCT && rec.TemplateVMID > 0 {
-		return m.createPVEContainer(id, rec, cfg)
+	// Translate any per-container ISO requests into bind mounts before
+	// dispatching, so all backends (permanent CT / ephemeral / legacy)
+	// pick them up via the normal mount path.
+	if mounts, err := resolveISOMounts(cfg.ISOs); err != nil {
+		return err
+	} else {
+		cfg.Mounts = append(cfg.Mounts, mounts...)
 	}
-	if m.UsePVE() && rec.TemplateVMID > 0 {
+
+	// In PVE mode, dispatch by ProxmoxCT (permanent vs. ephemeral). Both
+	// new ZFS-only templates (TemplateDataset != "") and legacy template
+	// VMIDs (TemplateVMID > 0) trigger PVE paths.
+	if m.UsePVE() && (rec.TemplateDataset != "" || rec.TemplateVMID > 0) {
+		if cfg.ProxmoxCT {
+			return m.createPVEContainer(id, rec, cfg)
+		}
 		return m.createEphemeralPVE(id, rec, cfg)
 	}
 	return m.createLegacyContainer(id, rec, cfg)
 }
 
-// createPVEContainer creates a full Proxmox CT via pct clone. The container
-// is visible in the Proxmox web UI and managed via pct commands.
+// resolveISOMounts asks pvesm for the on-host file path of each requested
+// ISO volume and returns equivalent read-only bind-mount specs. Used by
+// CreateContainer to fold ISO requests into the normal mount processing.
+func resolveISOMounts(isos []ISOMount) ([]MountSpec, error) {
+	var out []MountSpec
+	for _, iso := range isos {
+		volid := iso.Storage + ":" + iso.VolumeID
+		raw, err := exec.Command("pvesm", "path", volid).Output()
+		if err != nil {
+			return nil, fmt.Errorf("manager: resolve ISO %s: %w", volid, err)
+		}
+		host := strings.TrimSpace(string(raw))
+		if host == "" {
+			return nil, fmt.Errorf("manager: pvesm returned empty path for %s", volid)
+		}
+		dest := iso.Destination
+		if dest == "" {
+			dest = "/mnt/" + filepath.Base(iso.VolumeID)
+		}
+		out = append(out, MountSpec{
+			Source:      host,
+			Destination: dest,
+			ReadOnly:    true,
+		})
+	}
+	return out, nil
+}
+
+// createPVEContainer creates a permanent Proxmox CT visible in the PVE
+// web UI. Provisioning uses a ZFS clone of the image's template snapshot
+// directly into the PVE-conventional subvol path, then writes the CT's
+// .conf file. We deliberately avoid `pct clone` so we don't depend on
+// (and don't create) a PVE-registered template VMID — the OCI template
+// is a raw ZFS dataset under <storage>/dld-templates/, invisible to PVE.
 func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
 	vmid, err := allocateVMID()
 	if err != nil {
 		return fmt.Errorf("manager: %w", err)
 	}
 
-	// Fill in LAN config from daemon settings before any networking setup.
-	if cfg.LAN && m.lan.Bridge != "" {
-		cfg.LANBridge = m.lan.Bridge
-		cfg.LANIP = fmt.Sprintf("%s.%d/%d", m.lan.Prefix, vmid, m.lan.Subnet)
-		cfg.LANGateway = m.lan.Gateway
+	// Resolve the LAN bridge per-container (cfg.Bridge selects from the
+	// daemon's bridge catalog; empty falls back to the default bridge).
+	if cfg.LAN {
+		spec, ok := m.lan.Lookup(cfg.Bridge)
+		if !ok {
+			if cfg.Bridge != "" {
+				return fmt.Errorf("manager: container requested bridge %q but daemon has no such bridge configured", cfg.Bridge)
+			}
+			return fmt.Errorf("manager: container requested LAN networking but daemon has no default bridge configured")
+		}
+		cfg.LANBridge = spec.Name
+		cfg.LANIP = fmt.Sprintf("%s.%d/%d", spec.Prefix, vmid, spec.Subnet)
+		cfg.LANGateway = spec.Gateway
 		log.Printf("CreateContainer[PVE]: LAN NIC on %s with IP %s", cfg.LANBridge, cfg.LANIP)
 	}
 
-	log.Printf("CreateContainer[PVE]: pct clone %d → VMID %d for %s", imgRec.TemplateVMID, vmid, id[:12])
-	out, err := exec.Command("pct", "clone",
-		fmt.Sprintf("%d", imgRec.TemplateVMID),
-		fmt.Sprintf("%d", vmid),
-		"--full",
-		"--storage", m.pveStorage,
+	// Resolve target storage: per-container override wins, daemon default otherwise.
+	storage := cfg.Storage
+	if storage == "" {
+		storage = m.pveStorage
+	}
+
+	// Resolve the template snapshot to clone from. Prefer the new-style
+	// ZFS-only template; fall back to the legacy basevol path so existing
+	// state.json records keep working until the operator re-pulls.
+	snapDataset := ""
+	if imgRec.TemplateDataset != "" {
+		snapDataset = imgRec.TemplateDataset + "@tmpl"
+	} else if imgRec.TemplateVMID > 0 {
+		snapDataset = fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, imgRec.TemplateVMID)
+	} else {
+		return fmt.Errorf("manager: image %q has no clonable template", imgRec.Ref)
+	}
+
+	targetDataset := fmt.Sprintf("%s/subvol-%d-disk-0", storage, vmid)
+	mountPoint := pveRootfsPathOn(storage, vmid)
+
+	log.Printf("CreateContainer[PVE]: zfs clone %s → %s for %s",
+		snapDataset, targetDataset, id[:12])
+	out, err := exec.Command("zfs", "clone",
+		"-o", "mountpoint="+mountPoint,
+		snapDataset, targetDataset,
 	).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: pct clone %d → %d: %s: %w", imgRec.TemplateVMID, vmid, out, err)
+		return fmt.Errorf("manager: zfs clone %s → %s: %s: %w", snapDataset, targetDataset, out, err)
 	}
 
 	// Allocate IP for bridge networking (internal gow0).
@@ -545,9 +810,9 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	}
 	hostname = sanitizeHostname(hostname)
 
-	// Build rootfs spec for Proxmox config.
-	rootfsSpec := fmt.Sprintf("%s:subvol-%d-disk-0,size=4G", m.pveStorage, vmid)
-	rootfsPath := m.pveRootfsPath(vmid)
+	// Build rootfs spec for Proxmox config (uses the resolved storage).
+	rootfsSpec := fmt.Sprintf("%s:subvol-%d-disk-0,size=4G", storage, vmid)
+	rootfsPath := pveRootfsPathOn(storage, vmid)
 
 	// Write the Proxmox CT config.
 	if err := writePVEConfig(vmid, hostname, rootfsSpec, rootfsPath, &cfg, ip); err != nil {
@@ -556,25 +821,44 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	}
 
 	// Prepare rootfs: runtime dirs, resolv.conf.
-	rootfs := m.pveRootfsPath(vmid)
+	rootfs := pveRootfsPathOn(storage, vmid)
 	m.prepareRootfs(rootfs, cfg)
 
-	// Update store record with IP and VMID.
+	// Update store record with IP, VMID, and storage. Permanent CTs are
+	// explicitly non-ephemeral so the GC will never touch them.
 	if storeRec := m.store.GetContainer(id); storeRec != nil {
 		storeRec.IPAddress = ip
 		storeRec.VMID = vmid
+		storeRec.Ephemeral = false
+		storeRec.Storage = storage
 		return m.store.AddContainer(storeRec)
 	}
 	return nil
 }
 
-// createEphemeralPVE creates a raw-LXC container by ZFS-cloning the PVE
-// template's rootfs. The container is NOT visible in the Proxmox UI but its
-// rootfs lives on the PVE storage pool (ZFS).
+// createEphemeralPVE creates a raw-LXC container by ZFS-cloning the
+// template's rootfs snapshot. The container is NOT visible in the
+// Proxmox UI but its rootfs lives on the PVE storage pool (ZFS).
+// Note: cfg.Storage cannot override the pool here — ZFS clones must
+// live on the same pool as their source snapshot. A request for a
+// different storage is honored only by permanent CTs.
 func (m *Manager) createEphemeralPVE(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
-	// ZFS clone the template rootfs for instant provisioning.
-	// pct template converts subvol → basevol, so clone from basevol.
-	snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, imgRec.TemplateVMID)
+	if cfg.Storage != "" && cfg.Storage != m.pveStorage {
+		log.Printf("CreateContainer[ephemeral]: ignoring requested storage %q "+
+			"(ephemeral containers must use template's pool %q; ZFS clone is pool-local)",
+			cfg.Storage, m.pveStorage)
+	}
+	// Resolve the template snapshot. Prefer the new ZFS-only template
+	// dataset; fall back to the legacy basevol-<vmid> path so existing
+	// state.json records keep working until the operator re-pulls.
+	snapDataset := ""
+	if imgRec.TemplateDataset != "" {
+		snapDataset = imgRec.TemplateDataset + "@tmpl"
+	} else if imgRec.TemplateVMID > 0 {
+		snapDataset = fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, imgRec.TemplateVMID)
+	} else {
+		return fmt.Errorf("manager: image %q has no clonable template", imgRec.Ref)
+	}
 	cloneDataset := fmt.Sprintf("%s/lxc-%s", m.pveStorage, id)
 	cloneMountpoint := fmt.Sprintf("/%s/lxc-%s", m.pveStorage, id)
 
@@ -623,18 +907,22 @@ lxc.uts.name = %s
 		return fmt.Errorf("manager: mkdir log dir: %w", err)
 	}
 
-	// Rewrite config with full daemon-managed settings.
+	// Rewrite config with full daemon-managed settings. Mark as ephemeral
+	// so the GC can positively identify this container as reapable.
 	// Note: rewriteConfig may populate cfg.SocketLinks for socket bind mounts.
-	if err := rewriteConfig(configPath, &cfg, ip, id); err != nil {
+	if err := rewriteConfig(configPath, &cfg, ip, id, true); err != nil {
 		return fmt.Errorf("manager: rewrite config: %w", err)
 	}
 
 	// Prepare rootfs: runtime dirs, resolv.conf, socket symlinks.
 	m.prepareRootfs(cloneMountpoint, cfg)
 
-	// Update store record with IP (VMID stays 0 for ephemeral).
+	// Update store record with IP, mark ephemeral, and record the storage
+	// pool so RemoveContainer can locate the ZFS dataset (VMID stays 0).
 	if storeRec := m.store.GetContainer(id); storeRec != nil {
 		storeRec.IPAddress = ip
+		storeRec.Ephemeral = true
+		storeRec.Storage = m.pveStorage
 		return m.store.AddContainer(storeRec)
 	}
 	return nil
@@ -669,9 +957,10 @@ func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cf
 		return fmt.Errorf("manager: mkdir log dir: %w", err)
 	}
 
-	// Rewrite the cloned config.
+	// Rewrite the cloned config. Legacy raw-LXC containers are always
+	// ephemeral (no PVE UI presence), so mark them for GC eligibility.
 	configPath := filepath.Join(m.lxcPath, id, "config")
-	if err := rewriteConfig(configPath, &cfg, ip, id); err != nil {
+	if err := rewriteConfig(configPath, &cfg, ip, id, true); err != nil {
 		return fmt.Errorf("manager: rewrite config: %w", err)
 	}
 
@@ -679,9 +968,10 @@ func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cf
 	rootfs := filepath.Join(m.lxcPath, id, "rootfs")
 	m.prepareRootfs(rootfs, cfg)
 
-	// Update store record with IP.
+	// Update store record with IP and mark ephemeral.
 	if storeRec := m.store.GetContainer(id); storeRec != nil {
 		storeRec.IPAddress = ip
+		storeRec.Ephemeral = true
 		return m.store.AddContainer(storeRec)
 	}
 	return nil
@@ -733,14 +1023,15 @@ func (m *Manager) prepareRootfs(rootfs string, cfg ContainerConfig) {
 }
 
 // StartContainer starts a stopped container.
-// For Proxmox CTs (VMID > 0), uses pct start; otherwise lxc-start.
+// For Proxmox CTs (VMID > 0, including adopted ones), uses pct start;
+// otherwise lxc-start.
 func (m *Manager) StartContainer(id string) error {
 	state, _ := m.State(id)
 	if state == "running" {
 		return nil
 	}
 
-	rec := m.store.GetContainer(id)
+	rec := m.GetContainer(id)
 	if rec != nil && rec.VMID > 0 {
 		return m.startPVEContainer(id, rec.VMID)
 	}
@@ -803,7 +1094,7 @@ func (m *Manager) StopContainer(id string, timeout time.Duration) error {
 		return nil
 	}
 
-	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+	if rec := m.GetContainer(id); rec != nil && rec.VMID > 0 {
 		out, err := exec.Command("pct", "shutdown",
 			fmt.Sprintf("%d", rec.VMID),
 			"--timeout", fmt.Sprintf("%d", int(timeout.Seconds())),
@@ -834,7 +1125,7 @@ func (m *Manager) KillContainer(id, signal string) error {
 		signal = "KILL"
 	}
 
-	rec := m.store.GetContainer(id)
+	rec := m.GetContainer(id)
 
 	if signal == "KILL" || signal == "9" || signal == "SIGKILL" {
 		if rec != nil && rec.VMID > 0 {
@@ -887,21 +1178,31 @@ func (m *Manager) RemoveContainer(id string) error {
 		return fmt.Errorf("manager: cannot remove running container %s; stop it first", id)
 	}
 
-	rec := m.store.GetContainer(id)
+	rec := m.GetContainer(id)
 
 	if rec != nil && rec.VMID > 0 {
-		// Proxmox CT — destroy via pct.
+		// Proxmox CT — destroy via pct. Removing the underlying CT also
+		// removes its tag-based discoverability for adopted records, so
+		// store.RemoveContainer is best-effort: nothing to remove for an
+		// adopted CT (it was never persisted) and that's fine.
 		out, err := exec.Command("pct", "destroy", fmt.Sprintf("%d", rec.VMID), "--force").CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("manager: pct destroy %d: %s: %w", rec.VMID, out, err)
 		}
-		return m.store.RemoveContainer(id)
+		m.store.RemoveContainer(id)
+		return nil
 	}
 
 	if m.UsePVE() {
 		// Ephemeral container with ZFS-cloned rootfs — destroy the ZFS
-		// dataset, then remove the LXC config directory.
-		cloneDataset := fmt.Sprintf("%s/lxc-%s", m.pveStorage, id)
+		// dataset, then remove the LXC config directory. Use the storage
+		// recorded at create time when available so this works even if
+		// the daemon's default storage has since changed.
+		storage := m.pveStorage
+		if rec != nil && rec.Storage != "" {
+			storage = rec.Storage
+		}
+		cloneDataset := fmt.Sprintf("%s/lxc-%s", storage, id)
 		out, err := exec.Command("zfs", "destroy", cloneDataset).CombinedOutput()
 		if err != nil {
 			log.Printf("RemoveContainer: zfs destroy %s: %s: %v (continuing)", cloneDataset, out, err)
@@ -926,9 +1227,22 @@ func (m *Manager) RemoveImage(ref string) error {
 		return fmt.Errorf("manager: image %q not found", ref)
 	}
 
+	if rec.TemplateDataset != "" {
+		// New-style ZFS-only template — destroy the dataset (which removes
+		// its snapshot too via -r). Outstanding clones (running containers)
+		// will block the destroy with EBUSY; that's the right behavior —
+		// the caller should remove dependent containers first.
+		out, err := exec.Command("zfs", "destroy", "-r", rec.TemplateDataset).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("manager: zfs destroy %s: %s: %w", rec.TemplateDataset, out, err)
+		}
+		return m.store.RemoveImage(ref)
+	}
+
 	if rec.TemplateVMID > 0 {
-		// PVE template — first destroy any ZFS snapshots (used by ephemeral
-		// clones), then destroy the CT template via pct.
+		// Legacy PVE template — first destroy any ZFS snapshots, then the
+		// CT template via pct. Kept for backwards compatibility with
+		// pre-Apr-2026 templates that still appear as PVE CTs.
 		snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, rec.TemplateVMID)
 		exec.Command("zfs", "destroy", snapDataset).Run() // best-effort
 		out, err := exec.Command("pct", "destroy", fmt.Sprintf("%d", rec.TemplateVMID), "--force").CombinedOutput()
@@ -938,7 +1252,7 @@ func (m *Manager) RemoveImage(ref string) error {
 		return m.store.RemoveImage(ref)
 	}
 
-	// Legacy template — lxc-destroy.
+	// Legacy direct-LXC template — lxc-destroy.
 	if m.containerExists(rec.TemplateName) {
 		out, err := exec.Command("lxc-destroy", "-n", rec.TemplateName, "--lxcpath", m.lxcPath).CombinedOutput()
 		if err != nil {
@@ -951,7 +1265,7 @@ func (m *Manager) RemoveImage(ref string) error {
 // State returns the Docker-compatible state string for a container.
 // For PVE CTs uses pct status; otherwise lxc-info.
 func (m *Manager) State(id string) (string, error) {
-	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+	if rec := m.GetContainer(id); rec != nil && rec.VMID > 0 {
 		out, err := exec.Command("pct", "status", fmt.Sprintf("%d", rec.VMID)).Output()
 		if err != nil {
 			return "exited", nil
@@ -987,7 +1301,7 @@ func (m *Manager) State(id string) (string, error) {
 // Exec runs cmd inside the container. For PVE CTs uses pct exec;
 // otherwise lxc-attach. Returns an *exec.Cmd not yet started.
 func (m *Manager) Exec(id string, cmd []string, env []string) *exec.Cmd {
-	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+	if rec := m.GetContainer(id); rec != nil && rec.VMID > 0 {
 		args := []string{"exec", fmt.Sprintf("%d", rec.VMID), "--"}
 		args = append(args, cmd...)
 		c := exec.Command("pct", args...)
@@ -1012,7 +1326,7 @@ func (m *Manager) LXCPath() string { return m.lxcPath }
 // RootfsPath returns the rootfs path for a container.
 // For PVE CTs returns the ZFS subvol path; otherwise the lxcpath rootfs.
 func (m *Manager) RootfsPath(id string) string {
-	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+	if rec := m.GetContainer(id); rec != nil && rec.VMID > 0 {
 		return m.pveRootfsPath(rec.VMID)
 	}
 	// For ephemeral PVE containers, the rootfs is a ZFS clone mounted
@@ -1068,12 +1382,17 @@ func allocateVMID() (int, error) {
 	return vmid, nil
 }
 
-// pveRootfsPath returns the rootfs path for a Proxmox CT on ZFS storage.
-// For ZFS pool "large" and VMID 260: /large/subvol-260-disk-0
+// pveRootfsPath returns the rootfs path for a Proxmox CT on the daemon's
+// default ZFS storage. Prefer pveRootfsPathOn when the storage is known
+// per-container (since PVE CTs may be cloned to a non-default storage).
 func (m *Manager) pveRootfsPath(vmid int) string {
-	// Proxmox ZFS storage mounts datasets at /<pool>/subvol-<vmid>-disk-0.
-	// Determine the ZFS mountpoint by checking pvesm.
-	return fmt.Sprintf("/%s/subvol-%d-disk-0", m.pveStorage, vmid)
+	return pveRootfsPathOn(m.pveStorage, vmid)
+}
+
+// pveRootfsPathOn returns the rootfs path for a Proxmox CT on the named
+// ZFS storage pool. For pool "large" + VMID 260: /large/subvol-260-disk-0.
+func pveRootfsPathOn(storage string, vmid int) string {
+	return fmt.Sprintf("/%s/subvol-%d-disk-0", storage, vmid)
 }
 
 // pveConfigPath returns the Proxmox config path for a VMID.
@@ -1103,9 +1422,17 @@ func (m *Manager) containerExists(name string) bool {
 		_, err := os.Stat(pveConfigPath(rec.VMID))
 		return err == nil
 	}
-	// Check image records for PVE template by name.
+	// Check image records for templates registered under this name.
 	for _, img := range m.store.ListImages() {
-		if img.TemplateName == name && img.TemplateVMID > 0 {
+		if img.TemplateName != name {
+			continue
+		}
+		if img.TemplateDataset != "" {
+			// New-style ZFS template — exists iff the dataset's @tmpl
+			// snapshot is present.
+			return zfsSnapshotExists(img.TemplateDataset + "@tmpl")
+		}
+		if img.TemplateVMID > 0 {
 			_, err := os.Stat(pveConfigPath(img.TemplateVMID))
 			return err == nil
 		}
@@ -1114,6 +1441,11 @@ func (m *Manager) containerExists(name string) bool {
 	configPath := filepath.Join(m.lxcPath, name, "config")
 	_, err := os.Stat(configPath)
 	return err == nil
+}
+
+// zfsSnapshotExists reports whether the given ZFS snapshot exists.
+func zfsSnapshotExists(snap string) bool {
+	return exec.Command("zfs", "list", "-t", "snapshot", "-o", "name", "-H", snap).Run() == nil
 }
 
 func waitRunning(c *liblxc.Container, timeout time.Duration) error {

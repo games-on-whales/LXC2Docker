@@ -73,7 +73,7 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, resp)
 }
 
-// --- network stubs (Wolf queries networks when creating containers) ---
+// --- network stubs (Docker clients query networks when creating containers) ---
 
 func (h *Handler) listNetworks(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, []any{})
@@ -96,8 +96,9 @@ func (h *Handler) disconnectNetwork(w http.ResponseWriter, r *http.Request) {
 }
 
 // events implements GET /events. It holds the connection open as a streaming
-// endpoint. Wolf uses this to monitor container lifecycle events. We don't
-// emit real events yet — the handler simply blocks until the client disconnects.
+// endpoint that Docker clients use to monitor container lifecycle events.
+// We don't emit real events yet — the handler simply blocks until the client
+// disconnects.
 func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
