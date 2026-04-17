@@ -1,0 +1,157 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/gorilla/mux"
+)
+
+func (h *Handler) listVolumes(w http.ResponseWriter, r *http.Request) {
+	vols := h.store.ListVolumes()
+	out := make([]VolumeUsage, 0, len(vols))
+	for _, v := range vols {
+		size, _ := dirSize(v.Mountpoint)
+		out = append(out, volumeUsage(h.store, v, size))
+	}
+	jsonResponse(w, http.StatusOK, VolumeListResponse{
+		Volumes:  out,
+		Warnings: []string{},
+	})
+}
+
+func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
+	var req VolumeCreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if req.Name == "" {
+		req.Name = generateID()[:12]
+	}
+	if existing := h.store.GetVolume(req.Name); existing != nil {
+		jsonResponse(w, http.StatusCreated, volumeCreateResponse(existing))
+		return
+	}
+	v, err := h.ensureVolume(req.Name)
+	if err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	v.Driver = orDefault(req.Driver, "local")
+	v.Labels = req.Labels
+	v.Options = req.DriverOpts
+	if err := h.store.AddVolume(v); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonResponse(w, http.StatusCreated, volumeCreateResponse(v))
+}
+
+func (h *Handler) inspectVolume(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	v := h.store.GetVolume(name)
+	if v == nil {
+		errResponse(w, http.StatusNotFound, "no such volume")
+		return
+	}
+	jsonResponse(w, http.StatusOK, volumeCreateResponse(v))
+}
+
+func (h *Handler) removeVolume(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	v := h.store.GetVolume(name)
+	if v == nil {
+		errResponse(w, http.StatusNotFound, "no such volume")
+		return
+	}
+	for _, c := range h.store.ListContainers() {
+		for _, m := range c.Mounts {
+			if m.Name == name {
+				errResponse(w, http.StatusConflict, "volume is in use")
+				return
+			}
+		}
+	}
+	if err := os.RemoveAll(v.Mountpoint); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := h.store.RemoveVolume(name); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.publishEvent("volume", "destroy", name, map[string]string{"name": name, "driver": v.Driver})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) pruneVolumes(w http.ResponseWriter, r *http.Request) {
+	deleted := []string{}
+	space := int64(0)
+	inUse := map[string]bool{}
+	for _, c := range h.store.ListContainers() {
+		for _, m := range c.Mounts {
+			if m.Name != "" {
+				inUse[m.Name] = true
+			}
+		}
+	}
+	for _, v := range h.store.ListVolumes() {
+		if inUse[v.Name] {
+			continue
+		}
+		size, _ := dirSize(v.Mountpoint)
+		if err := os.RemoveAll(v.Mountpoint); err != nil {
+			continue
+		}
+		if err := h.store.RemoveVolume(v.Name); err != nil {
+			continue
+		}
+		deleted = append(deleted, v.Name)
+		space += size
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"VolumesDeleted": deleted,
+		"SpaceReclaimed": space,
+	})
+}
+
+func volumeCreateResponse(v *store.VolumeRecord) VolumeCreateResponse {
+	return VolumeCreateResponse{
+		Name:       v.Name,
+		Driver:     orDefault(v.Driver, "local"),
+		Mountpoint: v.Mountpoint,
+		CreatedAt:  v.CreatedAt.Format(time.RFC3339),
+		Labels:     v.Labels,
+		Options:    v.Options,
+		Scope:      "local",
+	}
+}
+
+func volumeUsage(st *store.Store, v *store.VolumeRecord, size int64) VolumeUsage {
+	refCount := 0
+	for _, c := range st.ListContainers() {
+		for _, m := range c.Mounts {
+			if m.Name == v.Name {
+				refCount++
+				break
+			}
+		}
+	}
+	return VolumeUsage{
+		Name:       v.Name,
+		Driver:     orDefault(v.Driver, "local"),
+		Mountpoint: v.Mountpoint,
+		CreatedAt:  v.CreatedAt.Format(time.RFC3339),
+		Labels:     v.Labels,
+		Options:    v.Options,
+		Scope:      "local",
+		UsageData: VolumeUsageData{
+			RefCount: refCount,
+			Size:     size,
+		},
+	}
+}

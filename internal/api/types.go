@@ -15,6 +15,7 @@ type ContainerCreateRequest struct {
 	Env        []string          `json:"Env"`
 	Labels     map[string]string `json:"Labels"`
 	WorkingDir string            `json:"WorkingDir"`
+	Mounts     []MountRequest    `json:"Mounts"`
 	HostConfig HostConfig        `json:"HostConfig"`
 }
 
@@ -170,6 +171,14 @@ type ImageInspect struct {
 	Labels       map[string]string `json:"Labels"`
 }
 
+// MountRequest is a mount entry in the Docker container-create request body.
+type MountRequest struct {
+	Type     string `json:"Type"`
+	Source   string `json:"Source"`
+	Target   string `json:"Target"`
+	ReadOnly bool   `json:"ReadOnly"`
+}
+
 // --- Exec ---
 
 // ExecCreateRequest is the body of POST /containers/{id}/exec.
@@ -243,6 +252,201 @@ type InfoResponse struct {
 	MemTotal          int64  `json:"MemTotal"`
 	DockerRootDir     string `json:"DockerRootDir"`
 	ServerVersion     string `json:"ServerVersion"`
+}
+
+// ChangeResponse is a single filesystem change entry.
+type ChangeResponse struct {
+	Path string `json:"Path"`
+	Kind int    `json:"Kind"`
+}
+
+// ContainerStats is a trimmed Docker-compatible stats payload.
+type ContainerStats struct {
+	Read         string              `json:"read"`
+	PreRead      string              `json:"preread"`
+	PidsStats    PidsStats           `json:"pids_stats"`
+	BlkioStats   map[string][]any    `json:"blkio_stats"`
+	NumProcs     int                 `json:"num_procs"`
+	StorageStats map[string]any      `json:"storage_stats"`
+	CPUStats     CPUStats            `json:"cpu_stats"`
+	PreCPUStats  CPUStats            `json:"precpu_stats"`
+	MemoryStats  MemoryStats         `json:"memory_stats"`
+	Networks     map[string]NetStats `json:"networks,omitempty"`
+}
+
+type PidsStats struct {
+	Current int `json:"current"`
+}
+
+type CPUStats struct {
+	CPUUsage       CPUUsage `json:"cpu_usage"`
+	SystemCPUUsage uint64   `json:"system_cpu_usage"`
+	OnlineCPUs     int      `json:"online_cpus"`
+}
+
+type CPUUsage struct {
+	TotalUsage        uint64   `json:"total_usage"`
+	PercpuUsage       []uint64 `json:"percpu_usage"`
+	UsageInKernelmode uint64   `json:"usage_in_kernelmode"`
+	UsageInUsermode   uint64   `json:"usage_in_usermode"`
+}
+
+type MemoryStats struct {
+	Usage    uint64         `json:"usage"`
+	MaxUsage uint64         `json:"max_usage"`
+	Limit    uint64         `json:"limit"`
+	Stats    map[string]any `json:"stats"`
+}
+
+type NetStats struct {
+	RxBytes   uint64 `json:"rx_bytes"`
+	RxPackets uint64 `json:"rx_packets"`
+	RxErrors  uint64 `json:"rx_errors"`
+	RxDropped uint64 `json:"rx_dropped"`
+	TxBytes   uint64 `json:"tx_bytes"`
+	TxPackets uint64 `json:"tx_packets"`
+	TxErrors  uint64 `json:"tx_errors"`
+	TxDropped uint64 `json:"tx_dropped"`
+}
+
+// SystemDiskUsage is the response body for GET /system/df.
+type SystemDiskUsage struct {
+	LayersSize int64            `json:"LayersSize"`
+	Images     []ImageUsage     `json:"Images"`
+	Containers []ContainerUsage `json:"Containers"`
+	Volumes    []VolumeUsage    `json:"Volumes"`
+	BuildCache []any            `json:"BuildCache"`
+}
+
+type ImageUsage struct {
+	ID           string   `json:"Id"`
+	Repository   string   `json:"Repository"`
+	Tag          string   `json:"Tag"`
+	CreatedSince string   `json:"CreatedSince,omitempty"`
+	CreatedAt    string   `json:"CreatedAt"`
+	Size         int64    `json:"Size"`
+	SharedSize   int64    `json:"SharedSize"`
+	Containers   int      `json:"Containers"`
+	RepoTags     []string `json:"RepoTags,omitempty"`
+}
+
+type ContainerUsage struct {
+	ID         string   `json:"Id"`
+	Names      []string `json:"Names"`
+	Image      string   `json:"Image"`
+	ImageID    string   `json:"ImageID"`
+	Command    string   `json:"Command"`
+	Created    int64    `json:"Created"`
+	State      string   `json:"State"`
+	Status     string   `json:"Status"`
+	SizeRw     int64    `json:"SizeRw"`
+	SizeRootFs int64    `json:"SizeRootFs"`
+}
+
+type VolumeUsage struct {
+	Name       string            `json:"Name"`
+	Driver     string            `json:"Driver"`
+	Mountpoint string            `json:"Mountpoint"`
+	CreatedAt  string            `json:"CreatedAt"`
+	Labels     map[string]string `json:"Labels"`
+	Options    map[string]string `json:"Options"`
+	Scope      string            `json:"Scope"`
+	UsageData  VolumeUsageData   `json:"UsageData"`
+}
+
+type VolumeUsageData struct {
+	RefCount int   `json:"RefCount"`
+	Size     int64 `json:"Size"`
+}
+
+type VolumeListResponse struct {
+	Volumes  []VolumeUsage `json:"Volumes"`
+	Warnings []string      `json:"Warnings"`
+}
+
+type VolumeCreateResponse struct {
+	Name       string            `json:"Name"`
+	Driver     string            `json:"Driver"`
+	Mountpoint string            `json:"Mountpoint"`
+	CreatedAt  string            `json:"CreatedAt"`
+	Labels     map[string]string `json:"Labels"`
+	Options    map[string]string `json:"Options"`
+	Scope      string            `json:"Scope"`
+}
+
+type VolumeCreateRequest struct {
+	Name       string            `json:"Name"`
+	Driver     string            `json:"Driver"`
+	Labels     map[string]string `json:"Labels"`
+	DriverOpts map[string]string `json:"DriverOpts"`
+}
+
+type NetworkResource struct {
+	Name       string                     `json:"Name"`
+	ID         string                     `json:"Id"`
+	Created    string                     `json:"Created"`
+	Scope      string                     `json:"Scope"`
+	Driver     string                     `json:"Driver"`
+	EnableIPv4 bool                       `json:"EnableIPv4"`
+	EnableIPv6 bool                       `json:"EnableIPv6"`
+	Internal   bool                       `json:"Internal"`
+	Attachable bool                       `json:"Attachable"`
+	Ingress    bool                       `json:"Ingress"`
+	IPAM       map[string]any             `json:"IPAM"`
+	Options    map[string]string          `json:"Options"`
+	Labels     map[string]string          `json:"Labels"`
+	Containers map[string]NetworkEndpoint `json:"Containers,omitempty"`
+}
+
+type NetworkEndpoint struct {
+	Name        string `json:"Name"`
+	EndpointID  string `json:"EndpointID"`
+	MacAddress  string `json:"MacAddress"`
+	IPv4Address string `json:"IPv4Address"`
+	IPv6Address string `json:"IPv6Address"`
+}
+
+type NetworkCreateRequest struct {
+	Name    string            `json:"Name"`
+	Driver  string            `json:"Driver"`
+	Options map[string]string `json:"Options"`
+	Labels  map[string]string `json:"Labels"`
+}
+
+type NetworkCreateResponse struct {
+	ID      string `json:"Id"`
+	Warning string `json:"Warning"`
+}
+
+type ImageHistoryItem struct {
+	ID        string   `json:"Id"`
+	Created   int64    `json:"Created"`
+	CreatedBy string   `json:"CreatedBy"`
+	Tags      []string `json:"Tags"`
+	Size      int64    `json:"Size"`
+	Comment   string   `json:"Comment"`
+}
+
+type ImageSearchResult struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	StarCount   int    `json:"star_count"`
+	IsOfficial  bool   `json:"is_official"`
+	IsAutomated bool   `json:"is_automated"`
+}
+
+type EventMessage struct {
+	Type     string     `json:"Type"`
+	Action   string     `json:"Action"`
+	Actor    EventActor `json:"Actor"`
+	Scope    string     `json:"scope"`
+	Time     int64      `json:"time"`
+	TimeNano int64      `json:"timeNano"`
+}
+
+type EventActor struct {
+	ID         string            `json:"ID"`
+	Attributes map[string]string `json:"Attributes"`
 }
 
 // ErrorResponse is the standard Docker API error body.
