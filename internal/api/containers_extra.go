@@ -122,10 +122,59 @@ func (h *Handler) snapshotContainerStats(id string) ContainerStats {
 				"cache": readUint64(filepath.Join("/sys/fs/cgroup", cg, "memory.stat.cache")),
 			},
 		},
-		Networks: map[string]NetStats{
-			"gow": {},
-		},
+		Networks: h.snapshotNetStats(id),
 	}
+}
+
+// snapshotNetStats reads /proc/<pid>/net/dev inside the container's network
+// namespace (pid lookup via lxc-info) and returns a per-interface stats map
+// matching Docker's shape. The loopback interface is dropped so Portainer's
+// charts focus on externally-visible traffic; a container with no running
+// init (pid<=0) returns an empty map.
+func (h *Handler) snapshotNetStats(id string) map[string]NetStats {
+	out := map[string]NetStats{}
+	pid, err := h.mgr.InitPID(id)
+	if err != nil || pid <= 0 {
+		return out
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/net/dev", pid))
+	if err != nil {
+		return out
+	}
+	for i, line := range strings.Split(string(data), "\n") {
+		if i < 2 {
+			// Skip the two-line header.
+			continue
+		}
+		name, raw, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if name == "" || name == "lo" {
+			continue
+		}
+		fields := strings.Fields(raw)
+		if len(fields) < 16 {
+			continue
+		}
+		out[name] = NetStats{
+			RxBytes:   parseUint64(fields[0]),
+			RxPackets: parseUint64(fields[1]),
+			RxErrors:  parseUint64(fields[2]),
+			RxDropped: parseUint64(fields[3]),
+			TxBytes:   parseUint64(fields[8]),
+			TxPackets: parseUint64(fields[9]),
+			TxErrors:  parseUint64(fields[10]),
+			TxDropped: parseUint64(fields[11]),
+		}
+	}
+	return out
+}
+
+func parseUint64(s string) uint64 {
+	n, _ := strconv.ParseUint(s, 10, 64)
+	return n
 }
 
 func mountTypeForSource(st *store.Store, source string) string {
