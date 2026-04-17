@@ -45,6 +45,19 @@ type ContainerRecord struct {
 	// on. Used by RemoveContainer for ephemeral containers (the ZFS clone
 	// dataset path includes the pool name) and for diagnostics on PVE CTs.
 	Storage string `json:"storage,omitempty"`
+	// RestartPolicy is echoed back through /containers/{id}/json so
+	// Portainer's container detail shows the policy the user selected at
+	// create time. The daemon does not currently enforce it — containers
+	// that exit stay exited until the user restarts them.
+	RestartPolicy *RestartPolicy `json:"restart_policy,omitempty"`
+}
+
+// RestartPolicy mirrors Docker's HostConfig.RestartPolicy block. Kept as a
+// pointer on ContainerRecord so zero-value state doesn't clobber persisted
+// records written before this field existed.
+type RestartPolicy struct {
+	Name              string `json:"name"`
+	MaximumRetryCount int    `json:"maximum_retry_count,omitempty"`
 }
 
 // NetworkAttachment records a container's membership in a Docker-style network.

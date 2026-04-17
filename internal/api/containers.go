@@ -192,17 +192,26 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	var restart *store.RestartPolicy
+	if req.HostConfig.RestartPolicy.Name != "" {
+		restart = &store.RestartPolicy{
+			Name:              req.HostConfig.RestartPolicy.Name,
+			MaximumRetryCount: req.HostConfig.RestartPolicy.MaximumRetryCount,
+		}
+	}
+
 	// Persist record before creating so the IP is allocated.
 	rec := &store.ContainerRecord{
-		ID:         id,
-		Name:       name,
-		Image:      req.Image,
-		ImageID:    normalizeImageRef(req.Image),
-		Created:    time.Now(),
-		Entrypoint: entrypoint,
-		Cmd:        cmd,
-		Env:        env,
-		Labels:     labels,
+		ID:            id,
+		Name:          name,
+		Image:         req.Image,
+		ImageID:       normalizeImageRef(req.Image),
+		Created:       time.Now(),
+		Entrypoint:    entrypoint,
+		Cmd:           cmd,
+		Env:           env,
+		Labels:        labels,
+		RestartPolicy: restart,
 	}
 	rec.Networks = defaultContainerNetworks(rec)
 	if err := attachRequestedNetworks(h.store, rec, req.NetworkingConfig); err != nil {
@@ -1533,6 +1542,15 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 			bind += ":ro"
 		}
 		hc.Binds = append(hc.Binds, bind)
+	}
+	if rec.RestartPolicy != nil {
+		hc.RestartPolicy = RestartPolicy{
+			Name:              rec.RestartPolicy.Name,
+			MaximumRetryCount: rec.RestartPolicy.MaximumRetryCount,
+		}
+	} else {
+		// Docker defaults to "no" when the user didn't pick anything.
+		hc.RestartPolicy = RestartPolicy{Name: "no"}
 	}
 	return hc
 }
