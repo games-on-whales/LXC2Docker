@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,11 +20,14 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 	records := h.store.ListImages()
 	out := make([]ImageSummary, 0, len(records))
 	for _, rec := range records {
+		size := h.imageSize(rec)
 		out = append(out, ImageSummary{
-			ID:       "sha256:" + rec.ID,
-			RepoTags: []string{rec.Ref},
-			Created:  rec.Created.Unix(),
-			Labels:   map[string]string{},
+			ID:          "sha256:" + rec.ID,
+			RepoTags:    []string{rec.Ref},
+			Created:     rec.Created.Unix(),
+			Size:        size,
+			VirtualSize: size,
+			Labels:      map[string]string{},
 		})
 	}
 	jsonResponse(w, http.StatusOK, out)
@@ -90,12 +94,15 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
 		return
 	}
+	size := h.imageSize(rec)
 	jsonResponse(w, http.StatusOK, ImageInspect{
 		ID:           "sha256:" + rec.ID,
 		RepoTags:     []string{rec.Ref},
 		Created:      rec.Created.Format(time.RFC3339),
 		Architecture: rec.Arch,
 		Os:           "linux",
+		Size:         size,
+		VirtualSize:  size,
 		Labels:       map[string]string{},
 	})
 }
@@ -208,6 +215,31 @@ func (h *Handler) pushImage(w http.ResponseWriter, r *http.Request) {
 		"error":       "image push is not supported",
 		"errorDetail": map[string]string{"message": "image push is not supported"},
 	})
+}
+
+// imageSize returns a best-effort on-disk size for an image. ZFS-backed
+// templates use `zfs get logicalreferenced` on the @tmpl snapshot; directory-
+// backed templates fall back to walking the rootfs. On failure we return 0
+// rather than an error because Portainer still renders the row usefully.
+func (h *Handler) imageSize(rec *store.ImageRecord) int64 {
+	if rec == nil {
+		return 0
+	}
+	if rec.TemplateDataset != "" {
+		out, err := exec.Command("zfs", "get", "-Hpo", "value",
+			"logicalreferenced", rec.TemplateDataset+"@tmpl").Output()
+		if err == nil {
+			if n, parseErr := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); parseErr == nil {
+				return n
+			}
+		}
+	}
+	if root := h.mgr.ImageRootfsPath(rec.Ref); root != "" {
+		if n, err := dirSize(root); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 func normalizeImageRef(name string) string {

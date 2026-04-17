@@ -168,6 +168,7 @@ type ImageSummary struct {
 	RepoDigests []string          `json:"RepoDigests"`
 	Created     int64             `json:"Created"`
 	Size        int64             `json:"Size"`
+	VirtualSize int64             `json:"VirtualSize"`
 	Labels      map[string]string `json:"Labels"`
 }
 
@@ -178,6 +179,8 @@ type ImageInspect struct {
 	Created      string            `json:"Created"`
 	Architecture string            `json:"Architecture"`
 	Os           string            `json:"Os"`
+	Size         int64             `json:"Size"`
+	VirtualSize  int64             `json:"VirtualSize"`
 	Labels       map[string]string `json:"Labels"`
 }
 
