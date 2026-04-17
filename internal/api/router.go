@@ -84,6 +84,10 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/containers/{id}/archive", h.putArchive).Methods(http.MethodPut)
 		sub.HandleFunc("/containers/{id}/archive", h.getArchive).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/containers/{id}/resize", h.resizeContainer).Methods(http.MethodPost)
+		sub.HandleFunc("/containers/{id}/pause", h.pauseContainer).Methods(http.MethodPost)
+		sub.HandleFunc("/containers/{id}/unpause", h.unpauseContainer).Methods(http.MethodPost)
+		sub.HandleFunc("/containers/{id}/update", h.updateContainer).Methods(http.MethodPost)
+		sub.HandleFunc("/containers/prune", h.pruneContainers).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}", h.removeContainer).Methods(http.MethodDelete)
 
 		// Images
@@ -95,7 +99,9 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/images/{name:.*}/history", h.imageHistory).Methods(http.MethodGet)
 		sub.HandleFunc("/images/{name:.*}/tag", h.tagImage).Methods(http.MethodPost)
 		sub.HandleFunc("/images/{name:.*}/push", h.pushImage).Methods(http.MethodPost)
+		sub.HandleFunc("/images/prune", h.pruneImages).Methods(http.MethodPost)
 		sub.HandleFunc("/images/{name:.*}", h.removeImage).Methods(http.MethodDelete)
+		sub.HandleFunc("/commit", h.commitContainer).Methods(http.MethodPost)
 
 		// Volumes
 		sub.HandleFunc("/volumes", h.listVolumes).Methods(http.MethodGet)
