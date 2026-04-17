@@ -155,7 +155,29 @@ func (h *Handler) searchImages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) pushImage(w http.ResponseWriter, r *http.Request) {
-	errResponse(w, http.StatusNotImplemented, "image push is not supported")
+	name := mux.Vars(r)["name"]
+	ref := normalizeImageRef(name)
+	if h.store.GetImage(ref) == nil {
+		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	enc := json.NewEncoder(w)
+	send := func(v any) {
+		_ = enc.Encode(v)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+
+	send(map[string]string{"status": "The push refers to repository [" + ref + "]"})
+	send(map[string]any{
+		"error":       "image push is not supported",
+		"errorDetail": map[string]string{"message": "image push is not supported"},
+	})
 }
 
 func normalizeImageRef(name string) string {
