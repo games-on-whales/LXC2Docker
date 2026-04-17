@@ -35,6 +35,23 @@ func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
 		Arch:          runtime.GOARCH,
 		KernelVersion: unameRelease(uname),
 		BuildTime:     "N/A",
+		Platform:      VersionPlatform{Name: "docker-lxc-daemon"},
+		Components: []VersionComponent{
+			{
+				Name:    "Engine",
+				Version: "24.0.0",
+				Details: map[string]string{
+					"ApiVersion":    apiVersion,
+					"Arch":          runtime.GOARCH,
+					"GitCommit":     "lxc",
+					"GoVersion":     runtime.Version(),
+					"KernelVersion": unameRelease(uname),
+					"MinAPIVersion": "1.12",
+					"Os":            runtime.GOOS,
+				},
+			},
+			{Name: "docker-lxc-daemon", Version: "pr10"},
+		},
 	}
 	jsonResponse(w, http.StatusOK, resp)
 }
@@ -57,25 +74,78 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 	var uname unix.Utsname
 	unix.Uname(&uname)
 
+	warnings := []string{}
+	if h.mgr.UsePVE() {
+		// No-op today; reserved for surfacing PVE-specific warnings later.
+	}
+
 	resp := InfoResponse{
-		ID:                "docker-lxc-daemon",
-		Containers:        len(containers),
-		ContainersRunning: running,
-		ContainersStopped: len(containers) - running,
-		Images:            len(images),
-		Driver:            "lxc",
-		MemoryLimit:       true,
-		SwapLimit:         true,
-		KernelVersion:     unameRelease(uname),
-		OperatingSystem:   "Linux",
-		OSType:            "linux",
-		Architecture:      runtime.GOARCH,
-		NCPU:              runtime.NumCPU(),
-		MemTotal:          int64(si.Totalram) * int64(si.Unit),
-		DockerRootDir:     h.mgr.LXCPath(),
-		ServerVersion:     "24.0.0",
+		ID:                 "docker-lxc-daemon",
+		Name:               hostname(),
+		Containers:         len(containers),
+		ContainersRunning:  running,
+		ContainersPaused:   0,
+		ContainersStopped:  len(containers) - running,
+		Images:             len(images),
+		Driver:             "lxc",
+		MemoryLimit:        true,
+		SwapLimit:          true,
+		KernelVersion:      unameRelease(uname),
+		OperatingSystem:    osPrettyName(),
+		OSVersion:          unameRelease(uname),
+		OSType:             "linux",
+		Architecture:       runtime.GOARCH,
+		NCPU:               runtime.NumCPU(),
+		MemTotal:           int64(si.Totalram) * int64(si.Unit),
+		DockerRootDir:      h.mgr.LXCPath(),
+		ServerVersion:      "24.0.0",
+		CgroupDriver:       "systemd",
+		CgroupVersion:      cgroupVersion(),
+		DefaultRuntime:     "lxc",
+		Runtimes:           map[string]any{"lxc": map[string]string{"path": "lxc-start"}},
+		Plugins:            InfoPlugins{Volume: []string{"local"}, Network: []string{"bridge", "host"}},
+		Labels:             []string{},
+		ExperimentalBuild:  false,
+		SystemTime:         time.Now().UTC().Format(time.RFC3339Nano),
+		LiveRestoreEnabled: true,
+		IndexServerAddress: "https://index.docker.io/v1/",
+		RegistryConfig:     map[string]any{"IndexConfigs": map[string]any{}, "InsecureRegistryCIDRs": []string{}},
+		Warnings:           warnings,
+		SecurityOptions:    []string{"name=no-new-privileges"},
+		ContainerdCommit:   VersionComponent{Name: "not-applicable"},
+		RuncCommit:         VersionComponent{Name: "not-applicable"},
+		InitCommit:         VersionComponent{Name: "not-applicable"},
 	}
 	jsonResponse(w, http.StatusOK, resp)
+}
+
+// osPrettyName returns /etc/os-release PRETTY_NAME (e.g. "Debian GNU/Linux
+// 12 (bookworm)") so Portainer's dashboard shows a human-readable OS label.
+func osPrettyName() string {
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return "Linux"
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "PRETTY_NAME=") {
+			continue
+		}
+		v := strings.TrimPrefix(line, "PRETTY_NAME=")
+		v = strings.Trim(v, `"`)
+		if v != "" {
+			return v
+		}
+	}
+	return "Linux"
+}
+
+// cgroupVersion returns "2" on a unified cgroup v2 host (/sys/fs/cgroup is
+// cgroup2fs) and "1" otherwise, matching the format Docker's /info uses.
+func cgroupVersion() string {
+	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err == nil {
+		return "2"
+	}
+	return "1"
 }
 
 // --- network stubs (Docker clients query networks when creating containers) ---

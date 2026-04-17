@@ -301,35 +301,80 @@ type ExecProcessConfig struct {
 
 // VersionResponse is the body of GET /version.
 type VersionResponse struct {
-	Version       string `json:"Version"`
-	APIVersion    string `json:"ApiVersion"`
-	MinAPIVersion string `json:"MinAPIVersion"`
-	GitCommit     string `json:"GitCommit"`
-	GoVersion     string `json:"GoVersion"`
-	Os            string `json:"Os"`
-	Arch          string `json:"Arch"`
-	KernelVersion string `json:"KernelVersion"`
-	BuildTime     string `json:"BuildTime"`
+	Version       string             `json:"Version"`
+	APIVersion    string             `json:"ApiVersion"`
+	MinAPIVersion string             `json:"MinAPIVersion"`
+	GitCommit     string             `json:"GitCommit"`
+	GoVersion     string             `json:"GoVersion"`
+	Os            string             `json:"Os"`
+	Arch          string             `json:"Arch"`
+	KernelVersion string             `json:"KernelVersion"`
+	BuildTime     string             `json:"BuildTime"`
+	Platform      VersionPlatform    `json:"Platform"`
+	Components    []VersionComponent `json:"Components"`
+}
+
+// VersionPlatform is the Platform subfield of /version, shown by
+// Portainer's "Platform" label.
+type VersionPlatform struct {
+	Name string `json:"Name"`
+}
+
+// VersionComponent is an entry in /version Components. Portainer reads the
+// Engine component and displays the version/runtime on the host details
+// page.
+type VersionComponent struct {
+	Name    string            `json:"Name"`
+	Version string            `json:"Version"`
+	Details map[string]string `json:"Details,omitempty"`
 }
 
 // InfoResponse is a trimmed body for GET /info.
 type InfoResponse struct {
-	ID                string `json:"ID"`
-	Containers        int    `json:"Containers"`
-	ContainersRunning int    `json:"ContainersRunning"`
-	ContainersStopped int    `json:"ContainersStopped"`
-	Images            int    `json:"Images"`
-	Driver            string `json:"Driver"`
-	MemoryLimit       bool   `json:"MemoryLimit"`
-	SwapLimit         bool   `json:"SwapLimit"`
-	KernelVersion     string `json:"KernelVersion"`
-	OperatingSystem   string `json:"OperatingSystem"`
-	OSType            string `json:"OSType"`
-	Architecture      string `json:"Architecture"`
-	NCPU              int    `json:"NCPU"`
-	MemTotal          int64  `json:"MemTotal"`
-	DockerRootDir     string `json:"DockerRootDir"`
-	ServerVersion     string `json:"ServerVersion"`
+	ID                 string           `json:"ID"`
+	Name               string           `json:"Name"`
+	Containers         int              `json:"Containers"`
+	ContainersRunning  int              `json:"ContainersRunning"`
+	ContainersPaused   int              `json:"ContainersPaused"`
+	ContainersStopped  int              `json:"ContainersStopped"`
+	Images             int              `json:"Images"`
+	Driver             string           `json:"Driver"`
+	MemoryLimit        bool             `json:"MemoryLimit"`
+	SwapLimit          bool             `json:"SwapLimit"`
+	KernelVersion      string           `json:"KernelVersion"`
+	OperatingSystem    string           `json:"OperatingSystem"`
+	OSVersion          string           `json:"OSVersion"`
+	OSType             string           `json:"OSType"`
+	Architecture       string           `json:"Architecture"`
+	NCPU               int              `json:"NCPU"`
+	MemTotal           int64            `json:"MemTotal"`
+	DockerRootDir      string           `json:"DockerRootDir"`
+	ServerVersion      string           `json:"ServerVersion"`
+	CgroupDriver       string           `json:"CgroupDriver"`
+	CgroupVersion      string           `json:"CgroupVersion"`
+	DefaultRuntime     string           `json:"DefaultRuntime"`
+	Runtimes           map[string]any   `json:"Runtimes"`
+	Plugins            InfoPlugins      `json:"Plugins"`
+	Labels             []string         `json:"Labels"`
+	ExperimentalBuild  bool             `json:"ExperimentalBuild"`
+	SystemTime         string           `json:"SystemTime"`
+	LiveRestoreEnabled bool             `json:"LiveRestoreEnabled"`
+	IndexServerAddress string           `json:"IndexServerAddress"`
+	RegistryConfig     map[string]any   `json:"RegistryConfig"`
+	Warnings           []string         `json:"Warnings"`
+	SecurityOptions    []string         `json:"SecurityOptions"`
+	ContainerdCommit   VersionComponent `json:"ContainerdCommit"`
+	RuncCommit         VersionComponent `json:"RuncCommit"`
+	InitCommit         VersionComponent `json:"InitCommit"`
+}
+
+// InfoPlugins mirrors the Plugins block from Docker's /info. Portainer reads
+// Volume and Network lists to show storage/network drivers available.
+type InfoPlugins struct {
+	Volume        []string `json:"Volume"`
+	Network       []string `json:"Network"`
+	Authorization []string `json:"Authorization"`
+	Log           []string `json:"Log"`
 }
 
 // ChangeResponse is a single filesystem change entry.
