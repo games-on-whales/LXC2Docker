@@ -362,15 +362,26 @@ func (h *Handler) systemDiskUsage(w http.ResponseWriter, r *http.Request) {
 		BuildCache: []any{},
 	}
 
+	// Pre-compute how many containers reference each image (by normalised
+	// ref) so the /system/df Images rows can report the count Portainer's
+	// resource overview reads.
+	containersPerImage := map[string]int{}
+	for _, c := range containers {
+		containersPerImage[normalizeImageRef(c.Image)]++
+	}
 	for _, img := range images {
 		repo, tag := splitImageRef(img.Ref)
+		size := h.imageSize(img)
 		out.Images = append(out.Images, ImageUsage{
 			ID:         "sha256:" + img.ID,
 			Repository: repo,
 			Tag:        tag,
+			Size:       size,
+			Containers: containersPerImage[normalizeImageRef(img.Ref)],
 			CreatedAt:  img.Created.Format(time.RFC3339),
 			RepoTags:   []string{img.Ref},
 		})
+		out.LayersSize += size
 	}
 	for _, c := range containers {
 		state, _ := h.mgr.State(c.ID)
@@ -391,7 +402,6 @@ func (h *Handler) systemDiskUsage(w http.ResponseWriter, r *http.Request) {
 		size, _ := dirSize(v.Mountpoint)
 		vu := volumeUsage(h.store, v, size)
 		out.Volumes = append(out.Volumes, vu)
-		out.LayersSize += size
 	}
 	jsonResponse(w, http.StatusOK, out)
 }
