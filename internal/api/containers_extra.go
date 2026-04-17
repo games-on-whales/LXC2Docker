@@ -59,14 +59,25 @@ func (h *Handler) containerStats(w http.ResponseWriter, r *http.Request) {
 		enc := json.NewEncoder(w)
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+		// Track the previous sample so PreCPUStats reflects the prior tick
+		// instead of zeros. Portainer's CPU% formula divides the delta in
+		// container CPU usage by the delta in system CPU usage; without a
+		// previous sample the chart pegs to either zero or 100%.
+		var prev *ContainerStats
 		for {
 			stats := h.snapshotContainerStats(id)
+			if prev != nil {
+				stats.PreRead = prev.Read
+				stats.PreCPUStats = prev.CPUStats
+			}
 			if err := enc.Encode(stats); err != nil {
 				return
 			}
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
+			cur := stats
+			prev = &cur
 			select {
 			case <-r.Context().Done():
 				return
