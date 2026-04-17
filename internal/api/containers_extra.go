@@ -391,9 +391,25 @@ func attachRequestedNetworks(st *store.Store, rec *store.ContainerRecord, cfg Ne
 			Gateway:    orDefault(ep.Gateway, "10.100.0.1"),
 			MacAddress: ep.MacAddress,
 			EndpointID: endpointID(rec.ID, networkName),
+			Aliases:    append([]string{}, ep.Aliases...),
+			Links:      append([]string{}, ep.Links...),
+			DriverOpts: copyStringMap(ep.DriverOpts),
 		}
 	}
 	return nil
+}
+
+// copyStringMap returns a defensive copy of src so persisted store records
+// don't share a slice/map instance with the request body.
+func copyStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 func buildContainerEndpoints(rec *store.ContainerRecord) map[string]EndpointSettings {
@@ -408,6 +424,9 @@ func buildContainerEndpoints(rec *store.ContainerRecord) map[string]EndpointSett
 			MacAddress: attached.MacAddress,
 			NetworkID:  attached.NetworkID,
 			EndpointID: attached.EndpointID,
+			Aliases:    append([]string{}, attached.Aliases...),
+			Links:      append([]string{}, attached.Links...),
+			DriverOpts: copyStringMap(attached.DriverOpts),
 		}
 	}
 	return out

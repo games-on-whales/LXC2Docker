@@ -299,6 +299,9 @@ func (h *Handler) connectNetwork(w http.ResponseWriter, r *http.Request) {
 		Gateway:    orDefault(req.EndpointConfig.Gateway, lxc.BridgeGW),
 		MacAddress: req.EndpointConfig.MacAddress,
 		EndpointID: endpointID(containerID, networkName),
+		Aliases:    append([]string{}, req.EndpointConfig.Aliases...),
+		Links:      append([]string{}, req.EndpointConfig.Links...),
+		DriverOpts: copyStringMap(req.EndpointConfig.DriverOpts),
 	}
 	if err := h.store.AddContainer(rec); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())

@@ -113,11 +113,14 @@ type RestartPolicy struct {
 
 // NetworkAttachment records a container's membership in a Docker-style network.
 type NetworkAttachment struct {
-	NetworkID  string `json:"network_id"`
-	IPAddress  string `json:"ip_address,omitempty"`
-	Gateway    string `json:"gateway,omitempty"`
-	MacAddress string `json:"mac_address,omitempty"`
-	EndpointID string `json:"endpoint_id,omitempty"`
+	NetworkID  string            `json:"network_id"`
+	IPAddress  string            `json:"ip_address,omitempty"`
+	Gateway    string            `json:"gateway,omitempty"`
+	MacAddress string            `json:"mac_address,omitempty"`
+	EndpointID string            `json:"endpoint_id,omitempty"`
+	Aliases    []string          `json:"aliases,omitempty"`
+	Links      []string          `json:"links,omitempty"`
+	DriverOpts map[string]string `json:"driver_opts,omitempty"`
 }
 
 // PortBinding records a single host→container port mapping.

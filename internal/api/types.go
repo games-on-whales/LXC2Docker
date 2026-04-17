@@ -193,11 +193,14 @@ type NetworkSettings struct {
 
 // EndpointSettings is a per-network settings block.
 type EndpointSettings struct {
-	IPAddress  string `json:"IPAddress"`
-	Gateway    string `json:"Gateway"`
-	MacAddress string `json:"MacAddress"`
-	NetworkID  string `json:"NetworkID"`
-	EndpointID string `json:"EndpointID,omitempty"`
+	IPAddress  string            `json:"IPAddress"`
+	Gateway    string            `json:"Gateway"`
+	MacAddress string            `json:"MacAddress"`
+	NetworkID  string            `json:"NetworkID"`
+	EndpointID string            `json:"EndpointID,omitempty"`
+	Aliases    []string          `json:"Aliases,omitempty"`
+	Links      []string          `json:"Links,omitempty"`
+	DriverOpts map[string]string `json:"DriverOpts,omitempty"`
 }
 
 // --- Container List ---
