@@ -50,6 +50,9 @@ type ContainerRecord struct {
 	// create time. The daemon does not currently enforce it — containers
 	// that exit stay exited until the user restarts them.
 	RestartPolicy *RestartPolicy `json:"restart_policy,omitempty"`
+	// RestartCount tracks how many times the user has restarted the
+	// container via /containers/{id}/restart. Surfaces on inspect.
+	RestartCount int `json:"restart_count,omitempty"`
 	// Healthcheck is echoed back on inspect so Portainer's detail panel
 	// and duplicate/edit dialog reflect the user's input. Like
 	// RestartPolicy, the daemon does not actually execute the check.

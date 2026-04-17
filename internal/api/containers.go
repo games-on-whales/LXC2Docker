@@ -483,16 +483,17 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 	includeSize := r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true"
 
 	resp := ContainerJSON{
-		ID:       rec.ID,
-		Created:  rec.Created.Format(time.RFC3339),
-		Path:     path,
-		Args:     args,
-		Name:     "/" + rec.Name,
-		Driver:   "lxc",
-		Platform: "linux",
-		Image:    rec.Image,
-		ImageID:  rec.ImageID,
-		LogPath:  h.mgr.LogPath(id),
+		ID:           rec.ID,
+		Created:      rec.Created.Format(time.RFC3339),
+		Path:         path,
+		Args:         args,
+		Name:         "/" + rec.Name,
+		Driver:       "lxc",
+		Platform:     "linux",
+		RestartCount: rec.RestartCount,
+		Image:        rec.Image,
+		ImageID:      rec.ImageID,
+		LogPath:      h.mgr.LogPath(id),
 		State: ContainerState{
 			Status:     state,
 			Running:    running,
@@ -1233,6 +1234,7 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 		rec.StartedAt = &now
 		rec.FinishedAt = nil
 		rec.ExitCode = 0
+		rec.RestartCount++
 		h.store.AddContainer(rec)
 		h.publishEvent("container", "restart", id, map[string]string{
 			"name":  rec.Name,
