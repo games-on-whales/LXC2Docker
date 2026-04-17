@@ -667,6 +667,26 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// If the container declared a custom StopSignal (postgres runs with
+	// SIGINT, for example), deliver that to PID 1 first and wait the
+	// user-supplied timeout for graceful shutdown. Fall through to
+	// Manager.StopContainer for the SIGKILL backstop.
+	if rec := h.store.GetContainer(id); rec != nil && nonDefaultStopSignal(rec.StopSignal) {
+		if err := h.mgr.KillContainer(id, rec.StopSignal); err == nil {
+			waitUntilExited(h.mgr, id, timeout)
+		}
+	}
+	if state, _ := h.mgr.State(id); state != "running" {
+		if rec := h.store.GetContainer(id); rec != nil {
+			h.markContainerExited(rec, 0)
+			h.publishEvent("container", "stop", id, map[string]string{
+				"name":  rec.Name,
+				"image": normalizeImageRef(rec.Image),
+			})
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if err := h.mgr.StopContainer(id, timeout); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1066,6 +1086,35 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// nonDefaultStopSignal reports whether the caller asked for a StopSignal
+// other than SIGTERM/TERM/15 (all names for the default init-killing
+// signal that lxc-stop and pct shutdown already use).
+func nonDefaultStopSignal(sig string) bool {
+	s := strings.ToUpper(strings.TrimSpace(sig))
+	if s == "" {
+		return false
+	}
+	s = strings.TrimPrefix(s, "SIG")
+	switch s {
+	case "TERM", "15":
+		return false
+	}
+	return true
+}
+
+// waitUntilExited polls the container's state up to timeout. Used after
+// sending a custom StopSignal so we give the process a chance to exit
+// before falling back to SIGKILL.
+func waitUntilExited(mgr *lxc.Manager, id string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if state, _ := mgr.State(id); state != "running" {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // parseStopTimeout interprets Docker's ?t=<seconds> query param. Missing or
