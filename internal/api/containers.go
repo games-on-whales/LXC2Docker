@@ -212,6 +212,8 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	extras := hostConfigExtrasFromRequest(req.HostConfig)
+
 	// Persist record before creating so the IP is allocated.
 	rec := &store.ContainerRecord{
 		ID:            id,
@@ -223,9 +225,10 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Cmd:           cmd,
 		Env:           env,
 		Labels:        labels,
-		RestartPolicy: restart,
-		Healthcheck:   health,
-		StopSignal:    req.StopSignal,
+		RestartPolicy:    restart,
+		Healthcheck:      health,
+		StopSignal:       req.StopSignal,
+		HostConfigExtras: extras,
 	}
 	rec.Networks = defaultContainerNetworks(rec)
 	if err := attachRequestedNetworks(h.store, rec, req.NetworkingConfig); err != nil {
@@ -495,6 +498,29 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		resp.SizeRootFs = &size
 	}
 	jsonResponse(w, http.StatusOK, resp)
+}
+
+// hostConfigExtrasFromRequest extracts the HostConfig fields we roundtrip
+// through inspect without enforcing. Returns nil when nothing meaningful was
+// set so older persisted records stay untouched by the new field.
+func hostConfigExtrasFromRequest(hc HostConfig) *store.HostConfigExtras {
+	if !hc.Privileged && len(hc.CapAdd) == 0 && len(hc.CapDrop) == 0 &&
+		len(hc.ExtraHosts) == 0 && len(hc.Dns) == 0 && len(hc.DnsSearch) == 0 &&
+		len(hc.DnsOptions) == 0 && hc.Memory == 0 && hc.CPUShares == 0 && hc.NanoCPUs == 0 {
+		return nil
+	}
+	return &store.HostConfigExtras{
+		Privileged: hc.Privileged,
+		CapAdd:     append([]string{}, hc.CapAdd...),
+		CapDrop:    append([]string{}, hc.CapDrop...),
+		ExtraHosts: append([]string{}, hc.ExtraHosts...),
+		Dns:        append([]string{}, hc.Dns...),
+		DnsSearch:  append([]string{}, hc.DnsSearch...),
+		DnsOptions: append([]string{}, hc.DnsOptions...),
+		Memory:     hc.Memory,
+		CPUShares:  hc.CPUShares,
+		NanoCPUs:   hc.NanoCPUs,
+	}
 }
 
 // healthcheckFromRecord lifts a stored healthcheck into the API shape that
@@ -1583,6 +1609,18 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 	} else {
 		// Docker defaults to "no" when the user didn't pick anything.
 		hc.RestartPolicy = RestartPolicy{Name: "no"}
+	}
+	if e := rec.HostConfigExtras; e != nil {
+		hc.Privileged = e.Privileged
+		hc.CapAdd = append([]string{}, e.CapAdd...)
+		hc.CapDrop = append([]string{}, e.CapDrop...)
+		hc.ExtraHosts = append([]string{}, e.ExtraHosts...)
+		hc.Dns = append([]string{}, e.Dns...)
+		hc.DnsSearch = append([]string{}, e.DnsSearch...)
+		hc.DnsOptions = append([]string{}, e.DnsOptions...)
+		hc.Memory = e.Memory
+		hc.CPUShares = e.CPUShares
+		hc.NanoCPUs = e.NanoCPUs
 	}
 	return hc
 }

@@ -49,6 +49,13 @@ type HostConfig struct {
 	IpcMode           string                   `json:"IpcMode"` // "host" or "" (private)
 	PortBindings      map[string][]PortBinding `json:"PortBindings"`
 	RestartPolicy     RestartPolicy            `json:"RestartPolicy"`
+	Privileged        bool                     `json:"Privileged,omitempty"`
+	CapAdd            []string                 `json:"CapAdd,omitempty"`
+	CapDrop           []string                 `json:"CapDrop,omitempty"`
+	ExtraHosts        []string                 `json:"ExtraHosts,omitempty"`
+	Dns               []string                 `json:"Dns,omitempty"`
+	DnsSearch         []string                 `json:"DnsSearch,omitempty"`
+	DnsOptions        []string                 `json:"DnsOptions,omitempty"`
 	// AutoRemove mirrors Docker's --rm flag. When true, the daemon creates
 	// the container as ephemeral (no PVE UI presence; reaped by GC after
 	// it exits). Default false → permanent PVE CT in PVE mode.
