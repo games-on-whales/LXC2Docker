@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,12 +21,16 @@ import (
 )
 
 type buildState struct {
-	baseRef    string
-	workdir    string
-	env        []string
-	cmd        []string
-	entrypoint []string
-	exposed    []string
+	baseRef     string
+	workdir     string
+	env         []string
+	cmd         []string
+	entrypoint  []string
+	exposed     []string
+	labels      map[string]string
+	user        string
+	stopSignal  string
+	healthcheck *oci.ImageHealthcheck
 }
 
 type dockerfileInstruction struct {
@@ -36,7 +41,7 @@ type dockerfileInstruction struct {
 
 // buildImage implements a constrained single-stage Dockerfile builder.
 // It is intentionally narrow but functional enough for basic Portainer flows:
-// FROM, WORKDIR, ENV, COPY, ADD, RUN, CMD, ENTRYPOINT, EXPOSE, LABEL.
+// FROM, ARG, WORKDIR, ENV, COPY, ADD, RUN, CMD, ENTRYPOINT, EXPOSE, LABEL.
 func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	tag := firstCSV(r.URL.Query().Get("t"))
 	if tag == "" {
@@ -47,6 +52,26 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	dockerfilePath := r.URL.Query().Get("dockerfile")
 	if dockerfilePath == "" {
 		dockerfilePath = "Dockerfile"
+	}
+
+	// buildargs is a JSON object — Portainer's build UI populates this from
+	// the "Build arguments" table. Parsed values override the defaults a
+	// Dockerfile declares with ARG.
+	buildArgs := map[string]string{}
+	if raw := r.URL.Query().Get("buildargs"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &buildArgs); err != nil {
+			errResponse(w, http.StatusBadRequest, "invalid buildargs: "+err.Error())
+			return
+		}
+	}
+	// labels is Portainer's "Image labels" override: JSON object merged on
+	// top of whatever LABEL the Dockerfile declared.
+	queryLabels := map[string]string{}
+	if raw := r.URL.Query().Get("labels"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &queryLabels); err != nil {
+			errResponse(w, http.StatusBadRequest, "invalid labels: "+err.Error())
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -88,10 +113,41 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 		fail("parse Dockerfile: " + err.Error())
 		return
 	}
+	// Resolve ARG defaults up front, then overlay the caller-supplied
+	// buildargs. The resulting map is used to $VAR-substitute every other
+	// instruction's args before it executes.
+	argSet := map[string]string{}
+	for _, inst := range instrs {
+		if inst.op != "ARG" {
+			continue
+		}
+		name, def, hasDef := strings.Cut(strings.TrimSpace(inst.args), "=")
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if hasDef {
+			argSet[name] = strings.Trim(strings.TrimSpace(def), `"`)
+		} else if _, ok := argSet[name]; !ok {
+			argSet[name] = ""
+		}
+	}
+	for k, v := range buildArgs {
+		argSet[k] = v
+	}
+	for i := range instrs {
+		if instrs[i].op == "ARG" || instrs[i].op == "FROM" {
+			continue
+		}
+		instrs[i].args = substituteBuildArgs(instrs[i].args, argSet)
+	}
 	state, err := evaluateBuildState(instrs)
 	if err != nil {
 		fail(err.Error())
 		return
+	}
+	for k, v := range queryLabels {
+		state.labels[k] = v
 	}
 
 	send(map[string]string{"stream": fmt.Sprintf("Step 1: resolving base image %s\n", state.baseRef)})
@@ -143,7 +199,7 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	for i, inst := range instrs {
 		send(map[string]string{"stream": fmt.Sprintf("Step %d: %s %s\n", i+3, inst.op, inst.args)})
 		switch inst.op {
-		case "FROM", "LABEL":
+		case "FROM", "LABEL", "ARG", "USER", "STOPSIGNAL", "HEALTHCHECK":
 			continue
 		case "WORKDIR":
 			dst := resolveContainerPath(state.workdir, inst.args)
@@ -308,7 +364,11 @@ func parseDockerfile(contents string) ([]dockerfileInstruction, error) {
 }
 
 func evaluateBuildState(instrs []dockerfileInstruction) (buildState, error) {
-	state := buildState{workdir: "/", env: []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}}
+	state := buildState{
+		workdir: "/",
+		env:     []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+		labels:  map[string]string{},
+	}
 	fromCount := 0
 	for _, inst := range instrs {
 		switch inst.op {
@@ -328,12 +388,221 @@ func evaluateBuildState(instrs []dockerfileInstruction) (buildState, error) {
 			state.entrypoint = parseCommandInstruction(inst.args)
 		case "EXPOSE":
 			state.exposed = append(state.exposed, strings.Fields(inst.args)...)
+		case "LABEL":
+			for k, v := range parseLabelInstruction(inst.args) {
+				state.labels[k] = v
+			}
+		case "USER":
+			state.user = strings.TrimSpace(inst.args)
+		case "STOPSIGNAL":
+			state.stopSignal = strings.TrimSpace(inst.args)
+		case "HEALTHCHECK":
+			hc, err := parseHealthcheckInstruction(inst.args)
+			if err != nil {
+				return state, err
+			}
+			state.healthcheck = hc
 		}
 	}
 	if state.baseRef == "" {
 		return state, fmt.Errorf("Dockerfile must contain FROM")
 	}
 	return state, nil
+}
+
+// parseHealthcheckInstruction handles the two HEALTHCHECK forms:
+//
+//	HEALTHCHECK NONE                               → disable
+//	HEALTHCHECK [OPTIONS] CMD <cmd>                → shell or exec cmd
+//
+// Options are --interval=<duration>, --timeout=<duration>,
+// --start-period=<duration>, --retries=<n>. Durations accept Go's time.
+// ParseDuration syntax (e.g. "30s", "1m30s").
+func parseHealthcheckInstruction(args string) (*oci.ImageHealthcheck, error) {
+	raw := strings.TrimSpace(args)
+	if strings.EqualFold(raw, "NONE") {
+		return &oci.ImageHealthcheck{Test: []string{"NONE"}}, nil
+	}
+	out := &oci.ImageHealthcheck{}
+	for {
+		if !strings.HasPrefix(raw, "--") {
+			break
+		}
+		space := strings.IndexAny(raw, " \t")
+		if space < 0 {
+			return nil, fmt.Errorf("HEALTHCHECK: expected CMD after options")
+		}
+		opt := raw[:space]
+		raw = strings.TrimSpace(raw[space+1:])
+		k, v, ok := strings.Cut(opt, "=")
+		if !ok {
+			return nil, fmt.Errorf("HEALTHCHECK: option %q requires a value", opt)
+		}
+		switch k {
+		case "--interval":
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return nil, fmt.Errorf("HEALTHCHECK --interval: %w", err)
+			}
+			out.Interval = int64(d)
+		case "--timeout":
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return nil, fmt.Errorf("HEALTHCHECK --timeout: %w", err)
+			}
+			out.Timeout = int64(d)
+		case "--start-period":
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return nil, fmt.Errorf("HEALTHCHECK --start-period: %w", err)
+			}
+			out.StartPeriod = int64(d)
+		case "--retries":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, fmt.Errorf("HEALTHCHECK --retries: %w", err)
+			}
+			out.Retries = n
+		default:
+			return nil, fmt.Errorf("HEALTHCHECK: unknown option %q", k)
+		}
+	}
+	// Remaining tokens must start with CMD. Docker accepts both shell form
+	// (`CMD curl -f ...`) and exec form (`CMD ["curl","-f","..."]`).
+	if !strings.HasPrefix(strings.ToUpper(raw), "CMD") {
+		return nil, fmt.Errorf("HEALTHCHECK: expected CMD, got %q", raw)
+	}
+	cmdArgs := strings.TrimSpace(raw[len("CMD"):])
+	if strings.HasPrefix(cmdArgs, "[") {
+		// Exec form: reuse the command parser which handles JSON arrays.
+		out.Test = append([]string{"CMD"}, parseCommandInstruction(cmdArgs)...)
+	} else {
+		out.Test = []string{"CMD-SHELL", cmdArgs}
+	}
+	return out, nil
+}
+
+// parseLabelInstruction parses Dockerfile LABEL arg tokens. Supports both the
+// single-pair shorthand (LABEL key=value or LABEL key value) and the
+// space-separated multi-pair form (LABEL key1=v1 key2="v 2" key3=v3).
+func parseLabelInstruction(args string) map[string]string {
+	out := map[string]string{}
+	tokens := splitShellTokens(args)
+	if len(tokens) == 2 && !strings.Contains(tokens[0], "=") {
+		out[tokens[0]] = tokens[1]
+		return out
+	}
+	for _, t := range tokens {
+		k, v, ok := strings.Cut(t, "=")
+		if !ok {
+			continue
+		}
+		out[k] = strings.Trim(v, `"`)
+	}
+	return out
+}
+
+// splitShellTokens splits args on whitespace while respecting simple double-
+// quoted runs so "LABEL desc=\"hello world\" name=foo" yields two tokens.
+func splitShellTokens(s string) []string {
+	var tokens []string
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			inQuote = !inQuote
+		case !inQuote && (c == ' ' || c == '\t'):
+			if cur.Len() > 0 {
+				tokens = append(tokens, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if cur.Len() > 0 {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens
+}
+
+// substituteBuildArgs replaces $VAR, ${VAR}, ${VAR:-default}, and
+// ${VAR:+value} references using the supplied map. Unknown variables in the
+// bare ${VAR} and $VAR forms expand to empty, matching Docker's behaviour.
+// Escape sequences (\$) are preserved literally.
+func substituteBuildArgs(s string, vars map[string]string) string {
+	if !strings.Contains(s, "$") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c == '\\' && i+1 < len(s) && s[i+1] == '$' {
+			b.WriteByte('$')
+			i += 2
+			continue
+		}
+		if c != '$' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		var ident string
+		var consumed int
+		if i+1 < len(s) && s[i+1] == '{' {
+			end := strings.IndexByte(s[i+2:], '}')
+			if end < 0 {
+				b.WriteByte('$')
+				i++
+				continue
+			}
+			ident = s[i+2 : i+2+end]
+			consumed = end + 3
+		} else {
+			j := i + 1
+			for j < len(s) && (isAlphaNum(s[j]) || s[j] == '_') {
+				j++
+			}
+			ident = s[i+1 : j]
+			consumed = j - i
+		}
+		if ident == "" {
+			b.WriteByte('$')
+			i++
+			continue
+		}
+		b.WriteString(expandBuildArgIdent(ident, vars))
+		i += consumed
+	}
+	return b.String()
+}
+
+// expandBuildArgIdent evaluates a single ${...} identifier, honouring
+// Docker's :- (default when unset/empty) and :+ (value when set) forms.
+func expandBuildArgIdent(ident string, vars map[string]string) string {
+	if idx := strings.Index(ident, ":-"); idx >= 0 {
+		name := ident[:idx]
+		fallback := ident[idx+2:]
+		if v, ok := vars[name]; ok && v != "" {
+			return v
+		}
+		return fallback
+	}
+	if idx := strings.Index(ident, ":+"); idx >= 0 {
+		name := ident[:idx]
+		alt := ident[idx+2:]
+		if v, ok := vars[name]; ok && v != "" {
+			return alt
+		}
+		return ""
+	}
+	return vars[ident]
+}
+
+func isAlphaNum(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 func parseEnvInstruction(args string) []string {
@@ -581,6 +850,10 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 			OCIEnv:          state.env,
 			OCIWorkingDir:   state.workdir,
 			OCIPorts:        state.exposed,
+			OCILabels:       state.labels,
+			OCIUser:         state.user,
+			OCIStopSignal:   state.stopSignal,
+			OCIHealthcheck:  buildHealthcheckToStore(state.healthcheck),
 		})
 	}
 
@@ -597,15 +870,36 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 	}
 	_ = h.store.RemoveContainer(tmpID)
 	return h.store.AddImage(&store.ImageRecord{
-		ID:            "build_" + strings.TrimPrefix(targetName, "__template_build_"),
-		Ref:           ref,
-		Arch:          "amd64",
-		TemplateName:  targetName,
-		Created:       time.Now(),
-		OCIEntrypoint: state.entrypoint,
-		OCICmd:        state.cmd,
-		OCIEnv:        state.env,
-		OCIWorkingDir: state.workdir,
-		OCIPorts:      state.exposed,
+		ID:             "build_" + strings.TrimPrefix(targetName, "__template_build_"),
+		Ref:            ref,
+		Arch:           "amd64",
+		TemplateName:   targetName,
+		Created:        time.Now(),
+		OCIEntrypoint:  state.entrypoint,
+		OCICmd:         state.cmd,
+		OCIEnv:         state.env,
+		OCIWorkingDir:  state.workdir,
+		OCIPorts:       state.exposed,
+		OCILabels:      state.labels,
+		OCIUser:        state.user,
+		OCIStopSignal:  state.stopSignal,
+		OCIHealthcheck: buildHealthcheckToStore(state.healthcheck),
 	})
+}
+
+// buildHealthcheckToStore converts an oci.ImageHealthcheck (captured from
+// the Dockerfile) into the store's HealthcheckConfig shape. Mirrors
+// imageHealthcheckToStore in internal/lxc — kept here to avoid widening
+// the oci↔store surface for a one-off conversion.
+func buildHealthcheckToStore(h *oci.ImageHealthcheck) *store.HealthcheckConfig {
+	if h == nil {
+		return nil
+	}
+	return &store.HealthcheckConfig{
+		Test:        append([]string{}, h.Test...),
+		Interval:    h.Interval,
+		Timeout:     h.Timeout,
+		StartPeriod: h.StartPeriod,
+		Retries:     h.Retries,
+	}
 }

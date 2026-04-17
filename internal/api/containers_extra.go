@@ -95,7 +95,7 @@ func (h *Handler) snapshotContainerStats(id string) ContainerStats {
 		PidsStats: PidsStats{
 			Current: pids,
 		},
-		BlkioStats:   map[string][]any{},
+		BlkioStats:   readBlkioStats(filepath.Join("/sys/fs/cgroup", cg, "io.stat")),
 		NumProcs:     pids,
 		StorageStats: map[string]any{},
 		CPUStats: CPUStats{
@@ -118,14 +118,160 @@ func (h *Handler) snapshotContainerStats(id string) ContainerStats {
 			Usage:    memUsage,
 			MaxUsage: memUsage,
 			Limit:    memLimit,
-			Stats: map[string]any{
-				"cache": readUint64(filepath.Join("/sys/fs/cgroup", cg, "memory.stat.cache")),
-			},
+			Stats:    readMemoryStat(filepath.Join("/sys/fs/cgroup", cg, "memory.stat")),
 		},
-		Networks: map[string]NetStats{
-			"gow": {},
-		},
+		Networks: h.snapshotNetStats(id),
 	}
+}
+
+// snapshotNetStats reads /proc/<pid>/net/dev inside the container's network
+// namespace (pid lookup via lxc-info) and returns a per-interface stats map
+// matching Docker's shape. The loopback interface is dropped so Portainer's
+// charts focus on externally-visible traffic; a container with no running
+// init (pid<=0) returns an empty map.
+func (h *Handler) snapshotNetStats(id string) map[string]NetStats {
+	out := map[string]NetStats{}
+	pid, err := h.mgr.InitPID(id)
+	if err != nil || pid <= 0 {
+		return out
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/net/dev", pid))
+	if err != nil {
+		return out
+	}
+	for i, line := range strings.Split(string(data), "\n") {
+		if i < 2 {
+			// Skip the two-line header.
+			continue
+		}
+		name, raw, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if name == "" || name == "lo" {
+			continue
+		}
+		fields := strings.Fields(raw)
+		if len(fields) < 16 {
+			continue
+		}
+		out[name] = NetStats{
+			RxBytes:   parseUint64(fields[0]),
+			RxPackets: parseUint64(fields[1]),
+			RxErrors:  parseUint64(fields[2]),
+			RxDropped: parseUint64(fields[3]),
+			TxBytes:   parseUint64(fields[8]),
+			TxPackets: parseUint64(fields[9]),
+			TxErrors:  parseUint64(fields[10]),
+			TxDropped: parseUint64(fields[11]),
+		}
+	}
+	return out
+}
+
+func parseUint64(s string) uint64 {
+	n, _ := strconv.ParseUint(s, 10, 64)
+	return n
+}
+
+// readBlkioStats parses cgroup v2's io.stat format into Docker's BlkioStats
+// shape. io.stat has one line per device:
+//
+//	8:0 rbytes=123 wbytes=456 rios=10 wios=20 dbytes=0 dios=0
+//
+// Docker's legacy shape is a map of named arrays. We populate
+// io_service_bytes_recursive (Read/Write/Total) and io_serviced_recursive
+// (Read/Write/Total), which is what Portainer's disk-IO chart reads.
+func readBlkioStats(path string) map[string][]any {
+	out := map[string][]any{
+		"io_service_bytes_recursive": []any{},
+		"io_serviced_recursive":      []any{},
+		"io_queue_recursive":         []any{},
+		"io_service_time_recursive":  []any{},
+		"io_wait_time_recursive":     []any{},
+		"io_merged_recursive":        []any{},
+		"io_time_recursive":          []any{},
+		"sectors_recursive":          []any{},
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		majorMinor := strings.SplitN(fields[0], ":", 2)
+		if len(majorMinor) != 2 {
+			continue
+		}
+		major, _ := strconv.ParseUint(majorMinor[0], 10, 64)
+		minor, _ := strconv.ParseUint(majorMinor[1], 10, 64)
+		vals := map[string]uint64{}
+		for _, kv := range fields[1:] {
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok {
+				continue
+			}
+			vals[k] = parseUint64(v)
+		}
+		out["io_service_bytes_recursive"] = append(out["io_service_bytes_recursive"],
+			blkioEntry(major, minor, "Read", vals["rbytes"]),
+			blkioEntry(major, minor, "Write", vals["wbytes"]),
+			blkioEntry(major, minor, "Total", vals["rbytes"]+vals["wbytes"]),
+		)
+		out["io_serviced_recursive"] = append(out["io_serviced_recursive"],
+			blkioEntry(major, minor, "Read", vals["rios"]),
+			blkioEntry(major, minor, "Write", vals["wios"]),
+			blkioEntry(major, minor, "Total", vals["rios"]+vals["wios"]),
+		)
+	}
+	return out
+}
+
+func blkioEntry(major, minor uint64, op string, value uint64) map[string]any {
+	return map[string]any{
+		"major": major,
+		"minor": minor,
+		"op":    op,
+		"value": value,
+	}
+}
+
+// readMemoryStat parses cgroup v2's memory.stat (one "key value" pair per
+// line) and also synthesises the cgroup v1 keys Docker's UI — and therefore
+// Portainer's memory chart — historically reads: "cache" maps to v2's
+// "file", "rss" maps to "anon".
+func readMemoryStat(path string) map[string]any {
+	stats := map[string]any{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return stats
+	}
+	raw := map[string]uint64{}
+	for _, line := range strings.Split(string(data), "\n") {
+		k, v, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			continue
+		}
+		raw[k] = n
+		stats[k] = n
+	}
+	// Docker's classic field names — keep them present so older clients
+	// (including Portainer's memory chart) don't show zeros.
+	if _, ok := stats["cache"]; !ok {
+		stats["cache"] = raw["file"]
+	}
+	if _, ok := stats["rss"]; !ok {
+		stats["rss"] = raw["anon"]
+	}
+	return stats
 }
 
 func mountTypeForSource(st *store.Store, source string) string {
@@ -245,9 +391,25 @@ func attachRequestedNetworks(st *store.Store, rec *store.ContainerRecord, cfg Ne
 			Gateway:    orDefault(ep.Gateway, "10.100.0.1"),
 			MacAddress: ep.MacAddress,
 			EndpointID: endpointID(rec.ID, networkName),
+			Aliases:    append([]string{}, ep.Aliases...),
+			Links:      append([]string{}, ep.Links...),
+			DriverOpts: copyStringMap(ep.DriverOpts),
 		}
 	}
 	return nil
+}
+
+// copyStringMap returns a defensive copy of src so persisted store records
+// don't share a slice/map instance with the request body.
+func copyStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 func buildContainerEndpoints(rec *store.ContainerRecord) map[string]EndpointSettings {
@@ -262,6 +424,9 @@ func buildContainerEndpoints(rec *store.ContainerRecord) map[string]EndpointSett
 			MacAddress: attached.MacAddress,
 			NetworkID:  attached.NetworkID,
 			EndpointID: attached.EndpointID,
+			Aliases:    append([]string{}, attached.Aliases...),
+			Links:      append([]string{}, attached.Links...),
+			DriverOpts: copyStringMap(attached.DriverOpts),
 		}
 	}
 	return out

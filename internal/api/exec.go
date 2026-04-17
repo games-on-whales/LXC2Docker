@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -84,10 +85,62 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 		Tty:         req.Tty,
 		Env:         req.Env,
 		WorkingDir:  req.WorkingDir,
+		User:        req.User,
 	}
 	h.execs.add(rec)
+	h.publishExecEvent("exec_create", containerID, rec)
 
 	jsonResponse(w, http.StatusCreated, ExecCreateResponse{ID: rec.ID})
+}
+
+// publishExecEvent emits a Docker-style container exec_{create,start,die}
+// event. Docker encodes the action as `exec_create: <cmd>` so subscribers
+// can match against the command text; we do the same.
+func (h *Handler) publishExecEvent(action, containerID string, rec *execRecord) {
+	cmdText := strings.Join(rec.Cmd, " ")
+	attrs := map[string]string{
+		"execID": rec.ID,
+	}
+	if name := h.containerName(containerID); name != "" {
+		attrs["name"] = name
+	}
+	if image := h.containerImage(containerID); image != "" {
+		attrs["image"] = image
+	}
+	if cmdText != "" {
+		action = action + ": " + cmdText
+	}
+	h.publishEvent("container", action, containerID, attrs)
+}
+
+// publishExecDieEvent is the exec_die counterpart and carries the final
+// exit code as an attribute, matching Docker's event body.
+func (h *Handler) publishExecDieEvent(containerID string, rec *execRecord) {
+	attrs := map[string]string{
+		"execID":   rec.ID,
+		"exitCode": strconv.Itoa(rec.ExitCode),
+	}
+	if name := h.containerName(containerID); name != "" {
+		attrs["name"] = name
+	}
+	if image := h.containerImage(containerID); image != "" {
+		attrs["image"] = image
+	}
+	h.publishEvent("container", "exec_die", containerID, attrs)
+}
+
+func (h *Handler) containerName(id string) string {
+	if rec := h.store.GetContainer(id); rec != nil {
+		return rec.Name
+	}
+	return ""
+}
+
+func (h *Handler) containerImage(id string) string {
+	if rec := h.store.GetContainer(id); rec != nil {
+		return normalizeImageRef(rec.Image)
+	}
+	return ""
 }
 
 // POST /exec/{id}/start
@@ -109,6 +162,7 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		// Fire-and-forget: run the command, don't stream output.
 		cmdArgs, env := prepareExecInvocation(rec)
 		cmd := h.mgr.Exec(rec.ContainerID, cmdArgs, env)
+		h.publishExecEvent("exec_start", rec.ContainerID, rec)
 		go func() {
 			err := cmd.Run()
 			code := 0
@@ -121,12 +175,14 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 				r.Running = false
 				r.ExitCode = code
 			})
+			h.publishExecDieEvent(rec.ContainerID, rec)
 		}()
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
 	h.execs.update(rec.ID, func(r *execRecord) { r.Running = true; r.StartedAt = time.Now() })
+	h.publishExecEvent("exec_start", rec.ContainerID, rec)
 
 	cmdArgs, env := prepareExecInvocation(rec)
 	cmd := h.mgr.Exec(rec.ContainerID, cmdArgs, env)
@@ -153,7 +209,9 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 
 		if rec.Tty {
 			closeConn = false
-			runExecTTY(cmd, conn)
+			runExecTTY(cmd, conn, func(p *os.File) {
+				h.execs.update(rec.ID, func(r *execRecord) { r.pty = p })
+			})
 		} else {
 			runExecMux(cmd, conn)
 		}
@@ -175,6 +233,11 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		r.Running = false
 		r.ExitCode = code
 	})
+	// Re-read the record so ExitCode is the just-written value; the
+	// publishExecDieEvent helper reads rec.ExitCode directly.
+	if final := h.execs.get(rec.ID); final != nil {
+		h.publishExecDieEvent(rec.ContainerID, final)
+	}
 }
 
 // GET /exec/{id}/json
@@ -202,17 +265,23 @@ func (h *Handler) execInspect(w http.ResponseWriter, r *http.Request) {
 			Tty:        rec.Tty,
 			Entrypoint: entrypoint,
 			Arguments:  args,
+			User:       rec.User,
 		},
 	})
 }
 
 // runExecTTY runs cmd with a PTY attached and proxies raw bytes between the
-// PTY master and the hijacked connection. Used when Tty=true.
-func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter) {
+// PTY master and the hijacked connection. Used when Tty=true. If onPTY is
+// non-nil it is called with the PTY master once the command has started so
+// callers (e.g. /exec/{id}/resize) can issue ioctls against it.
+func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter, onPTY func(*os.File)) {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		fmt.Fprintf(conn, "error starting pty: %s\n", err)
 		return
+	}
+	if onPTY != nil {
+		onPTY(ptmx)
 	}
 
 	var wg sync.WaitGroup
@@ -231,6 +300,11 @@ func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter) {
 	}()
 
 	cmd.Wait()
+	// Clear the handle before closing so a late resize ioctl can't race with
+	// ptmx.Close and hit a reused fd.
+	if onPTY != nil {
+		onPTY(nil)
+	}
 	// Close the PTY master to unblock the io.Copy goroutines. If we defer
 	// this, wg.Wait below deadlocks because the copies never see EOF.
 	ptmx.Close()
@@ -309,12 +383,25 @@ func runExecTTYOutput(cmd *exec.Cmd, w io.Writer) {
 
 func prepareExecInvocation(rec *execRecord) ([]string, []string) {
 	env := append(os.Environ(), rec.Env...)
-	if rec.WorkingDir == "" {
+	if rec.WorkingDir == "" && rec.User == "" {
 		return rec.Cmd, env
 	}
-	script := "cd " + shellQuote(rec.WorkingDir) + " && exec"
+	script := ""
+	if rec.WorkingDir != "" {
+		script = "cd " + shellQuote(rec.WorkingDir) + " && "
+	}
+	script += "exec"
 	for _, arg := range rec.Cmd {
 		script += " " + shellQuote(arg)
+	}
+	if rec.User != "" {
+		// Wrap in su so the payload runs as the chosen user inside the
+		// container. su -s /bin/sh keeps the shell predictable when the
+		// target account's login shell is something weird; -c runs the
+		// whole script. Falls back to root gracefully if the user does
+		// not exist in the container (su exits non-zero, which the
+		// caller's exit code reflects).
+		script = "su -s /bin/sh -c " + shellQuote(script) + " " + shellQuote(rec.User)
 	}
 	return []string{"/bin/sh", "-lc", script}, env
 }

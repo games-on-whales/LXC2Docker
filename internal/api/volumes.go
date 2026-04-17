@@ -11,9 +11,26 @@ import (
 )
 
 func (h *Handler) listVolumes(w http.ResponseWriter, r *http.Request) {
+	filters, err := parseListFilters(r.URL.Query().Get("filters"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
+		return
+	}
+	// Pre-compute refCount per volume so the filter can honour dangling=true.
+	refCount := map[string]int{}
+	for _, c := range h.store.ListContainers() {
+		for _, m := range c.Mounts {
+			if m.Name != "" {
+				refCount[m.Name]++
+			}
+		}
+	}
 	vols := h.store.ListVolumes()
 	out := make([]VolumeUsage, 0, len(vols))
 	for _, v := range vols {
+		if !matchesVolumeFilters(v, refCount[v.Name], filters) {
+			continue
+		}
 		size, _ := dirSize(v.Mountpoint)
 		out = append(out, volumeUsage(h.store, v, size))
 	}
@@ -58,7 +75,11 @@ func (h *Handler) inspectVolume(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "no such volume")
 		return
 	}
-	jsonResponse(w, http.StatusOK, volumeCreateResponse(v))
+	// Return the richer VolumeUsage shape (same fields as /volumes plus
+	// UsageData) so Portainer's volume detail page can show size and
+	// reference count instead of "—".
+	size, _ := dirSize(v.Mountpoint)
+	jsonResponse(w, http.StatusOK, volumeUsage(h.store, v, size))
 }
 
 func (h *Handler) removeVolume(w http.ResponseWriter, r *http.Request) {
@@ -89,6 +110,11 @@ func (h *Handler) removeVolume(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) pruneVolumes(w http.ResponseWriter, r *http.Request) {
+	filters, err := parseListFilters(r.URL.Query().Get("filters"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
+		return
+	}
 	deleted := []string{}
 	space := int64(0)
 	inUse := map[string]bool{}
@@ -101,6 +127,11 @@ func (h *Handler) pruneVolumes(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, v := range h.store.ListVolumes() {
 		if inUse[v.Name] {
+			continue
+		}
+		// Volumes carry no created-at field the caller can filter on, so
+		// until is a no-op for them; label still applies.
+		if !pruneEligible(v.CreatedAt, v.Labels, filters, nil) {
 			continue
 		}
 		size, _ := dirSize(v.Mountpoint)

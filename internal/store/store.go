@@ -34,7 +34,9 @@ type ContainerRecord struct {
 	PortBindings []PortBinding                `json:"port_bindings,omitempty"`
 	Mounts       []MountSpec                  `json:"mounts"`
 	Networks     map[string]NetworkAttachment `json:"networks,omitempty"`
-	StartedAt    *time.Time                   `json:"started_at,omitempty"` // nil until first start; distinguishes "created" from "exited"
+	StartedAt    *time.Time                   `json:"started_at,omitempty"`  // nil until first start; distinguishes "created" from "exited"
+	FinishedAt   *time.Time                   `json:"finished_at,omitempty"` // nil while running or before first exit
+	ExitCode     int                          `json:"exit_code,omitempty"`
 	// Ephemeral is true only for daemon-created raw-LXC containers that the
 	// GC is permitted to reap. Permanent Proxmox CTs (visible in PVE UI) and
 	// any pre-existing records that lack this flag are left strictly alone.
@@ -43,15 +45,82 @@ type ContainerRecord struct {
 	// on. Used by RemoveContainer for ephemeral containers (the ZFS clone
 	// dataset path includes the pool name) and for diagnostics on PVE CTs.
 	Storage string `json:"storage,omitempty"`
+	// RestartPolicy is echoed back through /containers/{id}/json so
+	// Portainer's container detail shows the policy the user selected at
+	// create time. The daemon does not currently enforce it — containers
+	// that exit stay exited until the user restarts them.
+	RestartPolicy *RestartPolicy `json:"restart_policy,omitempty"`
+	// Healthcheck is echoed back on inspect so Portainer's detail panel
+	// and duplicate/edit dialog reflect the user's input. Like
+	// RestartPolicy, the daemon does not actually execute the check.
+	Healthcheck *HealthcheckConfig `json:"healthcheck,omitempty"`
+	// StopSignal mirrors Docker's Config.StopSignal field (e.g. "SIGINT").
+	// We don't map it into lxc-stop, but Portainer reads it from inspect.
+	StopSignal string `json:"stop_signal,omitempty"`
+	// WorkingDir mirrors Docker's Config.WorkingDir so inspect echoes
+	// what the user picked instead of always reporting empty.
+	WorkingDir string `json:"working_dir,omitempty"`
+	// User/Domainname/Hostname mirror their Config counterparts. The
+	// daemon does not actually drop privileges to User today.
+	User       string `json:"user,omitempty"`
+	Domainname string `json:"domainname,omitempty"`
+	Hostname   string `json:"hostname,omitempty"`
+	// Tty/OpenStdin/StdinOnce mirror the Config flags; currently not
+	// propagated to lxc-start but roundtrip through inspect.
+	Tty       bool `json:"tty,omitempty"`
+	OpenStdin bool `json:"open_stdin,omitempty"`
+	StdinOnce bool `json:"stdin_once,omitempty"`
+	// HostConfigExtras holds the HostConfig fields we roundtrip through
+	// inspect without enforcing (Privileged, caps, DNS overrides,
+	// resource limits). Portainer's Host Config tab renders these.
+	HostConfigExtras *HostConfigExtras `json:"host_config_extras,omitempty"`
+}
+
+// HostConfigExtras is the persisted subset of Docker's HostConfig we
+// echo on inspect. Each field maps 1:1 to its Docker counterpart.
+type HostConfigExtras struct {
+	Privileged bool     `json:"privileged,omitempty"`
+	CapAdd     []string `json:"cap_add,omitempty"`
+	CapDrop    []string `json:"cap_drop,omitempty"`
+	ExtraHosts []string `json:"extra_hosts,omitempty"`
+	Dns        []string `json:"dns,omitempty"`
+	DnsSearch  []string `json:"dns_search,omitempty"`
+	DnsOptions []string `json:"dns_options,omitempty"`
+	Memory     int64    `json:"memory,omitempty"`
+	CPUShares  int64    `json:"cpu_shares,omitempty"`
+	NanoCPUs   int64    `json:"nano_cpus,omitempty"`
+}
+
+// HealthcheckConfig mirrors Docker's Config.Healthcheck. Stored verbatim;
+// the daemon currently does not execute healthchecks (all fields are
+// echoed back on inspect for UI purposes only).
+type HealthcheckConfig struct {
+	Test          []string `json:"test,omitempty"`
+	Interval      int64    `json:"interval,omitempty"`
+	Timeout       int64    `json:"timeout,omitempty"`
+	StartPeriod   int64    `json:"start_period,omitempty"`
+	StartInterval int64    `json:"start_interval,omitempty"`
+	Retries       int      `json:"retries,omitempty"`
+}
+
+// RestartPolicy mirrors Docker's HostConfig.RestartPolicy block. Kept as a
+// pointer on ContainerRecord so zero-value state doesn't clobber persisted
+// records written before this field existed.
+type RestartPolicy struct {
+	Name              string `json:"name"`
+	MaximumRetryCount int    `json:"maximum_retry_count,omitempty"`
 }
 
 // NetworkAttachment records a container's membership in a Docker-style network.
 type NetworkAttachment struct {
-	NetworkID  string `json:"network_id"`
-	IPAddress  string `json:"ip_address,omitempty"`
-	Gateway    string `json:"gateway,omitempty"`
-	MacAddress string `json:"mac_address,omitempty"`
-	EndpointID string `json:"endpoint_id,omitempty"`
+	NetworkID  string            `json:"network_id"`
+	IPAddress  string            `json:"ip_address,omitempty"`
+	Gateway    string            `json:"gateway,omitempty"`
+	MacAddress string            `json:"mac_address,omitempty"`
+	EndpointID string            `json:"endpoint_id,omitempty"`
+	Aliases    []string          `json:"aliases,omitempty"`
+	Links      []string          `json:"links,omitempty"`
+	DriverOpts map[string]string `json:"driver_opts,omitempty"`
 }
 
 // PortBinding records a single host→container port mapping.
@@ -82,13 +151,35 @@ type VolumeRecord struct {
 
 // NetworkRecord holds metadata for a Docker-style network object.
 type NetworkRecord struct {
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	Driver    string            `json:"driver"`
-	Scope     string            `json:"scope"`
-	CreatedAt time.Time         `json:"created_at"`
-	Labels    map[string]string `json:"labels,omitempty"`
-	Options   map[string]string `json:"options,omitempty"`
+	ID         string            `json:"id"`
+	Name       string            `json:"name"`
+	Driver     string            `json:"driver"`
+	Scope      string            `json:"scope"`
+	CreatedAt  time.Time         `json:"created_at"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	Options    map[string]string `json:"options,omitempty"`
+	Internal   bool              `json:"internal,omitempty"`
+	Attachable bool              `json:"attachable,omitempty"`
+	// IPAM is roundtripped verbatim on inspect. The daemon does not use
+	// these addresses for allocation — containers still get addresses
+	// from the single gow bridge — but Portainer's network detail page
+	// displays the configured Subnet/Gateway/IPRange.
+	IPAM *NetworkIPAM `json:"ipam,omitempty"`
+}
+
+// NetworkIPAM mirrors Docker's IPAM block.
+type NetworkIPAM struct {
+	Driver  string              `json:"driver,omitempty"`
+	Options map[string]string   `json:"options,omitempty"`
+	Config  []NetworkIPAMConfig `json:"config,omitempty"`
+}
+
+// NetworkIPAMConfig is one entry inside NetworkIPAM.Config.
+type NetworkIPAMConfig struct {
+	Subnet     string            `json:"subnet,omitempty"`
+	IPRange    string            `json:"ip_range,omitempty"`
+	Gateway    string            `json:"gateway,omitempty"`
+	AuxAddress map[string]string `json:"aux_address,omitempty"`
 }
 
 // ImageRecord holds metadata for a pulled image. Templates can be backed
@@ -106,11 +197,15 @@ type ImageRecord struct {
 	TemplateDataset string    `json:"template_dataset"` // ZFS dataset path of the template (preferred for new pulls; e.g. "large/dld-templates/nginx-alpine")
 	Created         time.Time `json:"created"`
 	// OCI image metadata (populated only for OCI-pulled images).
-	OCIEntrypoint []string `json:"oci_entrypoint,omitempty"`
-	OCICmd        []string `json:"oci_cmd,omitempty"`
-	OCIEnv        []string `json:"oci_env,omitempty"`
-	OCIWorkingDir string   `json:"oci_working_dir,omitempty"`
-	OCIPorts      []string `json:"oci_ports,omitempty"`
+	OCIEntrypoint  []string           `json:"oci_entrypoint,omitempty"`
+	OCICmd         []string           `json:"oci_cmd,omitempty"`
+	OCIEnv         []string           `json:"oci_env,omitempty"`
+	OCIWorkingDir  string             `json:"oci_working_dir,omitempty"`
+	OCIPorts       []string           `json:"oci_ports,omitempty"`
+	OCILabels      map[string]string  `json:"oci_labels,omitempty"`
+	OCIUser        string             `json:"oci_user,omitempty"`
+	OCIStopSignal  string             `json:"oci_stop_signal,omitempty"`
+	OCIHealthcheck *HealthcheckConfig `json:"oci_healthcheck,omitempty"`
 }
 
 type state struct {

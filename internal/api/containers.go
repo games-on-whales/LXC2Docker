@@ -3,6 +3,7 @@ package api
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -11,7 +12,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,6 +93,21 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		if imgRec := h.store.GetImage(normalizeImageRef(req.Image)); imgRec != nil {
 			workingDir = imgRec.OCIWorkingDir
 		}
+	}
+
+	// Labels: inherit from the image then overlay request labels so user
+	// overrides win — same semantics Docker uses. Portainer's stack grouping
+	// reads com.docker.compose.* labels on the resulting container, which
+	// were previously dropped whenever the Compose file set them via the
+	// image rather than the service block.
+	labels := map[string]string{}
+	if imgRec := h.store.GetImage(normalizeImageRef(req.Image)); imgRec != nil {
+		for k, v := range imgRec.OCILabels {
+			labels[k] = v
+		}
+	}
+	for k, v := range req.Labels {
+		labels[k] = v
 	}
 
 	// Default mode is PERMANENT (PVE CT, visible in the PVE UI). Opt out
@@ -174,17 +192,66 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	var restart *store.RestartPolicy
+	if req.HostConfig.RestartPolicy.Name != "" {
+		restart = &store.RestartPolicy{
+			Name:              req.HostConfig.RestartPolicy.Name,
+			MaximumRetryCount: req.HostConfig.RestartPolicy.MaximumRetryCount,
+		}
+	}
+
+	var health *store.HealthcheckConfig
+	if req.Healthcheck != nil && len(req.Healthcheck.Test) > 0 {
+		health = &store.HealthcheckConfig{
+			Test:          append([]string{}, req.Healthcheck.Test...),
+			Interval:      req.Healthcheck.Interval,
+			Timeout:       req.Healthcheck.Timeout,
+			StartPeriod:   req.Healthcheck.StartPeriod,
+			StartInterval: req.Healthcheck.StartInterval,
+			Retries:       req.Healthcheck.Retries,
+		}
+	}
+	// Inherit image-declared User/StopSignal/Healthcheck when the request
+	// didn't specify them (matches Docker's create semantics).
+	user := req.User
+	stopSignal := req.StopSignal
+	if imgRec := h.store.GetImage(normalizeImageRef(req.Image)); imgRec != nil {
+		if user == "" {
+			user = imgRec.OCIUser
+		}
+		if stopSignal == "" {
+			stopSignal = imgRec.OCIStopSignal
+		}
+		if health == nil && imgRec.OCIHealthcheck != nil {
+			hc := *imgRec.OCIHealthcheck
+			health = &hc
+		}
+	}
+
+	extras := hostConfigExtrasFromRequest(req.HostConfig)
+
 	// Persist record before creating so the IP is allocated.
 	rec := &store.ContainerRecord{
-		ID:         id,
-		Name:       name,
-		Image:      req.Image,
-		ImageID:    normalizeImageRef(req.Image),
-		Created:    time.Now(),
-		Entrypoint: entrypoint,
-		Cmd:        cmd,
-		Env:        env,
-		Labels:     req.Labels,
+		ID:            id,
+		Name:          name,
+		Image:         req.Image,
+		ImageID:       normalizeImageRef(req.Image),
+		Created:       time.Now(),
+		Entrypoint:    entrypoint,
+		Cmd:           cmd,
+		Env:           env,
+		Labels:        labels,
+		RestartPolicy:    restart,
+		Healthcheck:      health,
+		StopSignal:       stopSignal,
+		HostConfigExtras: extras,
+		WorkingDir:       workingDir,
+		User:             user,
+		Domainname:       req.Domainname,
+		Hostname:         req.Hostname,
+		Tty:              req.Tty,
+		OpenStdin:        req.OpenStdin,
+		StdinOnce:        req.StdinOnce,
 	}
 	rec.Networks = defaultContainerNetworks(rec)
 	if err := attachRequestedNetworks(h.store, rec, req.NetworkingConfig); err != nil {
@@ -251,6 +318,12 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 // GET /containers/json
 func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
+	includeSize := r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true"
+	filters, err := parseListFilters(r.URL.Query().Get("filters"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
+		return
+	}
 	// Use Manager.ListContainers so adopted (operator-tagged) PVE CTs
 	// surface alongside daemon-created records.
 	records := h.mgr.ListContainers()
@@ -264,6 +337,9 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		if !all && state != "running" {
 			continue
 		}
+		if !matchesContainerFilters(rec, state, filters) {
+			continue
+		}
 		cmd := strings.Join(append(rec.Entrypoint, rec.Cmd...), " ")
 		ports := make([]Port, 0, len(rec.PortBindings))
 		for _, pb := range rec.PortBindings {
@@ -274,7 +350,30 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 				Type:        pb.Proto,
 			})
 		}
-		out = append(out, ContainerSummary{
+		mounts := make([]MountJSON, 0, len(rec.Mounts))
+		for _, m := range rec.Mounts {
+			mode := "rw"
+			if m.ReadOnly {
+				mode = "ro"
+			}
+			mountType := m.Type
+			if mountType == "" {
+				mountType = "bind"
+			}
+			mounts = append(mounts, MountJSON{
+				Type:        mountType,
+				Source:      m.Source,
+				Destination: m.Destination,
+				Mode:        mode,
+				RW:          !m.ReadOnly,
+			})
+		}
+		networkMode := "bridge"
+		for name := range rec.Networks {
+			networkMode = name
+			break
+		}
+		summary := ContainerSummary{
 			ID:      rec.ID,
 			Names:   []string{"/" + rec.Name},
 			Image:   normalizeImageRef(rec.Image),
@@ -285,7 +384,16 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			Status:  stateToStatus(state, rec.Created),
 			Ports:   ports,
 			Labels:  rec.Labels,
-		})
+			Mounts:  mounts,
+			NetworkSettings: &SummaryNetworkSetting{
+				Networks: buildContainerEndpoints(rec),
+			},
+			HostConfig: &SummaryHostConfig{NetworkMode: networkMode},
+		}
+		if includeSize {
+			summary.SizeRootFs, _ = dirSize(h.mgr.RootfsPath(rec.ID))
+		}
+		out = append(out, summary)
 	}
 	jsonResponse(w, http.StatusOK, out)
 }
@@ -318,6 +426,10 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 	if rec.StartedAt != nil {
 		startedAt = rec.StartedAt.Format(time.RFC3339)
 	}
+	finishedAt := "0001-01-01T00:00:00Z"
+	if rec.FinishedAt != nil {
+		finishedAt = rec.FinishedAt.Format(time.RFC3339)
+	}
 
 	// Build Mounts array from stored mount specs.
 	mounts := make([]MountJSON, 0, len(rec.Mounts))
@@ -339,33 +451,156 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// Path/Args derive from the effective process that was launched. Docker
+	// reports Entrypoint when set, falling back to Cmd[0]. Portainer reads
+	// these to render the "Command" row in the inspect tab.
+	path, args := splitPathArgs(rec.Entrypoint, rec.Cmd)
+
+	pid := 0
+	if running {
+		if p, err := h.mgr.InitPID(id); err == nil {
+			pid = p
+		}
+	}
+
+	hostConfig := buildHostConfig(rec)
+	if hostConfig.NetworkMode == "" {
+		for name := range rec.Networks {
+			hostConfig.NetworkMode = name
+			break
+		}
+		if hostConfig.NetworkMode == "" {
+			hostConfig.NetworkMode = "bridge"
+		}
+	}
+
+	includeSize := r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true"
+
 	resp := ContainerJSON{
-		ID:      rec.ID,
-		Created: rec.Created.Format(time.RFC3339),
-		Name:    "/" + rec.Name,
+		ID:       rec.ID,
+		Created:  rec.Created.Format(time.RFC3339),
+		Path:     path,
+		Args:     args,
+		Name:     "/" + rec.Name,
+		Driver:   "lxc",
+		Platform: "linux",
+		Image:    rec.Image,
+		ImageID:  rec.ImageID,
+		LogPath:  h.mgr.LogPath(id),
 		State: ContainerState{
 			Status:     state,
 			Running:    running,
+			Pid:        pid,
+			ExitCode:   rec.ExitCode,
 			StartedAt:  startedAt,
-			FinishedAt: "0001-01-01T00:00:00Z",
+			FinishedAt: finishedAt,
 		},
-		Image:  rec.Image,
 		Mounts: mounts,
 		Config: &ContainerConfig{
-			Hostname:   rec.ID[:12],
-			Image:      rec.Image,
-			Cmd:        rec.Cmd,
-			Entrypoint: rec.Entrypoint,
-			Env:        rec.Env,
-			Labels:     rec.Labels,
+			Hostname:     orDefault(rec.Hostname, rec.ID[:12]),
+			Domainname:   rec.Domainname,
+			User:         rec.User,
+			Image:        rec.Image,
+			Cmd:          rec.Cmd,
+			Entrypoint:   rec.Entrypoint,
+			Env:          rec.Env,
+			Labels:       rec.Labels,
+			WorkingDir:   rec.WorkingDir,
+			ExposedPorts: imageExposedPorts(h.store, rec),
+			StopSignal:   rec.StopSignal,
+			Healthcheck:  healthcheckFromRecord(rec.Healthcheck),
+			Tty:          rec.Tty,
+			OpenStdin:    rec.OpenStdin,
+			StdinOnce:    rec.StdinOnce,
 		},
-		HostConfig: buildHostConfig(rec),
+		HostConfig: hostConfig,
 		NetworkSettings: NetworkSettings{
 			IPAddress: rec.IPAddress,
 			Networks:  buildContainerEndpoints(rec),
+			Ports:     hostConfig.PortBindings,
 		},
 	}
+	if includeSize {
+		size, _ := dirSize(h.mgr.RootfsPath(id))
+		zero := int64(0)
+		resp.SizeRw = &zero
+		resp.SizeRootFs = &size
+	}
 	jsonResponse(w, http.StatusOK, resp)
+}
+
+// hostConfigExtrasFromRequest extracts the HostConfig fields we roundtrip
+// through inspect without enforcing. Returns nil when nothing meaningful was
+// set so older persisted records stay untouched by the new field.
+func hostConfigExtrasFromRequest(hc HostConfig) *store.HostConfigExtras {
+	if !hc.Privileged && len(hc.CapAdd) == 0 && len(hc.CapDrop) == 0 &&
+		len(hc.ExtraHosts) == 0 && len(hc.Dns) == 0 && len(hc.DnsSearch) == 0 &&
+		len(hc.DnsOptions) == 0 && hc.Memory == 0 && hc.CPUShares == 0 && hc.NanoCPUs == 0 {
+		return nil
+	}
+	return &store.HostConfigExtras{
+		Privileged: hc.Privileged,
+		CapAdd:     append([]string{}, hc.CapAdd...),
+		CapDrop:    append([]string{}, hc.CapDrop...),
+		ExtraHosts: append([]string{}, hc.ExtraHosts...),
+		Dns:        append([]string{}, hc.Dns...),
+		DnsSearch:  append([]string{}, hc.DnsSearch...),
+		DnsOptions: append([]string{}, hc.DnsOptions...),
+		Memory:     hc.Memory,
+		CPUShares:  hc.CPUShares,
+		NanoCPUs:   hc.NanoCPUs,
+	}
+}
+
+// healthcheckFromRecord lifts a stored healthcheck into the API shape that
+// Portainer reads from Config.Healthcheck on inspect. nil in / nil out.
+func healthcheckFromRecord(h *store.HealthcheckConfig) *HealthConfig {
+	if h == nil {
+		return nil
+	}
+	return &HealthConfig{
+		Test:          append([]string{}, h.Test...),
+		Interval:      h.Interval,
+		Timeout:       h.Timeout,
+		StartPeriod:   h.StartPeriod,
+		StartInterval: h.StartInterval,
+		Retries:       h.Retries,
+	}
+}
+
+// imageExposedPorts returns the ExposedPorts map Docker surfaces on
+// container inspect's Config block — derived from the image's OCI Ports.
+// Portainer reads this alongside HostConfig.PortBindings to show "exposed
+// but not published" ports in the detail view. Also merges any container
+// port from the existing port bindings so manually-published ports appear
+// even when the image didn't declare them.
+func imageExposedPorts(st *store.Store, rec *store.ContainerRecord) map[string]struct{} {
+	out := map[string]struct{}{}
+	if img := st.GetImage(normalizeImageRef(rec.Image)); img != nil {
+		for _, p := range img.OCIPorts {
+			if p != "" {
+				out[p] = struct{}{}
+			}
+		}
+	}
+	for _, pb := range rec.PortBindings {
+		out[fmt.Sprintf("%d/%s", pb.ContainerPort, pb.Proto)] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// splitPathArgs reproduces Docker's Path/Args split: the entrypoint (or first
+// element of cmd when no entrypoint) is Path, everything after is Args.
+func splitPathArgs(entrypoint, cmd []string) (string, []string) {
+	combined := append([]string{}, entrypoint...)
+	combined = append(combined, cmd...)
+	if len(combined) == 0 {
+		return "", []string{}
+	}
+	return combined[0], combined[1:]
 }
 
 // POST /containers/{id}/start
@@ -375,15 +610,24 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
+	// Docker returns 304 Not Modified when the target is already running.
+	// Portainer uses that to keep its optimistic UI state instead of
+	// flashing an error when the user double-clicks start.
+	if state, _ := h.mgr.State(id); state == "running" {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	if err := h.mgr.StartContainer(id); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	// Record first-start timestamp so inspect can distinguish "created" from "exited".
-	if rec := h.store.GetContainer(id); rec != nil && rec.StartedAt == nil {
+	// Reset runtime state on each successful start.
+	if rec := h.store.GetContainer(id); rec != nil {
 		now := time.Now()
 		rec.StartedAt = &now
+		rec.FinishedAt = nil
+		rec.ExitCode = 0
 		h.store.AddContainer(rec)
 	}
 	if rec := h.store.GetContainer(id); rec != nil {
@@ -413,11 +657,42 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	if err := h.mgr.StopContainer(id, 10*time.Second); err != nil {
+	// Mirror Docker's 304 for already-stopped targets.
+	if state, _ := h.mgr.State(id); state != "running" {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	timeout, err := parseStopTimeout(r.URL.Query().Get("t"), 10*time.Second)
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// If the container declared a custom StopSignal (postgres runs with
+	// SIGINT, for example), deliver that to PID 1 first and wait the
+	// user-supplied timeout for graceful shutdown. Fall through to
+	// Manager.StopContainer for the SIGKILL backstop.
+	if rec := h.store.GetContainer(id); rec != nil && nonDefaultStopSignal(rec.StopSignal) {
+		if err := h.mgr.KillContainer(id, rec.StopSignal); err == nil {
+			waitUntilExited(h.mgr, id, timeout)
+		}
+	}
+	if state, _ := h.mgr.State(id); state != "running" {
+		if rec := h.store.GetContainer(id); rec != nil {
+			h.markContainerExited(rec, 0)
+			h.publishEvent("container", "stop", id, map[string]string{
+				"name":  rec.Name,
+				"image": normalizeImageRef(rec.Image),
+			})
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := h.mgr.StopContainer(id, timeout); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if rec := h.store.GetContainer(id); rec != nil {
+		h.markContainerExited(rec, 0)
 		h.publishEvent("container", "stop", id, map[string]string{
 			"name":  rec.Name,
 			"image": normalizeImageRef(rec.Image),
@@ -433,13 +708,51 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	// Poll until the container stops.
+	condition := strings.TrimSpace(r.URL.Query().Get("condition"))
+	if condition == "" {
+		condition = "not-running"
+	}
+	switch condition {
+	case "not-running", "next-exit", "removed":
+	default:
+		errResponse(w, http.StatusBadRequest, "unsupported wait condition")
+		return
+	}
+	lastExitCode := 0
+	if rec := h.store.GetContainer(id); rec != nil {
+		lastExitCode = rec.ExitCode
+	}
+
 	ctx := r.Context()
 	for {
+		if condition == "removed" {
+			if h.mgr.GetContainer(id) == nil {
+				jsonResponse(w, http.StatusOK, map[string]any{
+					"StatusCode": lastExitCode,
+					"Error":      nil,
+				})
+				return
+			}
+		}
+
 		state, _ := h.mgr.State(id)
 		if state != "running" {
+			if rec := h.store.GetContainer(id); rec != nil && rec.StartedAt != nil && rec.FinishedAt == nil {
+				h.markContainerExited(rec, rec.ExitCode)
+			}
+			if rec := h.store.GetContainer(id); rec != nil {
+				lastExitCode = rec.ExitCode
+			}
+			if condition == "removed" {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(500 * time.Millisecond):
+				}
+				continue
+			}
 			jsonResponse(w, http.StatusOK, map[string]any{
-				"StatusCode": 0,
+				"StatusCode": lastExitCode,
 				"Error":      nil,
 			})
 			return
@@ -465,6 +778,7 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rec := h.store.GetContainer(id); rec != nil {
+		h.markContainerExited(rec, exitCodeForSignal(signal))
 		h.publishEvent("container", "kill", id, map[string]string{
 			"name":   rec.Name,
 			"image":  normalizeImageRef(rec.Image),
@@ -523,6 +837,22 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	stdout := r.URL.Query().Get("stdout") == "1" || r.URL.Query().Get("stdout") == "true"
 	stderr := r.URL.Query().Get("stderr") == "1" || r.URL.Query().Get("stderr") == "true"
 	follow := r.URL.Query().Get("follow") == "1" || r.URL.Query().Get("follow") == "true"
+	timestamps := r.URL.Query().Get("timestamps") == "1" || r.URL.Query().Get("timestamps") == "true"
+	tailLines, err := parseTailLines(r.URL.Query().Get("tail"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	since, err := parseLogSince(r.URL.Query().Get("since"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	until, err := parseLogTimestamp(r.URL.Query().Get("until"), "until")
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	if !stdout && !stderr {
 		stdout = true
@@ -546,16 +876,50 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 	w.WriteHeader(http.StatusOK)
 
+	lines := make([]logLine, 0, 128)
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		line := scanner.Bytes()
-		writeLogFrame(w, 1, append(line, '\n')) // treat all console output as stdout
+		line := parseLogLine(scanner.Text())
+		if since != nil && line.Timestamp != nil && line.Timestamp.Before(*since) {
+			continue
+		}
+		if until != nil && line.Timestamp != nil && line.Timestamp.After(*until) {
+			continue
+		}
+		if tailLines < 0 {
+			lines = append(lines, line)
+			continue
+		}
+		if tailLines == 0 {
+			continue
+		}
+		if len(lines) < tailLines {
+			lines = append(lines, line)
+			continue
+		}
+		copy(lines, lines[1:])
+		lines[len(lines)-1] = line
+	}
+	if err := scanner.Err(); err != nil {
+		return
+	}
+	for _, line := range lines {
+		writeLogFrame(w, 1, append([]byte(formatLogLine(line, timestamps)), '\n'))
+	}
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
 	}
 
 	if follow {
-		// Tail: poll for new content until client disconnects.
+		// Tail: poll for new content until client disconnects or until
+		// the caller-supplied `until` cutoff is reached.
 		ctx := r.Context()
+		pending := make([]byte, 0, 4096)
 		for {
+			if until != nil && time.Now().After(*until) {
+				return
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -564,7 +928,19 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 			buf := make([]byte, 32*1024)
 			n, err := f.Read(buf)
 			if n > 0 {
-				writeLogFrame(w, 1, buf[:n])
+				pending = append(pending, buf[:n]...)
+				for {
+					idx := bytes.IndexByte(pending, '\n')
+					if idx < 0 {
+						break
+					}
+					line := parseLogLine(strings.TrimSuffix(string(pending[:idx]), "\r"))
+					if until != nil && line.Timestamp != nil && line.Timestamp.After(*until) {
+						return
+					}
+					writeLogFrame(w, 1, append([]byte(formatLogLine(line, timestamps)), '\n'))
+					pending = pending[idx+1:]
+				}
 				if fl, ok := w.(http.Flusher); ok {
 					fl.Flush()
 				}
@@ -579,6 +955,99 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func parseTailLines(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "all" {
+		return -1, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid tail value %q", raw)
+	}
+	return n, nil
+}
+
+type logLine struct {
+	Timestamp *time.Time
+	Text      string
+}
+
+var ansiRegexp = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func parseLogSince(raw string) (*time.Time, error) {
+	return parseLogTimestamp(raw, "since")
+}
+
+func parseLogTimestamp(raw, paramName string) (*time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	if secs, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		t := time.Unix(secs, 0).UTC()
+		return &t, nil
+	}
+	if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		secs := int64(f)
+		nanos := int64((f - float64(secs)) * float64(time.Second))
+		t := time.Unix(secs, nanos).UTC()
+		return &t, nil
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			utc := t.UTC()
+			return &utc, nil
+		}
+	}
+	return nil, fmt.Errorf("invalid %s value %q", paramName, raw)
+}
+
+func parseLogLine(raw string) logLine {
+	clean := strings.TrimSpace(ansiRegexp.ReplaceAllString(raw, ""))
+	for _, layout := range []string{
+		"2006/01/02 03:04PM",
+		"2006/01/02 15:04:05",
+		time.RFC3339Nano,
+		time.RFC3339,
+	} {
+		parts := strings.SplitN(clean, " ", 3)
+		switch layout {
+		case "2006/01/02 03:04PM", "2006/01/02 15:04:05":
+			if len(parts) < 2 {
+				continue
+			}
+			if ts, err := time.ParseInLocation(layout, parts[0]+" "+parts[1], time.Local); err == nil {
+				text := raw
+				if len(parts) == 3 {
+					text = parts[2]
+				}
+				utc := ts.UTC()
+				return logLine{Timestamp: &utc, Text: text}
+			}
+		default:
+			if len(parts) < 1 {
+				continue
+			}
+			if ts, err := time.Parse(layout, parts[0]); err == nil {
+				text := raw
+				if len(parts) >= 2 {
+					text = strings.Join(parts[1:], " ")
+				}
+				utc := ts.UTC()
+				return logLine{Timestamp: &utc, Text: text}
+			}
+		}
+	}
+	return logLine{Text: raw}
+}
+
+func formatLogLine(line logLine, timestamps bool) string {
+	if !timestamps || line.Timestamp == nil {
+		return line.Text
+	}
+	return line.Timestamp.Format(time.RFC3339Nano) + " " + line.Text
+}
+
 // POST /containers/{id}/restart
 func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
@@ -586,11 +1055,19 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
+	timeout, err := parseStopTimeout(r.URL.Query().Get("t"), 10*time.Second)
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	state, _ := h.mgr.State(id)
 	if state == "running" {
-		if err := h.mgr.StopContainer(id, 10*time.Second); err != nil {
+		if err := h.mgr.StopContainer(id, timeout); err != nil {
 			errResponse(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if rec := h.store.GetContainer(id); rec != nil {
+			h.markContainerExited(rec, 0)
 		}
 	}
 	if err := h.mgr.StartContainer(id); err != nil {
@@ -598,12 +1075,64 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rec := h.store.GetContainer(id); rec != nil {
+		now := time.Now()
+		rec.StartedAt = &now
+		rec.FinishedAt = nil
+		rec.ExitCode = 0
+		h.store.AddContainer(rec)
 		h.publishEvent("container", "restart", id, map[string]string{
 			"name":  rec.Name,
 			"image": normalizeImageRef(rec.Image),
 		})
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// nonDefaultStopSignal reports whether the caller asked for a StopSignal
+// other than SIGTERM/TERM/15 (all names for the default init-killing
+// signal that lxc-stop and pct shutdown already use).
+func nonDefaultStopSignal(sig string) bool {
+	s := strings.ToUpper(strings.TrimSpace(sig))
+	if s == "" {
+		return false
+	}
+	s = strings.TrimPrefix(s, "SIG")
+	switch s {
+	case "TERM", "15":
+		return false
+	}
+	return true
+}
+
+// waitUntilExited polls the container's state up to timeout. Used after
+// sending a custom StopSignal so we give the process a chance to exit
+// before falling back to SIGKILL.
+func waitUntilExited(mgr *lxc.Manager, id string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if state, _ := mgr.State(id); state != "running" {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// parseStopTimeout interprets Docker's ?t=<seconds> query param. Missing or
+// empty returns the caller's default; negative values mean "no timeout" in
+// Docker (kill immediately), so clamp to zero.
+func parseStopTimeout(raw string, fallback time.Duration) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid t value %q", raw)
+	}
+	if n < 0 {
+		return 0, nil
+	}
+	return time.Duration(n) * time.Second, nil
 }
 
 // POST /containers/{id}/rename
@@ -647,21 +1176,35 @@ func (h *Handler) topContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusConflict, "container is not running")
 		return
 	}
-	cmd := h.mgr.Exec(id, []string{"ps", "-eo", "pid,user,time,comm"}, nil)
-	out, err := cmd.Output()
+
+	psArgs := strings.TrimSpace(r.URL.Query().Get("ps_args"))
+	candidates := [][]string{}
+	if psArgs != "" {
+		candidates = append(candidates, append([]string{"ps"}, strings.Fields(psArgs)...))
+	}
+	candidates = append(candidates,
+		[]string{"ps", "-eo", "pid,user,time,comm"},
+		[]string{"ps"},
+	)
+
+	var out []byte
+	var err error
+	for _, argv := range candidates {
+		out, err = h.mgr.Exec(id, argv, nil).Output()
+		if err == nil && strings.TrimSpace(string(out)) != "" {
+			break
+		}
+	}
+	if err != nil {
+		out, err = h.topViaNsenter(id, psArgs)
+	}
 	if err != nil {
 		errResponse(w, http.StatusInternalServerError, fmt.Sprintf("ps: %v", err))
 		return
 	}
+
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	titles := []string{"PID", "USER", "TIME", "COMMAND"}
-	processes := make([][]string, 0, len(lines)-1)
-	for _, line := range lines[1:] {
-		fields := strings.Fields(line)
-		if len(fields) >= 4 {
-			processes = append(processes, fields[:4])
-		}
-	}
+	titles, processes := parseTopOutput(lines)
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"Titles":    titles,
 		"Processes": processes,
@@ -676,26 +1219,30 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		errResponse(w, http.StatusInternalServerError, "streaming not supported")
-		return
-	}
-	conn, buf, err := hj.Hijack()
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
-	buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
-	buf.WriteString("Connection: Upgrade\r\n")
-	buf.WriteString("Upgrade: tcp\r\n")
-	buf.WriteString("\r\n")
-	buf.Flush()
-
 	cmd := h.mgr.Exec(id, []string{"/bin/sh"}, nil)
-	runExecTTY(cmd, conn)
+	if hj, ok := w.(http.Hijacker); ok {
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
+		buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
+		buf.WriteString("Connection: Upgrade\r\n")
+		buf.WriteString("Upgrade: tcp\r\n")
+		buf.WriteString("\r\n")
+		buf.Flush()
+
+		runExecTTY(cmd, conn, func(p *os.File) {
+			h.setAttachPTY(id, p)
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
+	w.WriteHeader(http.StatusOK)
+	runAttachFallback(cmd, r.Body, w)
 }
 
 // safeJoin joins base and untrusted path, returning an error if the result
@@ -815,6 +1362,9 @@ func (h *Handler) getArchive(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Docker-Container-Path-Stat", base64.StdEncoding.EncodeToString(statJSON))
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
 	tw := tar.NewWriter(w)
 	defer tw.Close()
 
@@ -869,6 +1419,212 @@ func writeLogFrame(w io.Writer, streamType byte, data []byte) {
 	binary.BigEndian.PutUint32(header[4:], uint32(len(data)))
 	w.Write(header)
 	w.Write(data)
+}
+
+func (h *Handler) markContainerExited(rec *store.ContainerRecord, exitCode int) {
+	// Only emit the `die` event on the first transition from running to
+	// exited. markContainerExited is called from every lifecycle path —
+	// stop, kill, wait, GC — so guard on FinishedAt to avoid publishing
+	// duplicate events.
+	alreadyExited := rec.FinishedAt != nil
+	now := time.Now()
+	rec.FinishedAt = &now
+	rec.ExitCode = exitCode
+	_ = h.store.AddContainer(rec)
+	if !alreadyExited {
+		h.publishEvent("container", "die", rec.ID, map[string]string{
+			"name":     rec.Name,
+			"image":    normalizeImageRef(rec.Image),
+			"exitCode": strconv.Itoa(exitCode),
+		})
+	}
+}
+
+func exitCodeForSignal(signal string) int {
+	signal = strings.TrimSpace(strings.ToUpper(signal))
+	switch signal {
+	case "", "KILL", "SIGKILL", "9":
+		return 137
+	case "TERM", "SIGTERM", "15":
+		return 143
+	}
+	if n, err := strconv.Atoi(signal); err == nil && n > 0 {
+		return 128 + n
+	}
+	return 137
+}
+
+func parseTopOutput(lines []string) ([]string, [][]string) {
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return []string{}, [][]string{}
+	}
+
+	titles := strings.Fields(lines[0])
+	processes := make([][]string, 0, maxInt(len(lines)-1, 0))
+	for _, line := range lines[1:] {
+		fields := splitFieldsWithTail(line, len(titles))
+		if len(fields) == len(titles) {
+			processes = append(processes, fields)
+		}
+	}
+	return titles, processes
+}
+
+func (h *Handler) topViaNsenter(id, psArgs string) ([]byte, error) {
+	pid, err := h.mgr.InitPID(id)
+	if err != nil {
+		return nil, err
+	}
+	allowed, err := processTreeSet(pid)
+	if err != nil {
+		return nil, err
+	}
+	candidates := [][]string{}
+	if psArgs != "" {
+		candidates = append(candidates, append([]string{"ps"}, strings.Fields(psArgs)...))
+	}
+	candidates = append(candidates,
+		[]string{"ps", "-eo", "pid,user,time,comm"},
+		[]string{"ps", "-ef"},
+		[]string{"ps", "aux"},
+	)
+	for _, argv := range candidates {
+		cmd := exec.Command("nsenter", append([]string{
+			"-t", strconv.Itoa(pid),
+			"-p",
+		}, argv...)...)
+		out, err := cmd.Output()
+		if err == nil && strings.TrimSpace(string(out)) != "" {
+			filtered := filterTopOutputByPIDSet(out, allowed)
+			if strings.TrimSpace(string(filtered)) != "" {
+				return filtered, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("no usable ps variant found")
+}
+
+func filterTopOutputByPIDSet(out []byte, allowed map[int]struct{}) []byte {
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 {
+		return nil
+	}
+	titles := strings.Fields(lines[0])
+	pidIdx := -1
+	for i, title := range titles {
+		if strings.EqualFold(title, "PID") {
+			pidIdx = i
+			break
+		}
+	}
+	if pidIdx < 0 {
+		return out
+	}
+
+	filtered := []string{lines[0]}
+	for _, line := range lines[1:] {
+		fields := splitFieldsWithTail(line, len(titles))
+		if len(fields) != len(titles) {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[pidIdx])
+		if err != nil {
+			continue
+		}
+		if _, ok := allowed[pid]; ok {
+			filtered = append(filtered, line)
+		}
+	}
+	return []byte(strings.Join(filtered, "\n"))
+}
+
+func processTreeSet(root int) (map[int]struct{}, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	ppids := make(map[int]int)
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
+		if err != nil {
+			continue
+		}
+		ppids[pid] = parsePPIDFromStatus(data)
+	}
+	allowed := map[int]struct{}{root: {}}
+	for {
+		changed := false
+		for pid, ppid := range ppids {
+			if _, ok := allowed[pid]; ok {
+				continue
+			}
+			if _, ok := allowed[ppid]; ok {
+				allowed[pid] = struct{}{}
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return allowed, nil
+}
+
+func parsePPIDFromStatus(data []byte) int {
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "PPid:") {
+			ppid, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "PPid:")))
+			return ppid
+		}
+	}
+	return -1
+}
+
+func splitFieldsWithTail(line string, want int) []string {
+	if want <= 0 {
+		return nil
+	}
+	fields := strings.Fields(line)
+	if len(fields) < want {
+		return nil
+	}
+	if len(fields) == want {
+		return fields
+	}
+	head := append([]string{}, fields[:want-1]...)
+	head = append(head, strings.Join(fields[want-1:], " "))
+	return head
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func runAttachFallback(cmd *exec.Cmd, stdin io.Reader, w http.ResponseWriter) {
+	cmd.Stdin = stdin
+	fw := flushWriter{w: w}
+	cmd.Stdout = fw
+	cmd.Stderr = fw
+	_ = cmd.Run()
+}
+
+type flushWriter struct {
+	w http.ResponseWriter
+}
+
+func (f flushWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if fl, ok := f.w.(http.Flusher); ok {
+		fl.Flush()
+	}
+	return n, err
 }
 
 // stateToStatus returns a human-readable status string like Docker's "Up 2 hours".
@@ -934,6 +1690,27 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 			bind += ":ro"
 		}
 		hc.Binds = append(hc.Binds, bind)
+	}
+	if rec.RestartPolicy != nil {
+		hc.RestartPolicy = RestartPolicy{
+			Name:              rec.RestartPolicy.Name,
+			MaximumRetryCount: rec.RestartPolicy.MaximumRetryCount,
+		}
+	} else {
+		// Docker defaults to "no" when the user didn't pick anything.
+		hc.RestartPolicy = RestartPolicy{Name: "no"}
+	}
+	if e := rec.HostConfigExtras; e != nil {
+		hc.Privileged = e.Privileged
+		hc.CapAdd = append([]string{}, e.CapAdd...)
+		hc.CapDrop = append([]string{}, e.CapDrop...)
+		hc.ExtraHosts = append([]string{}, e.ExtraHosts...)
+		hc.Dns = append([]string{}, e.Dns...)
+		hc.DnsSearch = append([]string{}, e.DnsSearch...)
+		hc.DnsOptions = append([]string{}, e.DnsOptions...)
+		hc.Memory = e.Memory
+		hc.CPUShares = e.CPUShares
+		hc.NanoCPUs = e.NanoCPUs
 	}
 	return hc
 }

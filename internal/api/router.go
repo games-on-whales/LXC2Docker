@@ -3,6 +3,8 @@ package api
 import (
 	"log"
 	"net/http"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
@@ -13,19 +15,22 @@ import (
 // Handler is the root HTTP handler. It holds references to the LXC manager
 // and the metadata store, and owns the in-memory exec instance table.
 type Handler struct {
-	mgr       *lxc.Manager
-	store     *store.Store
-	execs     *execStore
-	eventsHub *eventHub
+	mgr        *lxc.Manager
+	store      *store.Store
+	execs      *execStore
+	eventsHub  *eventHub
+	attachMu   sync.Mutex
+	attachPTYs map[string]*os.File
 }
 
 // NewHandler wires up the Handler and returns an http.Handler ready to serve.
 func NewHandler(mgr *lxc.Manager, st *store.Store) http.Handler {
 	h := &Handler{
-		mgr:       mgr,
-		store:     st,
-		execs:     newExecStore(),
-		eventsHub: newEventHub(),
+		mgr:        mgr,
+		store:      st,
+		execs:      newExecStore(),
+		eventsHub:  newEventHub(),
+		attachPTYs: make(map[string]*os.File),
 	}
 	// Periodically prune completed exec records to prevent memory leaks.
 	go func() {
@@ -57,9 +62,31 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/networks/{id}", h.inspectNetwork).Methods(http.MethodGet)
 		sub.HandleFunc("/networks/{id}", h.removeNetwork).Methods(http.MethodDelete)
 		sub.HandleFunc("/networks/create", h.createNetwork).Methods(http.MethodPost)
+		sub.HandleFunc("/networks/prune", h.pruneNetworks).Methods(http.MethodPost)
 		sub.HandleFunc("/networks/{id}/connect", h.connectNetwork).Methods(http.MethodPost)
 		sub.HandleFunc("/networks/{id}/disconnect", h.disconnectNetwork).Methods(http.MethodPost)
 		sub.HandleFunc("/system/df", h.systemDiskUsage).Methods(http.MethodGet)
+		sub.HandleFunc("/build/prune", h.pruneBuildCache).Methods(http.MethodPost)
+		sub.HandleFunc("/distribution/{name:.*}/json", h.inspectDistribution).Methods(http.MethodGet)
+		sub.HandleFunc("/auth", h.auth).Methods(http.MethodPost)
+		sub.HandleFunc("/plugins", h.listPlugins).Methods(http.MethodGet)
+
+		// Swarm-mode endpoints. Docker returns 503 "This node is not a swarm
+		// manager" when swarm isn't initialised; Portainer treats that as
+		// "swarm unavailable" and hides the feature. A 404 instead is
+		// surfaced as a scary error banner.
+		sub.HandleFunc("/swarm", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/swarm/{rest:.*}", h.swarmUnavailable)
+		sub.HandleFunc("/nodes", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/nodes/{rest:.*}", h.swarmUnavailable)
+		sub.HandleFunc("/services", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/services/{rest:.*}", h.swarmUnavailable)
+		sub.HandleFunc("/tasks", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/tasks/{rest:.*}", h.swarmUnavailable)
+		sub.HandleFunc("/configs", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/configs/{rest:.*}", h.swarmUnavailable)
+		sub.HandleFunc("/secrets", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/secrets/{rest:.*}", h.swarmUnavailable)
 
 		// Containers
 		sub.HandleFunc("/containers/json", h.listContainers).Methods(http.MethodGet)
@@ -78,6 +105,12 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/containers/{id}/logs", h.containerLogs).Methods(http.MethodGet)
 		sub.HandleFunc("/containers/{id}/archive", h.putArchive).Methods(http.MethodPut)
 		sub.HandleFunc("/containers/{id}/archive", h.getArchive).Methods(http.MethodGet, http.MethodHead)
+		sub.HandleFunc("/containers/{id}/export", h.exportContainer).Methods(http.MethodGet)
+		sub.HandleFunc("/containers/{id}/resize", h.resizeContainer).Methods(http.MethodPost)
+		sub.HandleFunc("/containers/{id}/pause", h.pauseContainer).Methods(http.MethodPost)
+		sub.HandleFunc("/containers/{id}/unpause", h.unpauseContainer).Methods(http.MethodPost)
+		sub.HandleFunc("/containers/{id}/update", h.updateContainer).Methods(http.MethodPost)
+		sub.HandleFunc("/containers/prune", h.pruneContainers).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}", h.removeContainer).Methods(http.MethodDelete)
 
 		// Images
@@ -89,7 +122,9 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/images/{name:.*}/history", h.imageHistory).Methods(http.MethodGet)
 		sub.HandleFunc("/images/{name:.*}/tag", h.tagImage).Methods(http.MethodPost)
 		sub.HandleFunc("/images/{name:.*}/push", h.pushImage).Methods(http.MethodPost)
+		sub.HandleFunc("/images/prune", h.pruneImages).Methods(http.MethodPost)
 		sub.HandleFunc("/images/{name:.*}", h.removeImage).Methods(http.MethodDelete)
+		sub.HandleFunc("/commit", h.commitContainer).Methods(http.MethodPost)
 
 		// Volumes
 		sub.HandleFunc("/volumes", h.listVolumes).Methods(http.MethodGet)
@@ -102,6 +137,7 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/containers/{id}/exec", h.execCreate).Methods(http.MethodPost)
 		sub.HandleFunc("/exec/{id}/start", h.execStart).Methods(http.MethodPost)
 		sub.HandleFunc("/exec/{id}/json", h.execInspect).Methods(http.MethodGet)
+		sub.HandleFunc("/exec/{id}/resize", h.execResize).Methods(http.MethodPost)
 	}
 
 	// Log all requests for debugging.
