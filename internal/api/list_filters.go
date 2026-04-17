@@ -2,7 +2,10 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
 )
@@ -136,6 +139,40 @@ func matchesNetworkFilters(n *store.NetworkRecord, f listFilters) bool {
 		}
 	}
 	if !matchesLabelFilter(f["label"], n.Labels) {
+		return false
+	}
+	return true
+}
+
+// parsePruneUntil decodes Docker's "until" prune filter — either an RFC3339
+// timestamp or an epoch. Returns the latest creation time a resource can
+// carry to remain eligible for pruning; nil means no constraint.
+func parsePruneUntil(filters listFilters) (*time.Time, error) {
+	vals := filters["until"]
+	if len(vals) == 0 {
+		return nil, nil
+	}
+	// Docker only supports one `until` value; keep the last one if
+	// duplicates sneak in.
+	raw := vals[len(vals)-1]
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return &t, nil
+	}
+	if secs, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		t := time.Unix(secs, 0).UTC()
+		return &t, nil
+	}
+	return nil, fmt.Errorf("invalid until value %q", raw)
+}
+
+// pruneEligible returns true when a resource with the given creation time
+// and labels should be included in a prune sweep: its created time must be
+// before `until` (if set) and every `label` entry must match.
+func pruneEligible(created time.Time, labels map[string]string, filters listFilters, until *time.Time) bool {
+	if until != nil && created.After(*until) {
+		return false
+	}
+	if !matchesLabelFilter(filters["label"], labels) {
 		return false
 	}
 	return true

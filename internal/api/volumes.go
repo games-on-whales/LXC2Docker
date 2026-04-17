@@ -110,6 +110,11 @@ func (h *Handler) removeVolume(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) pruneVolumes(w http.ResponseWriter, r *http.Request) {
+	filters, err := parseListFilters(r.URL.Query().Get("filters"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
+		return
+	}
 	deleted := []string{}
 	space := int64(0)
 	inUse := map[string]bool{}
@@ -122,6 +127,11 @@ func (h *Handler) pruneVolumes(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, v := range h.store.ListVolumes() {
 		if inUse[v.Name] {
+			continue
+		}
+		// Volumes carry no created-at field the caller can filter on, so
+		// until is a no-op for them; label still applies.
+		if !pruneEligible(v.CreatedAt, v.Labels, filters, nil) {
 			continue
 		}
 		size, _ := dirSize(v.Mountpoint)

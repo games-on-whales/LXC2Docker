@@ -120,11 +120,24 @@ func (h *Handler) updateContainer(w http.ResponseWriter, r *http.Request) {
 
 // POST /containers/prune
 func (h *Handler) pruneContainers(w http.ResponseWriter, r *http.Request) {
+	filters, err := parseListFilters(r.URL.Query().Get("filters"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
+		return
+	}
+	until, err := parsePruneUntil(filters)
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	deleted := []string{}
 	var reclaimed int64
 	for _, rec := range h.store.ListContainers() {
 		state, _ := h.mgr.State(rec.ID)
 		if state == "running" {
+			continue
+		}
+		if !pruneEligible(rec.Created, rec.Labels, filters, until) {
 			continue
 		}
 		if err := h.mgr.RemoveContainer(rec.ID); err != nil {
@@ -146,20 +159,26 @@ func (h *Handler) pruneContainers(w http.ResponseWriter, r *http.Request) {
 // Portainer's prune includes a `filters` JSON blob. With
 // dangling=["true"] (Docker's default) only dangling images are removed —
 // we have no dangling state, so we delete nothing. With dangling=["false"]
-// every image not currently referenced by a container is removed.
+// every image not currently referenced by a container is removed, subject
+// to the label and until filters Docker also honours on this endpoint.
 func (h *Handler) pruneImages(w http.ResponseWriter, r *http.Request) {
+	filters, err := parseListFilters(r.URL.Query().Get("filters"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
+		return
+	}
 	onlyDangling := true
-	if raw := r.URL.Query().Get("filters"); raw != "" {
-		var filters map[string][]string
-		if err := json.Unmarshal([]byte(raw), &filters); err == nil {
-			if vals, ok := filters["dangling"]; ok {
-				for _, v := range vals {
-					if v == "false" || v == "0" {
-						onlyDangling = false
-					}
-				}
+	if vals := filters["dangling"]; len(vals) > 0 {
+		for _, v := range vals {
+			if v == "false" || v == "0" {
+				onlyDangling = false
 			}
 		}
+	}
+	until, err := parsePruneUntil(filters)
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	deleted := []map[string]string{}
@@ -171,6 +190,9 @@ func (h *Handler) pruneImages(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, img := range h.store.ListImages() {
 			if _, used := inUse[img.Ref]; used {
+				continue
+			}
+			if !pruneEligible(img.Created, img.OCILabels, filters, until) {
 				continue
 			}
 			if err := h.mgr.RemoveImage(img.Ref); err != nil {
@@ -191,6 +213,16 @@ func (h *Handler) pruneImages(w http.ResponseWriter, r *http.Request) {
 // treated as system and never pruned. A network is considered unused when no
 // container in the store attaches to it.
 func (h *Handler) pruneNetworks(w http.ResponseWriter, r *http.Request) {
+	filters, err := parseListFilters(r.URL.Query().Get("filters"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
+		return
+	}
+	until, err := parsePruneUntil(filters)
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	inUse := map[string]struct{}{}
 	for _, c := range h.store.ListContainers() {
 		for netID := range c.Networks {
@@ -206,6 +238,9 @@ func (h *Handler) pruneNetworks(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if _, used := inUse[n.Name]; used {
+			continue
+		}
+		if !pruneEligible(n.CreatedAt, n.Labels, filters, until) {
 			continue
 		}
 		if err := h.store.RemoveNetwork(n.ID); err != nil {
