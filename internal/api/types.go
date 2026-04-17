@@ -85,6 +85,8 @@ type ContainerJSON struct {
 	ResolvConfPath  string           `json:"ResolvConfPath"`
 	HostnamePath    string           `json:"HostnamePath"`
 	HostsPath       string           `json:"HostsPath"`
+	SizeRw          *int64           `json:"SizeRw,omitempty"`
+	SizeRootFs      *int64           `json:"SizeRootFs,omitempty"`
 	Config          *ContainerConfig `json:"Config"`
 	HostConfig      *HostConfig      `json:"HostConfig"`
 	Mounts          []MountJSON      `json:"Mounts"`
@@ -174,6 +176,8 @@ type ContainerSummary struct {
 	State           string                 `json:"State"`
 	Ports           []Port                 `json:"Ports"`
 	Labels          map[string]string      `json:"Labels"`
+	SizeRw          int64                  `json:"SizeRw,omitempty"`
+	SizeRootFs      int64                  `json:"SizeRootFs,omitempty"`
 	Mounts          []MountJSON            `json:"Mounts"`
 	NetworkSettings *SummaryNetworkSetting `json:"NetworkSettings,omitempty"`
 	HostConfig      *SummaryHostConfig     `json:"HostConfig,omitempty"`

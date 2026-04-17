@@ -254,6 +254,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 // GET /containers/json
 func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
+	includeSize := r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true"
 	filters, err := parseListFilters(r.URL.Query().Get("filters"))
 	if err != nil {
 		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
@@ -308,7 +309,7 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			networkMode = name
 			break
 		}
-		out = append(out, ContainerSummary{
+		summary := ContainerSummary{
 			ID:      rec.ID,
 			Names:   []string{"/" + rec.Name},
 			Image:   normalizeImageRef(rec.Image),
@@ -324,7 +325,11 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 				Networks: buildContainerEndpoints(rec),
 			},
 			HostConfig: &SummaryHostConfig{NetworkMode: networkMode},
-		})
+		}
+		if includeSize {
+			summary.SizeRootFs, _ = dirSize(h.mgr.RootfsPath(rec.ID))
+		}
+		out = append(out, summary)
 	}
 	jsonResponse(w, http.StatusOK, out)
 }
@@ -405,6 +410,8 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	includeSize := r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true"
+
 	resp := ContainerJSON{
 		ID:       rec.ID,
 		Created:  rec.Created.Format(time.RFC3339),
@@ -439,6 +446,12 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Networks:  buildContainerEndpoints(rec),
 			Ports:     hostConfig.PortBindings,
 		},
+	}
+	if includeSize {
+		size, _ := dirSize(h.mgr.RootfsPath(id))
+		zero := int64(0)
+		resp.SizeRw = &zero
+		resp.SizeRootFs = &size
 	}
 	jsonResponse(w, http.StatusOK, resp)
 }
