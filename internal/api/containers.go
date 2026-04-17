@@ -186,6 +186,11 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Env:        env,
 		Labels:     req.Labels,
 	}
+	rec.Networks = defaultContainerNetworks(rec)
+	if err := attachRequestedNetworks(h.store, rec, req.NetworkingConfig); err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	for _, m := range cfg.Mounts {
 		rec.Mounts = append(rec.Mounts, store.MountSpec{
 			Type:        mountTypeForSource(h.store, m.Source),
@@ -357,13 +362,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		HostConfig: buildHostConfig(rec),
 		NetworkSettings: NetworkSettings{
 			IPAddress: rec.IPAddress,
-			Networks: map[string]EndpointSettings{
-				"gow": {
-					IPAddress: rec.IPAddress,
-					Gateway:   lxc.BridgeGW,
-					NetworkID: "gow",
-				},
-			},
+			Networks:  buildContainerEndpoints(rec),
 		},
 	}
 	jsonResponse(w, http.StatusOK, resp)

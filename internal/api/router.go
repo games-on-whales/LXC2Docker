@@ -55,6 +55,7 @@ func (h *Handler) routes() http.Handler {
 		// Networks (stub)
 		sub.HandleFunc("/networks", h.listNetworks).Methods(http.MethodGet)
 		sub.HandleFunc("/networks/{id}", h.inspectNetwork).Methods(http.MethodGet)
+		sub.HandleFunc("/networks/{id}", h.removeNetwork).Methods(http.MethodDelete)
 		sub.HandleFunc("/networks/create", h.createNetwork).Methods(http.MethodPost)
 		sub.HandleFunc("/networks/{id}/connect", h.connectNetwork).Methods(http.MethodPost)
 		sub.HandleFunc("/networks/{id}/disconnect", h.disconnectNetwork).Methods(http.MethodPost)

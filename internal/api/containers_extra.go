@@ -210,6 +210,75 @@ func (h *Handler) ensureVolume(name string) (*store.VolumeRecord, error) {
 	return v, nil
 }
 
+func defaultContainerNetworks(rec *store.ContainerRecord) map[string]store.NetworkAttachment {
+	return map[string]store.NetworkAttachment{
+		"gow": {
+			NetworkID:  "gow",
+			IPAddress:  rec.IPAddress,
+			Gateway:    "10.100.0.1",
+			EndpointID: endpointID(rec.ID, "gow"),
+		},
+	}
+}
+
+func attachRequestedNetworks(st *store.Store, rec *store.ContainerRecord, cfg NetworkingConfig) error {
+	if len(cfg.EndpointsConfig) == 0 {
+		return nil
+	}
+	if rec.Networks == nil {
+		rec.Networks = defaultContainerNetworks(rec)
+	}
+	for name, ep := range cfg.EndpointsConfig {
+		networkName := name
+		networkID := name
+		if name != "gow" {
+			n := st.GetNetwork(name)
+			if n == nil {
+				return fmt.Errorf("network %q not found", name)
+			}
+			networkName = n.Name
+			networkID = n.ID
+		}
+		rec.Networks[networkName] = store.NetworkAttachment{
+			NetworkID:  networkID,
+			IPAddress:  orDefault(ep.IPAddress, rec.IPAddress),
+			Gateway:    orDefault(ep.Gateway, "10.100.0.1"),
+			MacAddress: ep.MacAddress,
+			EndpointID: endpointID(rec.ID, networkName),
+		}
+	}
+	return nil
+}
+
+func buildContainerEndpoints(rec *store.ContainerRecord) map[string]EndpointSettings {
+	if len(rec.Networks) == 0 {
+		rec.Networks = defaultContainerNetworks(rec)
+	}
+	out := make(map[string]EndpointSettings, len(rec.Networks))
+	for name, attached := range rec.Networks {
+		out[name] = EndpointSettings{
+			IPAddress:  attached.IPAddress,
+			Gateway:    attached.Gateway,
+			MacAddress: attached.MacAddress,
+			NetworkID:  attached.NetworkID,
+			EndpointID: attached.EndpointID,
+		}
+	}
+	return out
+}
+
+func endpointID(containerID, networkName string) string {
+	id := containerID
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	suffix := strings.ReplaceAll(networkName, "/", "_")
+	if len(suffix) > 12 {
+		suffix = suffix[:12]
+	}
+	return id + "-" + suffix
+}
+
 func diffRootfs(baseRoot, currentRoot string) ([]ChangeResponse, error) {
 	baseEntries, err := walkRootfs(baseRoot)
 	if err != nil {
