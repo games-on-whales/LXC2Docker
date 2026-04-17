@@ -138,6 +138,33 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.Mounts = append(cfg.Mounts, m)
 	}
+	for _, m := range req.Mounts {
+		if m.Target == "" {
+			continue
+		}
+		switch m.Type {
+		case "", "bind":
+			if m.Source == "" {
+				continue
+			}
+			cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
+				Source:      m.Source,
+				Destination: m.Target,
+				ReadOnly:    m.ReadOnly,
+			})
+		case "volume":
+			vol, err := h.ensureVolume(m.Source)
+			if err != nil {
+				errResponse(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
+				Source:      vol.Mountpoint,
+				Destination: m.Target,
+				ReadOnly:    m.ReadOnly,
+			})
+		}
+	}
 
 	// Device mappings
 	for _, d := range req.HostConfig.Devices {
@@ -161,6 +188,8 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, m := range cfg.Mounts {
 		rec.Mounts = append(rec.Mounts, store.MountSpec{
+			Type:        mountTypeForSource(h.store, m.Source),
+			Name:        volumeNameForSource(h.store, m.Source),
 			Source:      m.Source,
 			Destination: m.Destination,
 			ReadOnly:    m.ReadOnly,
@@ -203,6 +232,10 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("createContainer: success %s", id[:12])
+	h.publishEvent("container", "create", id, map[string]string{
+		"name":  name,
+		"image": normalizeImageRef(req.Image),
+	})
 
 	jsonResponse(w, http.StatusCreated, ContainerCreateResponse{
 		ID:       id,
@@ -288,8 +321,12 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		if m.ReadOnly {
 			mode = "ro"
 		}
+		mountType := m.Type
+		if mountType == "" {
+			mountType = "bind"
+		}
 		mounts = append(mounts, MountJSON{
-			Type:        "bind",
+			Type:        mountType,
 			Source:      m.Source,
 			Destination: m.Destination,
 			Mode:        mode,
@@ -350,6 +387,12 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		rec.StartedAt = &now
 		h.store.AddContainer(rec)
 	}
+	if rec := h.store.GetContainer(id); rec != nil {
+		h.publishEvent("container", "start", id, map[string]string{
+			"name":  rec.Name,
+			"image": normalizeImageRef(rec.Image),
+		})
+	}
 
 	// Set up port forwarding rules after successful start.
 	if rec := h.store.GetContainer(id); rec != nil && rec.IPAddress != "" {
@@ -374,6 +417,12 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 	if err := h.mgr.StopContainer(id, 10*time.Second); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if rec := h.store.GetContainer(id); rec != nil {
+		h.publishEvent("container", "stop", id, map[string]string{
+			"name":  rec.Name,
+			"image": normalizeImageRef(rec.Image),
+		})
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -416,6 +465,13 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if rec := h.store.GetContainer(id); rec != nil {
+		h.publishEvent("container", "kill", id, map[string]string{
+			"name":   rec.Name,
+			"image":  normalizeImageRef(rec.Image),
+			"signal": signal,
+		})
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -437,7 +493,8 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Remove port forwarding rules before destroying the container.
-	if rec := h.store.GetContainer(id); rec != nil && rec.IPAddress != "" {
+	rec := h.store.GetContainer(id)
+	if rec != nil && rec.IPAddress != "" {
 		if err := lxc.RemovePortForwards(rec.IPAddress); err != nil {
 			log.Printf("warning: removing port forwards for %s: %v", rec.IPAddress, err)
 		}
@@ -446,6 +503,12 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 	if err := h.mgr.RemoveContainer(id); err != nil {
 		errResponse(w, http.StatusConflict, err.Error())
 		return
+	}
+	if rec != nil {
+		h.publishEvent("container", "destroy", id, map[string]string{
+			"name":  rec.Name,
+			"image": normalizeImageRef(rec.Image),
+		})
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -535,6 +598,12 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if rec := h.store.GetContainer(id); rec != nil {
+		h.publishEvent("container", "restart", id, map[string]string{
+			"name":  rec.Name,
+			"image": normalizeImageRef(rec.Image),
+		})
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -561,6 +630,9 @@ func (h *Handler) renameContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.publishEvent("container", "rename", id, map[string]string{
+		"name": rec.Name,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 

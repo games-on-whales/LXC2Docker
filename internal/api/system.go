@@ -5,7 +5,12 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
+	"time"
 
+	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
+	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/gorilla/mux"
 	"golang.org/x/sys/unix"
 )
 
@@ -74,39 +79,236 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- network stubs (Docker clients query networks when creating containers) ---
-
 func (h *Handler) listNetworks(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, http.StatusOK, []any{})
+	networks := []NetworkResource{h.defaultNetworkResource()}
+	for _, n := range h.store.ListNetworks() {
+		networks = append(networks, h.networkResource(n))
+	}
+	jsonResponse(w, http.StatusOK, networks)
 }
 
 func (h *Handler) inspectNetwork(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	if id == "gow" {
+		jsonResponse(w, http.StatusOK, h.defaultNetworkResource())
+		return
+	}
+	if n := h.store.GetNetwork(id); n != nil {
+		jsonResponse(w, http.StatusOK, h.networkResource(n))
+		return
+	}
 	errResponse(w, http.StatusNotFound, "network not found")
 }
 
 func (h *Handler) createNetwork(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, http.StatusCreated, map[string]string{"Id": "stub"})
+	var req NetworkCreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if req.Name == "" {
+		errResponse(w, http.StatusBadRequest, "network name is required")
+		return
+	}
+	id := generateID()[:12]
+	rec := &store.NetworkRecord{
+		ID:        id,
+		Name:      req.Name,
+		Driver:    orDefault(req.Driver, "bridge"),
+		Scope:     "local",
+		CreatedAt: time.Now().UTC(),
+		Labels:    req.Labels,
+		Options:   req.Options,
+	}
+	if err := h.store.AddNetwork(rec); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.publishEvent("network", "create", rec.ID, map[string]string{"name": rec.Name, "type": rec.Driver})
+	jsonResponse(w, http.StatusCreated, NetworkCreateResponse{ID: rec.ID})
 }
 
 func (h *Handler) connectNetwork(w http.ResponseWriter, r *http.Request) {
+	if !h.networkExists(mux.Vars(r)["id"]) {
+		errResponse(w, http.StatusNotFound, "network not found")
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) disconnectNetwork(w http.ResponseWriter, r *http.Request) {
+	if !h.networkExists(mux.Vars(r)["id"]) {
+		errResponse(w, http.StatusNotFound, "network not found")
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
-// events implements GET /events. It holds the connection open as a streaming
-// endpoint that Docker clients use to monitor container lifecycle events.
-// We don't emit real events yet — the handler simply blocks until the client
-// disconnects.
+// events implements GET /events and streams daemon lifecycle events using the
+// Docker-compatible JSON event stream shape.
 func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
+	ch := h.eventsHub.subscribe()
+	defer h.eventsHub.unsubscribe(ch)
+	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
 	}
-	// Block until the client closes the connection.
-	<-r.Context().Done()
+	enc := json.NewEncoder(w)
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case evt := <-ch:
+			if !eventMatches(r, evt) {
+				continue
+			}
+			if err := enc.Encode(evt); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}
+}
+
+func (h *Handler) systemDiskUsage(w http.ResponseWriter, r *http.Request) {
+	images := h.store.ListImages()
+	containers := h.store.ListContainers()
+	volumes := h.store.ListVolumes()
+
+	out := SystemDiskUsage{
+		Images:     make([]ImageUsage, 0, len(images)),
+		Containers: make([]ContainerUsage, 0, len(containers)),
+		Volumes:    make([]VolumeUsage, 0, len(volumes)),
+		BuildCache: []any{},
+	}
+
+	for _, img := range images {
+		repo, tag := splitImageRef(img.Ref)
+		out.Images = append(out.Images, ImageUsage{
+			ID:         "sha256:" + img.ID,
+			Repository: repo,
+			Tag:        tag,
+			CreatedAt:  img.Created.Format(time.RFC3339),
+			RepoTags:   []string{img.Ref},
+		})
+	}
+	for _, c := range containers {
+		state, _ := h.mgr.State(c.ID)
+		sizeRootfs, _ := dirSize(h.mgr.RootfsPath(c.ID))
+		out.Containers = append(out.Containers, ContainerUsage{
+			ID:         c.ID,
+			Names:      []string{"/" + c.Name},
+			Image:      normalizeImageRef(c.Image),
+			ImageID:    c.ImageID,
+			Command:    strings.Join(append(c.Entrypoint, c.Cmd...), " "),
+			Created:    c.Created.Unix(),
+			State:      state,
+			Status:     stateToStatus(state, c.Created),
+			SizeRootFs: sizeRootfs,
+		})
+	}
+	for _, v := range volumes {
+		size, _ := dirSize(v.Mountpoint)
+		vu := volumeUsage(h.store, v, size)
+		out.Volumes = append(out.Volumes, vu)
+		out.LayersSize += size
+	}
+	jsonResponse(w, http.StatusOK, out)
+}
+
+func (h *Handler) defaultNetworkResource() NetworkResource {
+	return NetworkResource{
+		Name:       "gow",
+		ID:         "gow",
+		Created:    time.Unix(0, 0).UTC().Format(time.RFC3339),
+		Scope:      "local",
+		Driver:     "bridge",
+		EnableIPv4: true,
+		EnableIPv6: false,
+		IPAM: map[string]any{
+			"Driver": "default",
+			"Config": []map[string]string{{
+				"Subnet":  "10.100.0.0/24",
+				"Gateway": lxc.BridgeGW,
+			}},
+		},
+		Options:    map[string]string{},
+		Labels:     map[string]string{},
+		Containers: h.networkContainers(),
+	}
+}
+
+func (h *Handler) networkResource(n *store.NetworkRecord) NetworkResource {
+	return NetworkResource{
+		Name:       n.Name,
+		ID:         n.ID,
+		Created:    n.CreatedAt.Format(time.RFC3339),
+		Scope:      orDefault(n.Scope, "local"),
+		Driver:     orDefault(n.Driver, "bridge"),
+		EnableIPv4: true,
+		EnableIPv6: false,
+		IPAM: map[string]any{
+			"Driver": "default",
+			"Config": []map[string]string{},
+		},
+		Options: n.Options,
+		Labels:  n.Labels,
+	}
+}
+
+func (h *Handler) networkContainers() map[string]NetworkEndpoint {
+	out := map[string]NetworkEndpoint{}
+	for _, c := range h.store.ListContainers() {
+		if c.IPAddress == "" {
+			continue
+		}
+		out[c.ID] = NetworkEndpoint{
+			Name:        c.Name,
+			EndpointID:  c.ID[:12],
+			IPv4Address: c.IPAddress + "/24",
+		}
+	}
+	return out
+}
+
+func (h *Handler) networkExists(id string) bool {
+	return id == "gow" || h.store.GetNetwork(id) != nil
+}
+
+func eventMatches(r *http.Request, evt EventMessage) bool {
+	filters := r.URL.Query().Get("filters")
+	if filters == "" {
+		return true
+	}
+	var decoded map[string]map[string]bool
+	if err := json.Unmarshal([]byte(filters), &decoded); err != nil {
+		return true
+	}
+	if types, ok := decoded["type"]; ok && len(types) > 0 && !types[evt.Type] {
+		return false
+	}
+	if events, ok := decoded["event"]; ok && len(events) > 0 && !events[evt.Action] {
+		return false
+	}
+	return true
+}
+
+func orDefault(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
+func splitImageRef(ref string) (string, string) {
+	if before, after, ok := strings.Cut(ref, ":"); ok {
+		return before, after
+	}
+	return ref, "latest"
 }
 
 // --- helpers ---

@@ -20,19 +20,19 @@ const defaultPath = "/var/lib/docker-lxc-daemon"
 
 // ContainerRecord holds Docker-layer metadata for a single container.
 type ContainerRecord struct {
-	ID         string            `json:"id"`          // Docker hex ID (API-facing)
-	VMID       int               `json:"vmid"`        // Proxmox CT VMID (0 = legacy direct LXC)
-	Name       string            `json:"name"`        // Docker-style name (no leading slash)
-	Image      string            `json:"image"`       // Original image:tag as requested
-	ImageID    string            `json:"image_id"`    // Resolved image identifier
-	Created    time.Time         `json:"created"`
-	Entrypoint []string          `json:"entrypoint"`
-	Cmd        []string          `json:"cmd"`
-	Env        []string          `json:"env"`
-	Labels     map[string]string `json:"labels"`
+	ID           string            `json:"id"`       // Docker hex ID (API-facing)
+	VMID         int               `json:"vmid"`     // Proxmox CT VMID (0 = legacy direct LXC)
+	Name         string            `json:"name"`     // Docker-style name (no leading slash)
+	Image        string            `json:"image"`    // Original image:tag as requested
+	ImageID      string            `json:"image_id"` // Resolved image identifier
+	Created      time.Time         `json:"created"`
+	Entrypoint   []string          `json:"entrypoint"`
+	Cmd          []string          `json:"cmd"`
+	Env          []string          `json:"env"`
+	Labels       map[string]string `json:"labels"`
 	IPAddress    string            `json:"ip_address"`
-	PortBindings []PortBinding    `json:"port_bindings,omitempty"`
-	Mounts       []MountSpec      `json:"mounts"`
+	PortBindings []PortBinding     `json:"port_bindings,omitempty"`
+	Mounts       []MountSpec       `json:"mounts"`
 	StartedAt    *time.Time        `json:"started_at,omitempty"` // nil until first start; distinguishes "created" from "exited"
 	// Ephemeral is true only for daemon-created raw-LXC containers that the
 	// GC is permitted to reap. Permanent Proxmox CTs (visible in PVE UI) and
@@ -53,9 +53,32 @@ type PortBinding struct {
 
 // MountSpec mirrors the relevant fields of a Docker bind mount.
 type MountSpec struct {
+	Type        string `json:"type,omitempty"` // "bind" or "volume"
+	Name        string `json:"name,omitempty"` // volume name when Type=="volume"
 	Source      string `json:"source"`
 	Destination string `json:"destination"`
 	ReadOnly    bool   `json:"read_only"`
+}
+
+// VolumeRecord holds metadata for a Docker-style named volume.
+type VolumeRecord struct {
+	Name       string            `json:"name"`
+	Driver     string            `json:"driver"`
+	Mountpoint string            `json:"mountpoint"`
+	CreatedAt  time.Time         `json:"created_at"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	Options    map[string]string `json:"options,omitempty"`
+}
+
+// NetworkRecord holds metadata for a Docker-style network object.
+type NetworkRecord struct {
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Driver    string            `json:"driver"`
+	Scope     string            `json:"scope"`
+	CreatedAt time.Time         `json:"created_at"`
+	Labels    map[string]string `json:"labels,omitempty"`
+	Options   map[string]string `json:"options,omitempty"`
 }
 
 // ImageRecord holds metadata for a pulled image. Templates can be backed
@@ -83,6 +106,8 @@ type ImageRecord struct {
 type state struct {
 	Containers map[string]*ContainerRecord `json:"containers"` // keyed by ID
 	Images     map[string]*ImageRecord     `json:"images"`     // keyed by Ref (e.g. "ubuntu:22.04")
+	Volumes    map[string]*VolumeRecord    `json:"volumes"`    // keyed by volume name
+	Networks   map[string]*NetworkRecord   `json:"networks"`   // keyed by network id
 	NextIP     int                         `json:"next_ip"`    // last octet of 10.100.0.x, starts at 2
 	FreeIPs    []int                       `json:"free_ips"`   // last octets of freed IPs available for reuse
 }
@@ -110,12 +135,26 @@ func NewAt(dir string) (*Store, error) {
 		data: state{
 			Containers: make(map[string]*ContainerRecord),
 			Images:     make(map[string]*ImageRecord),
+			Volumes:    make(map[string]*VolumeRecord),
+			Networks:   make(map[string]*NetworkRecord),
 			NextIP:     2,
 		},
 	}
 
 	if err := s.load(); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("store: load: %w", err)
+	}
+	if s.data.Containers == nil {
+		s.data.Containers = make(map[string]*ContainerRecord)
+	}
+	if s.data.Images == nil {
+		s.data.Images = make(map[string]*ImageRecord)
+	}
+	if s.data.Volumes == nil {
+		s.data.Volumes = make(map[string]*VolumeRecord)
+	}
+	if s.data.Networks == nil {
+		s.data.Networks = make(map[string]*NetworkRecord)
 	}
 	return s, nil
 }
@@ -210,6 +249,82 @@ func (s *Store) ListContainers() []*ContainerRecord {
 		out = append(out, r)
 	}
 	return out
+}
+
+// AddVolume persists a named volume record.
+func (s *Store) AddVolume(v *VolumeRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.Volumes[v.Name] = v
+	return s.save()
+}
+
+// GetVolume returns the named volume, or nil if not found.
+func (s *Store) GetVolume(name string) *VolumeRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.data.Volumes[name]
+}
+
+// ListVolumes returns all known named volumes.
+func (s *Store) ListVolumes() []*VolumeRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*VolumeRecord, 0, len(s.data.Volumes))
+	for _, v := range s.data.Volumes {
+		out = append(out, v)
+	}
+	return out
+}
+
+// RemoveVolume deletes a named volume record.
+func (s *Store) RemoveVolume(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.data.Volumes, name)
+	return s.save()
+}
+
+// AddNetwork persists a network record.
+func (s *Store) AddNetwork(n *NetworkRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.Networks[n.ID] = n
+	return s.save()
+}
+
+// GetNetwork returns a network by id or name, or nil if not found.
+func (s *Store) GetNetwork(idOrName string) *NetworkRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if n, ok := s.data.Networks[idOrName]; ok {
+		return n
+	}
+	for _, n := range s.data.Networks {
+		if n.Name == idOrName {
+			return n
+		}
+	}
+	return nil
+}
+
+// ListNetworks returns all known networks.
+func (s *Store) ListNetworks() []*NetworkRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*NetworkRecord, 0, len(s.data.Networks))
+	for _, n := range s.data.Networks {
+		out = append(out, n)
+	}
+	return out
+}
+
+// RemoveNetwork deletes a network by id.
+func (s *Store) RemoveNetwork(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.data.Networks, id)
+	return s.save()
 }
 
 // AddImage persists a new image record keyed by its Ref.
@@ -325,4 +440,9 @@ func (s *Store) save() error {
 		return err
 	}
 	return os.Rename(tmp, s.path)
+}
+
+// RootDir returns the directory containing the store state.
+func (s *Store) RootDir() string {
+	return filepath.Dir(s.path)
 }
