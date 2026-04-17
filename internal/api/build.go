@@ -36,7 +36,7 @@ type dockerfileInstruction struct {
 
 // buildImage implements a constrained single-stage Dockerfile builder.
 // It is intentionally narrow but functional enough for basic Portainer flows:
-// FROM, WORKDIR, ENV, COPY, ADD, RUN, CMD, ENTRYPOINT, EXPOSE, LABEL.
+// FROM, ARG, WORKDIR, ENV, COPY, ADD, RUN, CMD, ENTRYPOINT, EXPOSE, LABEL.
 func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	tag := firstCSV(r.URL.Query().Get("t"))
 	if tag == "" {
@@ -47,6 +47,17 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	dockerfilePath := r.URL.Query().Get("dockerfile")
 	if dockerfilePath == "" {
 		dockerfilePath = "Dockerfile"
+	}
+
+	// buildargs is a JSON object — Portainer's build UI populates this from
+	// the "Build arguments" table. Parsed values override the defaults a
+	// Dockerfile declares with ARG.
+	buildArgs := map[string]string{}
+	if raw := r.URL.Query().Get("buildargs"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &buildArgs); err != nil {
+			errResponse(w, http.StatusBadRequest, "invalid buildargs: "+err.Error())
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -87,6 +98,34 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		fail("parse Dockerfile: " + err.Error())
 		return
+	}
+	// Resolve ARG defaults up front, then overlay the caller-supplied
+	// buildargs. The resulting map is used to $VAR-substitute every other
+	// instruction's args before it executes.
+	argSet := map[string]string{}
+	for _, inst := range instrs {
+		if inst.op != "ARG" {
+			continue
+		}
+		name, def, hasDef := strings.Cut(strings.TrimSpace(inst.args), "=")
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if hasDef {
+			argSet[name] = strings.Trim(strings.TrimSpace(def), `"`)
+		} else if _, ok := argSet[name]; !ok {
+			argSet[name] = ""
+		}
+	}
+	for k, v := range buildArgs {
+		argSet[k] = v
+	}
+	for i := range instrs {
+		if instrs[i].op == "ARG" || instrs[i].op == "FROM" {
+			continue
+		}
+		instrs[i].args = substituteBuildArgs(instrs[i].args, argSet)
 	}
 	state, err := evaluateBuildState(instrs)
 	if err != nil {
@@ -143,7 +182,7 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	for i, inst := range instrs {
 		send(map[string]string{"stream": fmt.Sprintf("Step %d: %s %s\n", i+3, inst.op, inst.args)})
 		switch inst.op {
-		case "FROM", "LABEL":
+		case "FROM", "LABEL", "ARG":
 			continue
 		case "WORKDIR":
 			dst := resolveContainerPath(state.workdir, inst.args)
@@ -334,6 +373,83 @@ func evaluateBuildState(instrs []dockerfileInstruction) (buildState, error) {
 		return state, fmt.Errorf("Dockerfile must contain FROM")
 	}
 	return state, nil
+}
+
+// substituteBuildArgs replaces $VAR, ${VAR}, ${VAR:-default}, and
+// ${VAR:+value} references using the supplied map. Unknown variables in the
+// bare ${VAR} and $VAR forms expand to empty, matching Docker's behaviour.
+// Escape sequences (\$) are preserved literally.
+func substituteBuildArgs(s string, vars map[string]string) string {
+	if !strings.Contains(s, "$") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c == '\\' && i+1 < len(s) && s[i+1] == '$' {
+			b.WriteByte('$')
+			i += 2
+			continue
+		}
+		if c != '$' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		var ident string
+		var consumed int
+		if i+1 < len(s) && s[i+1] == '{' {
+			end := strings.IndexByte(s[i+2:], '}')
+			if end < 0 {
+				b.WriteByte('$')
+				i++
+				continue
+			}
+			ident = s[i+2 : i+2+end]
+			consumed = end + 3
+		} else {
+			j := i + 1
+			for j < len(s) && (isAlphaNum(s[j]) || s[j] == '_') {
+				j++
+			}
+			ident = s[i+1 : j]
+			consumed = j - i
+		}
+		if ident == "" {
+			b.WriteByte('$')
+			i++
+			continue
+		}
+		b.WriteString(expandBuildArgIdent(ident, vars))
+		i += consumed
+	}
+	return b.String()
+}
+
+// expandBuildArgIdent evaluates a single ${...} identifier, honouring
+// Docker's :- (default when unset/empty) and :+ (value when set) forms.
+func expandBuildArgIdent(ident string, vars map[string]string) string {
+	if idx := strings.Index(ident, ":-"); idx >= 0 {
+		name := ident[:idx]
+		fallback := ident[idx+2:]
+		if v, ok := vars[name]; ok && v != "" {
+			return v
+		}
+		return fallback
+	}
+	if idx := strings.Index(ident, ":+"); idx >= 0 {
+		name := ident[:idx]
+		alt := ident[idx+2:]
+		if v, ok := vars[name]; ok && v != "" {
+			return alt
+		}
+		return ""
+	}
+	return vars[ident]
+}
+
+func isAlphaNum(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 func parseEnvInstruction(args string) []string {
