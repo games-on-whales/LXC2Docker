@@ -58,7 +58,11 @@ func (h *Handler) inspectVolume(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "no such volume")
 		return
 	}
-	jsonResponse(w, http.StatusOK, volumeCreateResponse(v))
+	// Return the richer VolumeUsage shape (same fields as /volumes plus
+	// UsageData) so Portainer's volume detail page can show size and
+	// reference count instead of "—".
+	size, _ := dirSize(v.Mountpoint)
+	jsonResponse(w, http.StatusOK, volumeUsage(h.store, v, size))
 }
 
 func (h *Handler) removeVolume(w http.ResponseWriter, r *http.Request) {
