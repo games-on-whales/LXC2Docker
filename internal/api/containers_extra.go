@@ -127,8 +127,9 @@ func (h *Handler) snapshotContainerStats(id string) ContainerStats {
 		},
 		MemoryStats: MemoryStats{
 			Usage:    memUsage,
-			MaxUsage: memUsage,
+			MaxUsage: maxOrFallback(readUint64(filepath.Join("/sys/fs/cgroup", cg, "memory.peak")), memUsage),
 			Limit:    memLimit,
+			Failcnt:  readMemoryEventsOOM(filepath.Join("/sys/fs/cgroup", cg, "memory.events")),
 			Stats:    readMemoryStat(filepath.Join("/sys/fs/cgroup", cg, "memory.stat")),
 		},
 		Networks: h.snapshotNetStats(id),
@@ -249,6 +250,38 @@ func blkioEntry(major, minor uint64, op string, value uint64) map[string]any {
 		"op":    op,
 		"value": value,
 	}
+}
+
+// maxOrFallback picks the larger of peak (read from memory.peak) and the
+// current usage; cgroup v2's memory.peak is only present on kernels ≥ 5.19,
+// so older hosts return 0 and we fall back to the current usage.
+func maxOrFallback(peak, cur uint64) uint64 {
+	if peak > cur {
+		return peak
+	}
+	return cur
+}
+
+// readMemoryEventsOOM parses cgroup v2's memory.events (one "key value"
+// pair per line) and returns the cumulative `oom` counter, mapped onto
+// Docker's MemoryStats.Failcnt field.
+func readMemoryEventsOOM(path string) uint64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		k, v, ok := strings.Cut(line, " ")
+		if !ok || k != "oom" {
+			continue
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			return 0
+		}
+		return n
+	}
+	return 0
 }
 
 // readMemoryStat parses cgroup v2's memory.stat (one "key value" pair per

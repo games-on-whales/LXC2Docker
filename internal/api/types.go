@@ -522,6 +522,7 @@ type MemoryStats struct {
 	Usage    uint64         `json:"usage"`
 	MaxUsage uint64         `json:"max_usage"`
 	Limit    uint64         `json:"limit"`
+	Failcnt  uint64         `json:"failcnt"`
 	Stats    map[string]any `json:"stats"`
 }
 
