@@ -473,6 +473,7 @@ type execRecord struct {
 	Cmd         []string
 	Tty         bool
 	Env         []string
+	WorkingDir  string
 	ExitCode    int
 	Running     bool
 	StartedAt   time.Time
