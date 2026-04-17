@@ -483,6 +483,37 @@ func eventMatches(r *http.Request, evt EventMessage) bool {
 	if events, ok := decoded["event"]; ok && len(events) > 0 && !events[evt.Action] {
 		return false
 	}
+	// container/image/volume/network filters match the actor's id or name
+	// AND constrain the event type to match. Docker drops a volume event
+	// when the subscriber requested `container=foo`; match that so
+	// Portainer's per-container subscriptions don't see unrelated noise.
+	for _, key := range []string{"container", "image", "volume", "network"} {
+		vals, ok := decoded[key]
+		if !ok || len(vals) == 0 {
+			continue
+		}
+		if key != evt.Type {
+			return false
+		}
+		name := evt.Actor.Attributes["name"]
+		if !vals[evt.Actor.ID] && !vals[name] {
+			return false
+		}
+	}
+	// label filter: require every `key=value` (or bare `key`) to be present
+	// in the actor attributes.
+	if labels, ok := decoded["label"]; ok && len(labels) > 0 {
+		for wanted := range labels {
+			k, v, hasValue := strings.Cut(wanted, "=")
+			got, present := evt.Actor.Attributes[k]
+			if !present {
+				return false
+			}
+			if hasValue && got != v {
+				return false
+			}
+		}
+	}
 	return true
 }
 
