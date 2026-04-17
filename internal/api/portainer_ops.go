@@ -184,6 +184,76 @@ func (h *Handler) pruneImages(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// POST /networks/prune
+// We only manage user-defined networks in the store; the built-in "gow" is
+// treated as system and never pruned. A network is considered unused when no
+// container in the store attaches to it.
+func (h *Handler) pruneNetworks(w http.ResponseWriter, r *http.Request) {
+	inUse := map[string]struct{}{}
+	for _, c := range h.store.ListContainers() {
+		for netID := range c.Networks {
+			inUse[netID] = struct{}{}
+		}
+	}
+	deleted := []string{}
+	for _, n := range h.store.ListNetworks() {
+		if n.Name == "gow" {
+			continue
+		}
+		if _, used := inUse[n.ID]; used {
+			continue
+		}
+		if _, used := inUse[n.Name]; used {
+			continue
+		}
+		if err := h.store.RemoveNetwork(n.ID); err != nil {
+			continue
+		}
+		h.publishEvent("network", "destroy", n.ID, map[string]string{
+			"name": n.Name, "type": n.Driver,
+		})
+		deleted = append(deleted, n.Name)
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"NetworksDeleted": deleted,
+	})
+}
+
+// POST /build/prune
+// We don't maintain a build cache — builds run straight against rootfs — so
+// there is nothing to reclaim. Return an empty response so Portainer's cache
+// cleanup button reports success instead of failing.
+func (h *Handler) pruneBuildCache(w http.ResponseWriter, r *http.Request) {
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"CachesDeleted":  []string{},
+		"SpaceReclaimed": 0,
+	})
+}
+
+// GET /distribution/{name}/json
+// Portainer calls this before pulling so it can show manifest details. We
+// don't have registry access of our own, so we synthesise a minimal response
+// advertising amd64/linux — Portainer's pull UI stays happy and the
+// subsequent /images/create pull path does the real work.
+func (h *Handler) inspectDistribution(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	ref := normalizeImageRef(name)
+	digest := ""
+	if rec := h.store.GetImage(ref); rec != nil {
+		digest = "sha256:" + rec.ID
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"Descriptor": map[string]any{
+			"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+			"digest":    digest,
+			"size":      0,
+		},
+		"Platforms": []map[string]any{
+			{"architecture": "amd64", "os": "linux"},
+		},
+	})
+}
+
 // POST /commit
 // Portainer's "duplicate/edit" flow snapshots a container into an image using
 // this endpoint. We approximate it by creating a new image record that points

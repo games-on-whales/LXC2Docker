@@ -62,9 +62,12 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/networks/{id}", h.inspectNetwork).Methods(http.MethodGet)
 		sub.HandleFunc("/networks/{id}", h.removeNetwork).Methods(http.MethodDelete)
 		sub.HandleFunc("/networks/create", h.createNetwork).Methods(http.MethodPost)
+		sub.HandleFunc("/networks/prune", h.pruneNetworks).Methods(http.MethodPost)
 		sub.HandleFunc("/networks/{id}/connect", h.connectNetwork).Methods(http.MethodPost)
 		sub.HandleFunc("/networks/{id}/disconnect", h.disconnectNetwork).Methods(http.MethodPost)
 		sub.HandleFunc("/system/df", h.systemDiskUsage).Methods(http.MethodGet)
+		sub.HandleFunc("/build/prune", h.pruneBuildCache).Methods(http.MethodPost)
+		sub.HandleFunc("/distribution/{name:.*}/json", h.inspectDistribution).Methods(http.MethodGet)
 
 		// Containers
 		sub.HandleFunc("/containers/json", h.listContainers).Methods(http.MethodGet)
