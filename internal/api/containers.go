@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -523,7 +524,13 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	stdout := r.URL.Query().Get("stdout") == "1" || r.URL.Query().Get("stdout") == "true"
 	stderr := r.URL.Query().Get("stderr") == "1" || r.URL.Query().Get("stderr") == "true"
 	follow := r.URL.Query().Get("follow") == "1" || r.URL.Query().Get("follow") == "true"
+	timestamps := r.URL.Query().Get("timestamps") == "1" || r.URL.Query().Get("timestamps") == "true"
 	tailLines, err := parseTailLines(r.URL.Query().Get("tail"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	since, err := parseLogSince(r.URL.Query().Get("since"))
 	if err != nil {
 		errResponse(w, http.StatusBadRequest, err.Error())
 		return
@@ -551,11 +558,14 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 	w.WriteHeader(http.StatusOK)
 
-	lines := make([]string, 0, 128)
+	lines := make([]logLine, 0, 128)
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := parseLogLine(scanner.Text())
+		if since != nil && line.Timestamp != nil && line.Timestamp.Before(*since) {
+			continue
+		}
 		if tailLines < 0 {
 			lines = append(lines, line)
 			continue
@@ -574,7 +584,7 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, line := range lines {
-		writeLogFrame(w, 1, append([]byte(line), '\n'))
+		writeLogFrame(w, 1, append([]byte(formatLogLine(line, timestamps)), '\n'))
 	}
 	if fl, ok := w.(http.Flusher); ok {
 		fl.Flush()
@@ -617,6 +627,83 @@ func parseTailLines(raw string) (int, error) {
 		return 0, fmt.Errorf("invalid tail value %q", raw)
 	}
 	return n, nil
+}
+
+type logLine struct {
+	Timestamp *time.Time
+	Text      string
+}
+
+var ansiRegexp = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func parseLogSince(raw string) (*time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	if secs, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		t := time.Unix(secs, 0).UTC()
+		return &t, nil
+	}
+	if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		secs := int64(f)
+		nanos := int64((f - float64(secs)) * float64(time.Second))
+		t := time.Unix(secs, nanos).UTC()
+		return &t, nil
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			utc := t.UTC()
+			return &utc, nil
+		}
+	}
+	return nil, fmt.Errorf("invalid since value %q", raw)
+}
+
+func parseLogLine(raw string) logLine {
+	clean := strings.TrimSpace(ansiRegexp.ReplaceAllString(raw, ""))
+	for _, layout := range []string{
+		"2006/01/02 03:04PM",
+		"2006/01/02 15:04:05",
+		time.RFC3339Nano,
+		time.RFC3339,
+	} {
+		parts := strings.SplitN(clean, " ", 3)
+		switch layout {
+		case "2006/01/02 03:04PM", "2006/01/02 15:04:05":
+			if len(parts) < 2 {
+				continue
+			}
+			if ts, err := time.ParseInLocation(layout, parts[0]+" "+parts[1], time.Local); err == nil {
+				text := raw
+				if len(parts) == 3 {
+					text = parts[2]
+				}
+				utc := ts.UTC()
+				return logLine{Timestamp: &utc, Text: text}
+			}
+		default:
+			if len(parts) < 1 {
+				continue
+			}
+			if ts, err := time.Parse(layout, parts[0]); err == nil {
+				text := raw
+				if len(parts) >= 2 {
+					text = strings.Join(parts[1:], " ")
+				}
+				utc := ts.UTC()
+				return logLine{Timestamp: &utc, Text: text}
+			}
+		}
+	}
+	return logLine{Text: raw}
+}
+
+func formatLogLine(line logLine, timestamps bool) string {
+	if !timestamps || line.Timestamp == nil {
+		return line.Text
+	}
+	return line.Timestamp.Format(time.RFC3339Nano) + " " + line.Text
 }
 
 // POST /containers/{id}/restart
