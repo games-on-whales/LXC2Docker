@@ -474,6 +474,13 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
+	// Docker returns 304 Not Modified when the target is already running.
+	// Portainer uses that to keep its optimistic UI state instead of
+	// flashing an error when the user double-clicks start.
+	if state, _ := h.mgr.State(id); state == "running" {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	if err := h.mgr.StartContainer(id); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -512,6 +519,11 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
 	if id == "" {
 		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+	// Mirror Docker's 304 for already-stopped targets.
+	if state, _ := h.mgr.State(id); state != "running" {
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	if err := h.mgr.StopContainer(id, 10*time.Second); err != nil {
