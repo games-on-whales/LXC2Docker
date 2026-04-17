@@ -15,10 +15,25 @@ import (
 )
 
 func (h *Handler) ping(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("API-Version", apiVersion)
-	w.Header().Set("Content-Type", "text/plain")
+	// Portainer (and docker CLI) feature-detect from /_ping headers — the
+	// body is just "OK". Surface the same header set Docker does so the
+	// client doesn't have to guess swarm/builder/experimental state.
+	hdr := w.Header()
+	hdr.Set("API-Version", apiVersion)
+	hdr.Set("Docker-Experimental", "false")
+	hdr.Set("OSType", "linux")
+	hdr.Set("Builder-Version", "1")
+	hdr.Set("Swarm", "inactive")
+	hdr.Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	hdr.Set("Pragma", "no-cache")
+	hdr.Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	// HEAD requests (used by Docker's health probe and some haproxy
+	// setups) must not include a body; ResponseWriter would buffer it
+	// anyway, but being explicit keeps the content-length zero.
+	if r.Method != http.MethodHead {
+		w.Write([]byte("OK"))
+	}
 }
 
 func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
@@ -321,8 +336,19 @@ func (h *Handler) disconnectNetwork(w http.ResponseWriter, r *http.Request) {
 }
 
 // events implements GET /events and streams daemon lifecycle events using the
-// Docker-compatible JSON event stream shape.
+// Docker-compatible JSON event stream shape. Honors the since/until
+// timestamps Docker clients use to replay events around a reconnect.
 func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
+	since, err := parseLogTimestamp(r.URL.Query().Get("since"), "since")
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	until, err := parseLogTimestamp(r.URL.Query().Get("until"), "until")
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	ch := h.eventsHub.subscribe()
@@ -331,12 +357,31 @@ func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 	if flusher != nil {
 		flusher.Flush()
 	}
+	// Non-streaming mode: when until is set and already in the past, just
+	// return an empty body. Docker clients use this form to probe whether
+	// the endpoint is alive.
+	if until != nil && !until.After(time.Now()) {
+		return
+	}
+	// When until is in the future, close the stream at that deadline.
+	var deadline <-chan time.Time
+	if until != nil {
+		deadline = time.After(time.Until(*until))
+	}
 	enc := json.NewEncoder(w)
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-deadline:
+			return
 		case evt := <-ch:
+			if since != nil && evt.TimeNano < since.UnixNano() {
+				continue
+			}
+			if until != nil && evt.TimeNano > until.UnixNano() {
+				return
+			}
 			if !eventMatches(r, evt) {
 				continue
 			}
