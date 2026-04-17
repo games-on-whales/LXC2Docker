@@ -649,6 +649,7 @@ lxc.uts.name = %s
 			OCIEnv:        cfg.Env,
 			OCIWorkingDir: cfg.WorkingDir,
 			OCIPorts:      cfg.Ports,
+			OCILabels:     cfg.Labels,
 		}); err == nil {
 			os.WriteFile(filepath.Join(templateDir, "oci-meta.json"), data, 0o644)
 		}
@@ -667,6 +668,7 @@ lxc.uts.name = %s
 		OCIEnv:          cfg.Env,
 		OCIWorkingDir:   cfg.WorkingDir,
 		OCIPorts:        cfg.Ports,
+		OCILabels:       cfg.Labels,
 	})
 }
 

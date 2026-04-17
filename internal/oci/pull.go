@@ -20,6 +20,7 @@ type ImageConfig struct {
 	Env        []string
 	WorkingDir string
 	Ports      []string // e.g. ["80/tcp", "443/tcp"]
+	Labels     map[string]string
 }
 
 // Pull downloads an OCI image from a registry and unpacks it to a rootfs
@@ -152,11 +153,12 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 
 	var imgCfg struct {
 		Config struct {
-			Entrypoint   []string          `json:"Entrypoint"`
-			Cmd          []string          `json:"Cmd"`
-			Env          []string          `json:"Env"`
-			WorkingDir   string            `json:"WorkingDir"`
+			Entrypoint   []string            `json:"Entrypoint"`
+			Cmd          []string            `json:"Cmd"`
+			Env          []string            `json:"Env"`
+			WorkingDir   string              `json:"WorkingDir"`
 			ExposedPorts map[string]struct{} `json:"ExposedPorts"`
+			Labels       map[string]string   `json:"Labels"`
 		} `json:"config"`
 	}
 	if err := json.Unmarshal(configData, &imgCfg); err != nil {
@@ -174,6 +176,7 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 		Env:        imgCfg.Config.Env,
 		WorkingDir: imgCfg.Config.WorkingDir,
 		Ports:      ports,
+		Labels:     imgCfg.Config.Labels,
 	}, nil
 }
 

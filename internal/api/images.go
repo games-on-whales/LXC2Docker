@@ -51,10 +51,21 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 			Created:     rec.Created.Unix(),
 			Size:        size,
 			VirtualSize: size,
-			Labels:      map[string]string{},
+			Labels:      copyLabels(rec.OCILabels),
 		})
 	}
 	jsonResponse(w, http.StatusOK, out)
+}
+
+func copyLabels(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // matchesImageFilters applies Docker's /images/json filter keys we support
@@ -80,9 +91,7 @@ func matchesImageFilters(rec *store.ImageRecord, f listFilters) bool {
 			return false
 		}
 	}
-	// We don't yet track labels on images; a label filter matches only if
-	// the filter is empty.
-	if len(f["label"]) > 0 {
+	if !matchesLabelFilter(f["label"], rec.OCILabels) {
 		return false
 	}
 	return true
@@ -176,7 +185,7 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 		Os:              "linux",
 		Size:            size,
 		VirtualSize:     size,
-		Labels:          config.Labels,
+		Labels:          copyLabels(rec.OCILabels),
 		DockerVersion:   "24.0.0",
 		Author:          "docker-lxc-daemon",
 		Config:          config,
@@ -381,7 +390,7 @@ func imageConfigFromRecord(rec *store.ImageRecord) *ImageConfig {
 		Cmd:          append([]string{}, rec.OCICmd...),
 		Entrypoint:   append([]string{}, rec.OCIEntrypoint...),
 		WorkingDir:   rec.OCIWorkingDir,
-		Labels:       map[string]string{},
+		Labels:       copyLabels(rec.OCILabels),
 		ExposedPorts: exposed,
 	}
 }

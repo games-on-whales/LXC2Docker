@@ -26,6 +26,7 @@ type buildState struct {
 	cmd        []string
 	entrypoint []string
 	exposed    []string
+	labels     map[string]string
 }
 
 type dockerfileInstruction struct {
@@ -56,6 +57,15 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	if raw := r.URL.Query().Get("buildargs"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &buildArgs); err != nil {
 			errResponse(w, http.StatusBadRequest, "invalid buildargs: "+err.Error())
+			return
+		}
+	}
+	// labels is Portainer's "Image labels" override: JSON object merged on
+	// top of whatever LABEL the Dockerfile declared.
+	queryLabels := map[string]string{}
+	if raw := r.URL.Query().Get("labels"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &queryLabels); err != nil {
+			errResponse(w, http.StatusBadRequest, "invalid labels: "+err.Error())
 			return
 		}
 	}
@@ -131,6 +141,9 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		fail(err.Error())
 		return
+	}
+	for k, v := range queryLabels {
+		state.labels[k] = v
 	}
 
 	send(map[string]string{"stream": fmt.Sprintf("Step 1: resolving base image %s\n", state.baseRef)})
@@ -347,7 +360,11 @@ func parseDockerfile(contents string) ([]dockerfileInstruction, error) {
 }
 
 func evaluateBuildState(instrs []dockerfileInstruction) (buildState, error) {
-	state := buildState{workdir: "/", env: []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}}
+	state := buildState{
+		workdir: "/",
+		env:     []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+		labels:  map[string]string{},
+	}
 	fromCount := 0
 	for _, inst := range instrs {
 		switch inst.op {
@@ -367,12 +384,62 @@ func evaluateBuildState(instrs []dockerfileInstruction) (buildState, error) {
 			state.entrypoint = parseCommandInstruction(inst.args)
 		case "EXPOSE":
 			state.exposed = append(state.exposed, strings.Fields(inst.args)...)
+		case "LABEL":
+			for k, v := range parseLabelInstruction(inst.args) {
+				state.labels[k] = v
+			}
 		}
 	}
 	if state.baseRef == "" {
 		return state, fmt.Errorf("Dockerfile must contain FROM")
 	}
 	return state, nil
+}
+
+// parseLabelInstruction parses Dockerfile LABEL arg tokens. Supports both the
+// single-pair shorthand (LABEL key=value or LABEL key value) and the
+// space-separated multi-pair form (LABEL key1=v1 key2="v 2" key3=v3).
+func parseLabelInstruction(args string) map[string]string {
+	out := map[string]string{}
+	tokens := splitShellTokens(args)
+	if len(tokens) == 2 && !strings.Contains(tokens[0], "=") {
+		out[tokens[0]] = tokens[1]
+		return out
+	}
+	for _, t := range tokens {
+		k, v, ok := strings.Cut(t, "=")
+		if !ok {
+			continue
+		}
+		out[k] = strings.Trim(v, `"`)
+	}
+	return out
+}
+
+// splitShellTokens splits args on whitespace while respecting simple double-
+// quoted runs so "LABEL desc=\"hello world\" name=foo" yields two tokens.
+func splitShellTokens(s string) []string {
+	var tokens []string
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			inQuote = !inQuote
+		case !inQuote && (c == ' ' || c == '\t'):
+			if cur.Len() > 0 {
+				tokens = append(tokens, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if cur.Len() > 0 {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens
 }
 
 // substituteBuildArgs replaces $VAR, ${VAR}, ${VAR:-default}, and
@@ -697,6 +764,7 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 			OCIEnv:          state.env,
 			OCIWorkingDir:   state.workdir,
 			OCIPorts:        state.exposed,
+			OCILabels:       state.labels,
 		})
 	}
 
@@ -723,5 +791,6 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 		OCIEnv:        state.env,
 		OCIWorkingDir: state.workdir,
 		OCIPorts:      state.exposed,
+		OCILabels:     state.labels,
 	})
 }
