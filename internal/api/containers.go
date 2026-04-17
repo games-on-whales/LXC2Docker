@@ -254,6 +254,11 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 // GET /containers/json
 func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
+	filters, err := parseListFilters(r.URL.Query().Get("filters"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
+		return
+	}
 	// Use Manager.ListContainers so adopted (operator-tagged) PVE CTs
 	// surface alongside daemon-created records.
 	records := h.mgr.ListContainers()
@@ -265,6 +270,9 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			state = "created"
 		}
 		if !all && state != "running" {
+			continue
+		}
+		if !matchesContainerFilters(rec, state, filters) {
 			continue
 		}
 		cmd := strings.Join(append(rec.Entrypoint, rec.Cmd...), " ")

@@ -17,9 +17,33 @@ import (
 
 // GET /images/json
 func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
+	filters, err := parseListFilters(r.URL.Query().Get("filters"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
+		return
+	}
+	// Docker's `dangling` image filter is the odd one out: images without
+	// tags. We never produce untagged images, so `dangling=true` yields an
+	// empty list and `dangling=false` is a no-op.
+	if vals := filters["dangling"]; len(vals) > 0 {
+		onlyDangling := false
+		for _, v := range vals {
+			if v == "true" || v == "1" {
+				onlyDangling = true
+			}
+		}
+		if onlyDangling {
+			jsonResponse(w, http.StatusOK, []ImageSummary{})
+			return
+		}
+	}
+
 	records := h.store.ListImages()
 	out := make([]ImageSummary, 0, len(records))
 	for _, rec := range records {
+		if !matchesImageFilters(rec, filters) {
+			continue
+		}
 		size := h.imageSize(rec)
 		out = append(out, ImageSummary{
 			ID:          "sha256:" + rec.ID,
@@ -31,6 +55,37 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	jsonResponse(w, http.StatusOK, out)
+}
+
+// matchesImageFilters applies Docker's /images/json filter keys we support
+// (reference, label). `reference` does a substring/prefix match on the tag
+// — Docker's globbing support is richer, but Portainer only uses exact and
+// prefix matches today.
+func matchesImageFilters(rec *store.ImageRecord, f listFilters) bool {
+	if vals := f["reference"]; len(vals) > 0 {
+		ref := normalizeImageRef(rec.Ref)
+		matched := false
+		for _, v := range vals {
+			v = strings.TrimRight(v, "*")
+			if v == "" {
+				matched = true
+				break
+			}
+			if strings.Contains(ref, v) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	// We don't yet track labels on images; a label filter matches only if
+	// the filter is empty.
+	if len(f["label"]) > 0 {
+		return false
+	}
+	return true
 }
 
 // POST /images/create  (docker pull)
