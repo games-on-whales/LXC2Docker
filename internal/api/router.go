@@ -3,6 +3,8 @@ package api
 import (
 	"log"
 	"net/http"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
@@ -13,19 +15,22 @@ import (
 // Handler is the root HTTP handler. It holds references to the LXC manager
 // and the metadata store, and owns the in-memory exec instance table.
 type Handler struct {
-	mgr       *lxc.Manager
-	store     *store.Store
-	execs     *execStore
-	eventsHub *eventHub
+	mgr        *lxc.Manager
+	store      *store.Store
+	execs      *execStore
+	eventsHub  *eventHub
+	attachMu   sync.Mutex
+	attachPTYs map[string]*os.File
 }
 
 // NewHandler wires up the Handler and returns an http.Handler ready to serve.
 func NewHandler(mgr *lxc.Manager, st *store.Store) http.Handler {
 	h := &Handler{
-		mgr:       mgr,
-		store:     st,
-		execs:     newExecStore(),
-		eventsHub: newEventHub(),
+		mgr:        mgr,
+		store:      st,
+		execs:      newExecStore(),
+		eventsHub:  newEventHub(),
+		attachPTYs: make(map[string]*os.File),
 	}
 	// Periodically prune completed exec records to prevent memory leaks.
 	go func() {
@@ -78,6 +83,7 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/containers/{id}/logs", h.containerLogs).Methods(http.MethodGet)
 		sub.HandleFunc("/containers/{id}/archive", h.putArchive).Methods(http.MethodPut)
 		sub.HandleFunc("/containers/{id}/archive", h.getArchive).Methods(http.MethodGet, http.MethodHead)
+		sub.HandleFunc("/containers/{id}/resize", h.resizeContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}", h.removeContainer).Methods(http.MethodDelete)
 
 		// Images
@@ -102,6 +108,7 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/containers/{id}/exec", h.execCreate).Methods(http.MethodPost)
 		sub.HandleFunc("/exec/{id}/start", h.execStart).Methods(http.MethodPost)
 		sub.HandleFunc("/exec/{id}/json", h.execInspect).Methods(http.MethodGet)
+		sub.HandleFunc("/exec/{id}/resize", h.execResize).Methods(http.MethodPost)
 	}
 
 	// Log all requests for debugging.

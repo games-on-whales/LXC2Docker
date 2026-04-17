@@ -899,7 +899,9 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 		buf.WriteString("\r\n")
 		buf.Flush()
 
-		runExecTTY(cmd, conn)
+		runExecTTY(cmd, conn, func(p *os.File) {
+			h.setAttachPTY(id, p)
+		})
 		return
 	}
 

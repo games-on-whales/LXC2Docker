@@ -153,7 +153,9 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 
 		if rec.Tty {
 			closeConn = false
-			runExecTTY(cmd, conn)
+			runExecTTY(cmd, conn, func(p *os.File) {
+				h.execs.update(rec.ID, func(r *execRecord) { r.pty = p })
+			})
 		} else {
 			runExecMux(cmd, conn)
 		}
@@ -207,12 +209,17 @@ func (h *Handler) execInspect(w http.ResponseWriter, r *http.Request) {
 }
 
 // runExecTTY runs cmd with a PTY attached and proxies raw bytes between the
-// PTY master and the hijacked connection. Used when Tty=true.
-func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter) {
+// PTY master and the hijacked connection. Used when Tty=true. If onPTY is
+// non-nil it is called with the PTY master once the command has started so
+// callers (e.g. /exec/{id}/resize) can issue ioctls against it.
+func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter, onPTY func(*os.File)) {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		fmt.Fprintf(conn, "error starting pty: %s\n", err)
 		return
+	}
+	if onPTY != nil {
+		onPTY(ptmx)
 	}
 
 	var wg sync.WaitGroup
@@ -231,6 +238,11 @@ func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter) {
 	}()
 
 	cmd.Wait()
+	// Clear the handle before closing so a late resize ioctl can't race with
+	// ptmx.Close and hit a reused fd.
+	if onPTY != nil {
+		onPTY(nil)
+	}
 	// Close the PTY master to unblock the io.Copy goroutines. If we defer
 	// this, wg.Wait below deadlocks because the copies never see EOF.
 	ptmx.Close()

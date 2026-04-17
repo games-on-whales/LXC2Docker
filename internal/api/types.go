@@ -2,7 +2,10 @@
 // by the raw docker CLI and GoW tooling.
 package api
 
-import "time"
+import (
+	"os"
+	"time"
+)
 
 // --- Container Create ---
 
@@ -477,4 +480,7 @@ type execRecord struct {
 	ExitCode    int
 	Running     bool
 	StartedAt   time.Time
+	// pty is the PTY master for a running TTY exec, used by /exec/{id}/resize.
+	// nil when the exec is not TTY or has not started yet.
+	pty *os.File
 }
