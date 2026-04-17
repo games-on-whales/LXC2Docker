@@ -102,15 +102,35 @@ type MountJSON struct {
 
 // ContainerState holds the runtime state of a container.
 type ContainerState struct {
-	Status     string `json:"Status"` // "running", "exited", "created"
-	Running    bool   `json:"Running"`
-	Paused     bool   `json:"Paused"`
-	Restarting bool   `json:"Restarting"`
-	Dead       bool   `json:"Dead"`
-	Pid        int    `json:"Pid"`
-	ExitCode   int    `json:"ExitCode"`
-	StartedAt  string `json:"StartedAt"`
-	FinishedAt string `json:"FinishedAt"`
+	Status     string           `json:"Status"` // "running", "exited", "created"
+	Running    bool             `json:"Running"`
+	Paused     bool             `json:"Paused"`
+	Restarting bool             `json:"Restarting"`
+	OOMKilled  bool             `json:"OOMKilled"`
+	Dead       bool             `json:"Dead"`
+	Pid        int              `json:"Pid"`
+	ExitCode   int              `json:"ExitCode"`
+	Error      string           `json:"Error"`
+	StartedAt  string           `json:"StartedAt"`
+	FinishedAt string           `json:"FinishedAt"`
+	Health     *ContainerHealth `json:"Health,omitempty"`
+}
+
+// ContainerHealth is the /health subblock of ContainerState. We don't run
+// healthchecks today, but Portainer's container list uses the presence
+// and Status of this field to decide which badge to render.
+type ContainerHealth struct {
+	Status        string                 `json:"Status"`
+	FailingStreak int                    `json:"FailingStreak"`
+	Log           []ContainerHealthEntry `json:"Log"`
+}
+
+// ContainerHealthEntry is a single execution record inside Health.Log.
+type ContainerHealthEntry struct {
+	Start    string `json:"Start"`
+	End      string `json:"End"`
+	ExitCode int    `json:"ExitCode"`
+	Output   string `json:"Output"`
 }
 
 // ContainerConfig is the image-level config embedded in ContainerJSON.
