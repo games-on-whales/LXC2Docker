@@ -1422,10 +1422,22 @@ func writeLogFrame(w io.Writer, streamType byte, data []byte) {
 }
 
 func (h *Handler) markContainerExited(rec *store.ContainerRecord, exitCode int) {
+	// Only emit the `die` event on the first transition from running to
+	// exited. markContainerExited is called from every lifecycle path —
+	// stop, kill, wait, GC — so guard on FinishedAt to avoid publishing
+	// duplicate events.
+	alreadyExited := rec.FinishedAt != nil
 	now := time.Now()
 	rec.FinishedAt = &now
 	rec.ExitCode = exitCode
 	_ = h.store.AddContainer(rec)
+	if !alreadyExited {
+		h.publishEvent("container", "die", rec.ID, map[string]string{
+			"name":     rec.Name,
+			"image":    normalizeImageRef(rec.Image),
+			"exitCode": strconv.Itoa(exitCode),
+		})
+	}
 }
 
 func exitCodeForSignal(signal string) int {
