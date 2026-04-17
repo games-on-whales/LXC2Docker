@@ -346,13 +346,30 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// Path/Args derive from the effective process that was launched. Docker
+	// reports Entrypoint when set, falling back to Cmd[0]. Portainer reads
+	// these to render the "Command" row in the inspect tab.
+	path, args := splitPathArgs(rec.Entrypoint, rec.Cmd)
+
+	pid := 0
+	if running {
+		if p, err := h.mgr.InitPID(id); err == nil {
+			pid = p
+		}
+	}
+
 	resp := ContainerJSON{
-		ID:      rec.ID,
-		Created: rec.Created.Format(time.RFC3339),
-		Name:    "/" + rec.Name,
+		ID:       rec.ID,
+		Created:  rec.Created.Format(time.RFC3339),
+		Path:     path,
+		Args:     args,
+		Name:     "/" + rec.Name,
+		Driver:   "lxc",
+		Platform: "linux",
 		State: ContainerState{
 			Status:     state,
 			Running:    running,
+			Pid:        pid,
 			ExitCode:   rec.ExitCode,
 			StartedAt:  startedAt,
 			FinishedAt: finishedAt,
@@ -374,6 +391,17 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	jsonResponse(w, http.StatusOK, resp)
+}
+
+// splitPathArgs reproduces Docker's Path/Args split: the entrypoint (or first
+// element of cmd when no entrypoint) is Path, everything after is Args.
+func splitPathArgs(entrypoint, cmd []string) (string, []string) {
+	combined := append([]string{}, entrypoint...)
+	combined = append(combined, cmd...)
+	if len(combined) == 0 {
+		return "", []string{}
+	}
+	return combined[0], combined[1:]
 }
 
 // POST /containers/{id}/start

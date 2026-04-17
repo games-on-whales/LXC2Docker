@@ -72,7 +72,12 @@ type ContainerCreateResponse struct {
 type ContainerJSON struct {
 	ID              string           `json:"Id"`
 	Created         string           `json:"Created"`
+	Path            string           `json:"Path"`
+	Args            []string         `json:"Args"`
 	Name            string           `json:"Name"`
+	RestartCount    int              `json:"RestartCount"`
+	Driver          string           `json:"Driver"`
+	Platform        string           `json:"Platform"`
 	State           ContainerState   `json:"State"`
 	Image           string           `json:"Image"`
 	Config          *ContainerConfig `json:"Config"`
