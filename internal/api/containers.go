@@ -786,21 +786,35 @@ func (h *Handler) topContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusConflict, "container is not running")
 		return
 	}
-	cmd := h.mgr.Exec(id, []string{"ps", "-eo", "pid,user,time,comm"}, nil)
-	out, err := cmd.Output()
+
+	psArgs := strings.TrimSpace(r.URL.Query().Get("ps_args"))
+	candidates := [][]string{}
+	if psArgs != "" {
+		candidates = append(candidates, append([]string{"ps"}, strings.Fields(psArgs)...))
+	}
+	candidates = append(candidates,
+		[]string{"ps", "-eo", "pid,user,time,comm"},
+		[]string{"ps"},
+	)
+
+	var out []byte
+	var err error
+	for _, argv := range candidates {
+		out, err = h.mgr.Exec(id, argv, nil).Output()
+		if err == nil && strings.TrimSpace(string(out)) != "" {
+			break
+		}
+	}
+	if err != nil {
+		out, err = h.topViaNsenter(id, psArgs)
+	}
 	if err != nil {
 		errResponse(w, http.StatusInternalServerError, fmt.Sprintf("ps: %v", err))
 		return
 	}
+
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	titles := []string{"PID", "USER", "TIME", "COMMAND"}
-	processes := make([][]string, 0, len(lines)-1)
-	for _, line := range lines[1:] {
-		fields := strings.Fields(line)
-		if len(fields) >= 4 {
-			processes = append(processes, fields[:4])
-		}
-	}
+	titles, processes := parseTopOutput(lines)
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"Titles":    titles,
 		"Processes": processes,
@@ -1013,6 +1027,72 @@ func writeLogFrame(w io.Writer, streamType byte, data []byte) {
 	binary.BigEndian.PutUint32(header[4:], uint32(len(data)))
 	w.Write(header)
 	w.Write(data)
+}
+
+func parseTopOutput(lines []string) ([]string, [][]string) {
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return []string{}, [][]string{}
+	}
+
+	titles := strings.Fields(lines[0])
+	processes := make([][]string, 0, maxInt(len(lines)-1, 0))
+	for _, line := range lines[1:] {
+		fields := splitFieldsWithTail(line, len(titles))
+		if len(fields) == len(titles) {
+			processes = append(processes, fields)
+		}
+	}
+	return titles, processes
+}
+
+func (h *Handler) topViaNsenter(id, psArgs string) ([]byte, error) {
+	pid, err := h.mgr.InitPID(id)
+	if err != nil {
+		return nil, err
+	}
+	candidates := [][]string{}
+	if psArgs != "" {
+		candidates = append(candidates, append([]string{"ps"}, strings.Fields(psArgs)...))
+	}
+	candidates = append(candidates,
+		[]string{"ps", "-eo", "pid,user,time,comm"},
+		[]string{"ps", "-ef"},
+		[]string{"ps", "aux"},
+	)
+	for _, argv := range candidates {
+		cmd := exec.Command("nsenter", append([]string{
+			"-t", strconv.Itoa(pid),
+			"-p",
+		}, argv...)...)
+		out, err := cmd.Output()
+		if err == nil && strings.TrimSpace(string(out)) != "" {
+			return out, nil
+		}
+	}
+	return nil, fmt.Errorf("no usable ps variant found")
+}
+
+func splitFieldsWithTail(line string, want int) []string {
+	if want <= 0 {
+		return nil
+	}
+	fields := strings.Fields(line)
+	if len(fields) < want {
+		return nil
+	}
+	if len(fields) == want {
+		return fields
+	}
+	head := append([]string{}, fields[:want-1]...)
+	head = append(head, strings.Join(fields[want-1:], " "))
+	return head
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func runAttachFallback(cmd *exec.Cmd, stdin io.Reader, w http.ResponseWriter) {
