@@ -50,6 +50,25 @@ type ContainerRecord struct {
 	// create time. The daemon does not currently enforce it — containers
 	// that exit stay exited until the user restarts them.
 	RestartPolicy *RestartPolicy `json:"restart_policy,omitempty"`
+	// Healthcheck is echoed back on inspect so Portainer's detail panel
+	// and duplicate/edit dialog reflect the user's input. Like
+	// RestartPolicy, the daemon does not actually execute the check.
+	Healthcheck *HealthcheckConfig `json:"healthcheck,omitempty"`
+	// StopSignal mirrors Docker's Config.StopSignal field (e.g. "SIGINT").
+	// We don't map it into lxc-stop, but Portainer reads it from inspect.
+	StopSignal string `json:"stop_signal,omitempty"`
+}
+
+// HealthcheckConfig mirrors Docker's Config.Healthcheck. Stored verbatim;
+// the daemon currently does not execute healthchecks (all fields are
+// echoed back on inspect for UI purposes only).
+type HealthcheckConfig struct {
+	Test          []string `json:"test,omitempty"`
+	Interval      int64    `json:"interval,omitempty"`
+	Timeout       int64    `json:"timeout,omitempty"`
+	StartPeriod   int64    `json:"start_period,omitempty"`
+	StartInterval int64    `json:"start_interval,omitempty"`
+	Retries       int      `json:"retries,omitempty"`
 }
 
 // RestartPolicy mirrors Docker's HostConfig.RestartPolicy block. Kept as a

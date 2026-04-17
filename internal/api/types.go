@@ -21,6 +21,20 @@ type ContainerCreateRequest struct {
 	Mounts           []MountRequest    `json:"Mounts"`
 	NetworkingConfig NetworkingConfig  `json:"NetworkingConfig"`
 	HostConfig       HostConfig        `json:"HostConfig"`
+	Healthcheck      *HealthConfig     `json:"Healthcheck,omitempty"`
+	StopSignal       string            `json:"StopSignal,omitempty"`
+}
+
+// HealthConfig is Docker's healthcheck configuration block. We don't
+// actually execute healthchecks, but we roundtrip the config through
+// inspect so Portainer's UI can render what the user submitted.
+type HealthConfig struct {
+	Test          []string `json:"Test,omitempty"`
+	Interval      int64    `json:"Interval,omitempty"`      // nanoseconds
+	Timeout       int64    `json:"Timeout,omitempty"`       // nanoseconds
+	StartPeriod   int64    `json:"StartPeriod,omitempty"`   // nanoseconds
+	StartInterval int64    `json:"StartInterval,omitempty"` // nanoseconds
+	Retries       int      `json:"Retries,omitempty"`
 }
 
 // HostConfig holds the host-level container options.
@@ -146,6 +160,7 @@ type ContainerConfig struct {
 	WorkingDir   string              `json:"WorkingDir"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
 	StopSignal   string              `json:"StopSignal,omitempty"`
+	Healthcheck  *HealthConfig       `json:"Healthcheck,omitempty"`
 	Tty          bool                `json:"Tty"`
 	AttachStdin  bool                `json:"AttachStdin"`
 	AttachStdout bool                `json:"AttachStdout"`

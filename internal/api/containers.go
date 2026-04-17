@@ -200,6 +200,18 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var health *store.HealthcheckConfig
+	if req.Healthcheck != nil && len(req.Healthcheck.Test) > 0 {
+		health = &store.HealthcheckConfig{
+			Test:          append([]string{}, req.Healthcheck.Test...),
+			Interval:      req.Healthcheck.Interval,
+			Timeout:       req.Healthcheck.Timeout,
+			StartPeriod:   req.Healthcheck.StartPeriod,
+			StartInterval: req.Healthcheck.StartInterval,
+			Retries:       req.Healthcheck.Retries,
+		}
+	}
+
 	// Persist record before creating so the IP is allocated.
 	rec := &store.ContainerRecord{
 		ID:            id,
@@ -212,6 +224,8 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Env:           env,
 		Labels:        labels,
 		RestartPolicy: restart,
+		Healthcheck:   health,
+		StopSignal:    req.StopSignal,
 	}
 	rec.Networks = defaultContainerNetworks(rec)
 	if err := attachRequestedNetworks(h.store, rec, req.NetworkingConfig); err != nil {
@@ -464,6 +478,8 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Env:          rec.Env,
 			Labels:       rec.Labels,
 			ExposedPorts: imageExposedPorts(h.store, rec),
+			StopSignal:   rec.StopSignal,
+			Healthcheck:  healthcheckFromRecord(rec.Healthcheck),
 		},
 		HostConfig: hostConfig,
 		NetworkSettings: NetworkSettings{
@@ -479,6 +495,22 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		resp.SizeRootFs = &size
 	}
 	jsonResponse(w, http.StatusOK, resp)
+}
+
+// healthcheckFromRecord lifts a stored healthcheck into the API shape that
+// Portainer reads from Config.Healthcheck on inspect. nil in / nil out.
+func healthcheckFromRecord(h *store.HealthcheckConfig) *HealthConfig {
+	if h == nil {
+		return nil
+	}
+	return &HealthConfig{
+		Test:          append([]string{}, h.Test...),
+		Interval:      h.Interval,
+		Timeout:       h.Timeout,
+		StartPeriod:   h.StartPeriod,
+		StartInterval: h.StartInterval,
+		Retries:       h.Retries,
+	}
 }
 
 // imageExposedPorts returns the ExposedPorts map Docker surfaces on
