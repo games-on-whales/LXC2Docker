@@ -32,11 +32,21 @@ func (h *Handler) containerChanges(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rootfs := h.mgr.RootfsPath(id)
-	base := h.mgr.ImageRootfsPath(normalizeImageRef(rec.Image))
-	if rootfs == "" || base == "" {
+	if rootfs == "" {
 		jsonResponse(w, http.StatusOK, []ChangeResponse{})
 		return
 	}
+	base, cleanup, err := h.resolveImageBaseDir(rec.Image)
+	if err != nil || base == "" {
+		// No base to diff against — return an empty change list rather
+		// than a 500 so Portainer's Filesystem tab renders cleanly.
+		if cleanup != nil {
+			cleanup()
+		}
+		jsonResponse(w, http.StatusOK, []ChangeResponse{})
+		return
+	}
+	defer cleanup()
 
 	changes, err := diffRootfs(base, rootfs)
 	if err != nil {
@@ -44,6 +54,35 @@ func (h *Handler) containerChanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusOK, changes)
+}
+
+// resolveImageBaseDir picks a directory containing the image's rootfs the
+// caller can diff against. Tries the legacy template path first (cheap),
+// then falls back to the ZFS @tmpl snapshot via the .zfs/snapshot/tmpl
+// accessor — exactly the approach openImageRootfs takes for image save.
+func (h *Handler) resolveImageBaseDir(ref string) (string, func(), error) {
+	noop := func() {}
+	if path := h.mgr.ImageRootfsPath(normalizeImageRef(ref)); path != "" {
+		if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+			return path, noop, nil
+		}
+	}
+	rec := h.store.GetImage(normalizeImageRef(ref))
+	if rec == nil {
+		return "", noop, nil
+	}
+	if rec.TemplateDataset == "" {
+		return "", noop, nil
+	}
+	mp, err := zfsMountpoint(rec.TemplateDataset)
+	if err != nil {
+		return "", noop, err
+	}
+	snap := filepath.Join(mp, ".zfs", "snapshot", "tmpl")
+	if fi, err := os.Stat(snap); err != nil || !fi.IsDir() {
+		return "", noop, nil
+	}
+	return snap, noop, nil
 }
 
 func (h *Handler) containerStats(w http.ResponseWriter, r *http.Request) {
@@ -59,14 +98,25 @@ func (h *Handler) containerStats(w http.ResponseWriter, r *http.Request) {
 		enc := json.NewEncoder(w)
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+		// Track the previous sample so PreCPUStats reflects the prior tick
+		// instead of zeros. Portainer's CPU% formula divides the delta in
+		// container CPU usage by the delta in system CPU usage; without a
+		// previous sample the chart pegs to either zero or 100%.
+		var prev *ContainerStats
 		for {
 			stats := h.snapshotContainerStats(id)
+			if prev != nil {
+				stats.PreRead = prev.Read
+				stats.PreCPUStats = prev.CPUStats
+			}
 			if err := enc.Encode(stats); err != nil {
 				return
 			}
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
+			cur := stats
+			prev = &cur
 			select {
 			case <-r.Context().Done():
 				return
@@ -116,8 +166,9 @@ func (h *Handler) snapshotContainerStats(id string) ContainerStats {
 		},
 		MemoryStats: MemoryStats{
 			Usage:    memUsage,
-			MaxUsage: memUsage,
+			MaxUsage: maxOrFallback(readUint64(filepath.Join("/sys/fs/cgroup", cg, "memory.peak")), memUsage),
 			Limit:    memLimit,
+			Failcnt:  readMemoryEventsOOM(filepath.Join("/sys/fs/cgroup", cg, "memory.events")),
 			Stats:    readMemoryStat(filepath.Join("/sys/fs/cgroup", cg, "memory.stat")),
 		},
 		Networks: h.snapshotNetStats(id),
@@ -238,6 +289,38 @@ func blkioEntry(major, minor uint64, op string, value uint64) map[string]any {
 		"op":    op,
 		"value": value,
 	}
+}
+
+// maxOrFallback picks the larger of peak (read from memory.peak) and the
+// current usage; cgroup v2's memory.peak is only present on kernels ≥ 5.19,
+// so older hosts return 0 and we fall back to the current usage.
+func maxOrFallback(peak, cur uint64) uint64 {
+	if peak > cur {
+		return peak
+	}
+	return cur
+}
+
+// readMemoryEventsOOM parses cgroup v2's memory.events (one "key value"
+// pair per line) and returns the cumulative `oom` counter, mapped onto
+// Docker's MemoryStats.Failcnt field.
+func readMemoryEventsOOM(path string) uint64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		k, v, ok := strings.Cut(line, " ")
+		if !ok || k != "oom" {
+			continue
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			return 0
+		}
+		return n
+	}
+	return 0
 }
 
 // readMemoryStat parses cgroup v2's memory.stat (one "key value" pair per
@@ -394,9 +477,36 @@ func attachRequestedNetworks(st *store.Store, rec *store.ContainerRecord, cfg Ne
 			Aliases:    append([]string{}, ep.Aliases...),
 			Links:      append([]string{}, ep.Links...),
 			DriverOpts: copyStringMap(ep.DriverOpts),
+			IPAMConfig: endpointIPAMToStore(ep.IPAMConfig),
 		}
 	}
 	return nil
+}
+
+// endpointIPAMToStore copies the API-level EndpointIPAMConfig into its
+// store counterpart. Returns nil when nothing meaningful was set so older
+// records keep deserialising untouched.
+func endpointIPAMToStore(in *EndpointIPAMConfig) *store.EndpointIPAMConfig {
+	if in == nil || (in.IPv4Address == "" && in.IPv6Address == "" && len(in.LinkLocalIPs) == 0) {
+		return nil
+	}
+	return &store.EndpointIPAMConfig{
+		IPv4Address:  in.IPv4Address,
+		IPv6Address:  in.IPv6Address,
+		LinkLocalIPs: append([]string{}, in.LinkLocalIPs...),
+	}
+}
+
+// endpointIPAMFromStore is the inverse of endpointIPAMToStore.
+func endpointIPAMFromStore(in *store.EndpointIPAMConfig) *EndpointIPAMConfig {
+	if in == nil {
+		return nil
+	}
+	return &EndpointIPAMConfig{
+		IPv4Address:  in.IPv4Address,
+		IPv6Address:  in.IPv6Address,
+		LinkLocalIPs: append([]string{}, in.LinkLocalIPs...),
+	}
 }
 
 // copyStringMap returns a defensive copy of src so persisted store records
@@ -427,6 +537,7 @@ func buildContainerEndpoints(rec *store.ContainerRecord) map[string]EndpointSett
 			Aliases:    append([]string{}, attached.Aliases...),
 			Links:      append([]string{}, attached.Links...),
 			DriverOpts: copyStringMap(attached.DriverOpts),
+			IPAMConfig: endpointIPAMFromStore(attached.IPAMConfig),
 		}
 	}
 	return out

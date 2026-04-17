@@ -50,6 +50,9 @@ type ContainerRecord struct {
 	// create time. The daemon does not currently enforce it — containers
 	// that exit stay exited until the user restarts them.
 	RestartPolicy *RestartPolicy `json:"restart_policy,omitempty"`
+	// RestartCount tracks how many times the user has restarted the
+	// container via /containers/{id}/restart. Surfaces on inspect.
+	RestartCount int `json:"restart_count,omitempty"`
 	// Healthcheck is echoed back on inspect so Portainer's detail panel
 	// and duplicate/edit dialog reflect the user's input. Like
 	// RestartPolicy, the daemon does not actually execute the check.
@@ -70,6 +73,11 @@ type ContainerRecord struct {
 	Tty       bool `json:"tty,omitempty"`
 	OpenStdin bool `json:"open_stdin,omitempty"`
 	StdinOnce bool `json:"stdin_once,omitempty"`
+	// RequestedVolumes captures Config.Volumes from the create body so
+	// inspect can echo it back alongside the image-declared volumes.
+	// We do not auto-create anonymous volumes for these paths today; the
+	// field is purely roundtripped.
+	RequestedVolumes []string `json:"requested_volumes,omitempty"`
 	// HostConfigExtras holds the HostConfig fields we roundtrip through
 	// inspect without enforcing (Privileged, caps, DNS overrides,
 	// resource limits). Portainer's Host Config tab renders these.
@@ -79,16 +87,37 @@ type ContainerRecord struct {
 // HostConfigExtras is the persisted subset of Docker's HostConfig we
 // echo on inspect. Each field maps 1:1 to its Docker counterpart.
 type HostConfigExtras struct {
-	Privileged bool     `json:"privileged,omitempty"`
-	CapAdd     []string `json:"cap_add,omitempty"`
-	CapDrop    []string `json:"cap_drop,omitempty"`
-	ExtraHosts []string `json:"extra_hosts,omitempty"`
-	Dns        []string `json:"dns,omitempty"`
-	DnsSearch  []string `json:"dns_search,omitempty"`
-	DnsOptions []string `json:"dns_options,omitempty"`
-	Memory     int64    `json:"memory,omitempty"`
-	CPUShares  int64    `json:"cpu_shares,omitempty"`
-	NanoCPUs   int64    `json:"nano_cpus,omitempty"`
+	Privileged        bool              `json:"privileged,omitempty"`
+	CapAdd            []string          `json:"cap_add,omitempty"`
+	CapDrop           []string          `json:"cap_drop,omitempty"`
+	ExtraHosts        []string          `json:"extra_hosts,omitempty"`
+	Dns               []string          `json:"dns,omitempty"`
+	DnsSearch         []string          `json:"dns_search,omitempty"`
+	DnsOptions        []string          `json:"dns_options,omitempty"`
+	Memory            int64             `json:"memory,omitempty"`
+	CPUShares         int64             `json:"cpu_shares,omitempty"`
+	NanoCPUs          int64             `json:"nano_cpus,omitempty"`
+	Tmpfs             map[string]string `json:"tmpfs,omitempty"`
+	ReadonlyRootfs    bool              `json:"readonly_rootfs,omitempty"`
+	PidMode           string            `json:"pid_mode,omitempty"`
+	UTSMode           string            `json:"uts_mode,omitempty"`
+	Devices           []DeviceMapping   `json:"devices,omitempty"`
+	DeviceCgroupRules []string          `json:"device_cgroup_rules,omitempty"`
+	UsernsMode        string            `json:"userns_mode,omitempty"`
+	GroupAdd          []string          `json:"group_add,omitempty"`
+	SecurityOpt       []string          `json:"security_opt,omitempty"`
+	Sysctls           map[string]string `json:"sysctls,omitempty"`
+	PidsLimit         int64             `json:"pids_limit,omitempty"`
+	OomScoreAdj       int               `json:"oom_score_adj,omitempty"`
+	LogDriver         string            `json:"log_driver,omitempty"`
+	LogOptions        map[string]string `json:"log_options,omitempty"`
+}
+
+// DeviceMapping mirrors Docker's HostConfig.Devices entries.
+type DeviceMapping struct {
+	PathOnHost        string `json:"path_on_host"`
+	PathInContainer   string `json:"path_in_container,omitempty"`
+	CgroupPermissions string `json:"cgroup_permissions,omitempty"`
 }
 
 // HealthcheckConfig mirrors Docker's Config.Healthcheck. Stored verbatim;
@@ -113,14 +142,24 @@ type RestartPolicy struct {
 
 // NetworkAttachment records a container's membership in a Docker-style network.
 type NetworkAttachment struct {
-	NetworkID  string            `json:"network_id"`
-	IPAddress  string            `json:"ip_address,omitempty"`
-	Gateway    string            `json:"gateway,omitempty"`
-	MacAddress string            `json:"mac_address,omitempty"`
-	EndpointID string            `json:"endpoint_id,omitempty"`
-	Aliases    []string          `json:"aliases,omitempty"`
-	Links      []string          `json:"links,omitempty"`
-	DriverOpts map[string]string `json:"driver_opts,omitempty"`
+	NetworkID  string             `json:"network_id"`
+	IPAddress  string             `json:"ip_address,omitempty"`
+	Gateway    string             `json:"gateway,omitempty"`
+	MacAddress string             `json:"mac_address,omitempty"`
+	EndpointID string             `json:"endpoint_id,omitempty"`
+	Aliases    []string           `json:"aliases,omitempty"`
+	Links      []string           `json:"links,omitempty"`
+	DriverOpts map[string]string  `json:"driver_opts,omitempty"`
+	IPAMConfig *EndpointIPAMConfig `json:"ipam_config,omitempty"`
+}
+
+// EndpointIPAMConfig persists the per-endpoint IPAM block. The daemon
+// does not pin static addresses today; the field is roundtripped so
+// clients can read back what they submitted.
+type EndpointIPAMConfig struct {
+	IPv4Address  string   `json:"ipv4_address,omitempty"`
+	IPv6Address  string   `json:"ipv6_address,omitempty"`
+	LinkLocalIPs []string `json:"link_local_ips,omitempty"`
 }
 
 // PortBinding records a single host→container port mapping.
@@ -206,6 +245,9 @@ type ImageRecord struct {
 	OCIUser        string             `json:"oci_user,omitempty"`
 	OCIStopSignal  string             `json:"oci_stop_signal,omitempty"`
 	OCIHealthcheck *HealthcheckConfig `json:"oci_healthcheck,omitempty"`
+	OCIVolumes     []string           `json:"oci_volumes,omitempty"`
+	OCIShell       []string           `json:"oci_shell,omitempty"`
+	OCIDigest      string             `json:"oci_digest,omitempty"`
 }
 
 type state struct {

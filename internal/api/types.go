@@ -12,23 +12,24 @@ import (
 // ContainerCreateRequest mirrors the relevant subset of the Docker Engine
 // POST /containers/create body.
 type ContainerCreateRequest struct {
-	Image            string            `json:"Image"`
-	Cmd              []string          `json:"Cmd"`
-	Entrypoint       []string          `json:"Entrypoint"`
-	Env              []string          `json:"Env"`
-	Labels           map[string]string `json:"Labels"`
-	WorkingDir       string            `json:"WorkingDir"`
-	User             string            `json:"User"`
-	Domainname       string            `json:"Domainname"`
-	Hostname         string            `json:"Hostname"`
-	Mounts           []MountRequest    `json:"Mounts"`
-	NetworkingConfig NetworkingConfig  `json:"NetworkingConfig"`
-	HostConfig       HostConfig        `json:"HostConfig"`
-	Healthcheck      *HealthConfig     `json:"Healthcheck,omitempty"`
-	StopSignal       string            `json:"StopSignal,omitempty"`
-	Tty              bool              `json:"Tty"`
-	OpenStdin        bool              `json:"OpenStdin"`
-	StdinOnce        bool              `json:"StdinOnce"`
+	Image            string              `json:"Image"`
+	Cmd              []string            `json:"Cmd"`
+	Entrypoint       []string            `json:"Entrypoint"`
+	Env              []string            `json:"Env"`
+	Labels           map[string]string   `json:"Labels"`
+	WorkingDir       string              `json:"WorkingDir"`
+	User             string              `json:"User"`
+	Domainname       string              `json:"Domainname"`
+	Hostname         string              `json:"Hostname"`
+	Mounts           []MountRequest      `json:"Mounts"`
+	Volumes          map[string]struct{} `json:"Volumes"`
+	NetworkingConfig NetworkingConfig    `json:"NetworkingConfig"`
+	HostConfig       HostConfig          `json:"HostConfig"`
+	Healthcheck      *HealthConfig       `json:"Healthcheck,omitempty"`
+	StopSignal       string              `json:"StopSignal,omitempty"`
+	Tty              bool                `json:"Tty"`
+	OpenStdin        bool                `json:"OpenStdin"`
+	StdinOnce        bool                `json:"StdinOnce"`
 }
 
 // HealthConfig is Docker's healthcheck configuration block. We don't
@@ -62,6 +63,18 @@ type HostConfig struct {
 	Dns               []string                 `json:"Dns,omitempty"`
 	DnsSearch         []string                 `json:"DnsSearch,omitempty"`
 	DnsOptions        []string                 `json:"DnsOptions,omitempty"`
+	Mounts            []MountRequest           `json:"Mounts,omitempty"`
+	Tmpfs             map[string]string        `json:"Tmpfs,omitempty"`
+	ReadonlyRootfs    bool                     `json:"ReadonlyRootfs,omitempty"`
+	PidMode           string                   `json:"PidMode,omitempty"`
+	UTSMode           string                   `json:"UTSMode,omitempty"`
+	UsernsMode        string                   `json:"UsernsMode,omitempty"`
+	GroupAdd          []string                 `json:"GroupAdd,omitempty"`
+	SecurityOpt       []string                 `json:"SecurityOpt,omitempty"`
+	Sysctls           map[string]string        `json:"Sysctls,omitempty"`
+	PidsLimit         int64                    `json:"PidsLimit,omitempty"`
+	OomScoreAdj       int                      `json:"OomScoreAdj,omitempty"`
+	LogConfig         *LogConfig               `json:"LogConfig,omitempty"`
 	// AutoRemove mirrors Docker's --rm flag. When true, the daemon creates
 	// the container as ephemeral (no PVE UI presence; reaped by GC after
 	// it exits). Default false → permanent PVE CT in PVE mode.
@@ -73,6 +86,15 @@ type DeviceMapping struct {
 	PathOnHost        string `json:"PathOnHost"`
 	PathInContainer   string `json:"PathInContainer"`
 	CgroupPermissions string `json:"CgroupPermissions"`
+}
+
+// LogConfig mirrors Docker's HostConfig.LogConfig. We don't actually
+// route container output through alternate log drivers — the daemon
+// always writes to lxc-start's console log — but Portainer's "Log
+// driver" dropdown reads the type back from inspect.
+type LogConfig struct {
+	Type   string            `json:"Type"`
+	Config map[string]string `json:"Config,omitempty"`
 }
 
 // PortBinding maps a container port to a host port.
@@ -123,10 +145,13 @@ type ContainerJSON struct {
 // MountJSON represents a mount in the inspect response.
 type MountJSON struct {
 	Type        string `json:"Type"`
+	Name        string `json:"Name,omitempty"`
+	Driver      string `json:"Driver,omitempty"`
 	Source      string `json:"Source"`
 	Destination string `json:"Destination"`
 	Mode        string `json:"Mode"`
 	RW          bool   `json:"RW"`
+	Propagation string `json:"Propagation,omitempty"`
 }
 
 // ContainerState holds the runtime state of a container.
@@ -174,7 +199,9 @@ type ContainerConfig struct {
 	Labels       map[string]string   `json:"Labels"`
 	WorkingDir   string              `json:"WorkingDir"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+	Volumes      map[string]struct{} `json:"Volumes,omitempty"`
 	StopSignal   string              `json:"StopSignal,omitempty"`
+	Shell        []string            `json:"Shell,omitempty"`
 	Healthcheck  *HealthConfig       `json:"Healthcheck,omitempty"`
 	Tty          bool                `json:"Tty"`
 	OpenStdin    bool                `json:"OpenStdin"`
@@ -186,21 +213,40 @@ type ContainerConfig struct {
 
 // NetworkSettings holds the IP and network info for a container.
 type NetworkSettings struct {
-	IPAddress string                      `json:"IPAddress"`
-	Networks  map[string]EndpointSettings `json:"Networks"`
-	Ports     map[string][]PortBinding    `json:"Ports,omitempty"`
+	Bridge                 string                      `json:"Bridge"`
+	SandboxID              string                      `json:"SandboxID,omitempty"`
+	SandboxKey             string                      `json:"SandboxKey,omitempty"`
+	HairpinMode            bool                        `json:"HairpinMode"`
+	LinkLocalIPv6Address   string                      `json:"LinkLocalIPv6Address,omitempty"`
+	LinkLocalIPv6PrefixLen int                         `json:"LinkLocalIPv6PrefixLen,omitempty"`
+	Gateway                string                      `json:"Gateway"`
+	IPAddress              string                      `json:"IPAddress"`
+	IPPrefixLen            int                         `json:"IPPrefixLen"`
+	MacAddress             string                      `json:"MacAddress,omitempty"`
+	EndpointID             string                      `json:"EndpointID,omitempty"`
+	Networks               map[string]EndpointSettings `json:"Networks"`
+	Ports                  map[string][]PortBinding    `json:"Ports,omitempty"`
 }
 
 // EndpointSettings is a per-network settings block.
 type EndpointSettings struct {
-	IPAddress  string            `json:"IPAddress"`
-	Gateway    string            `json:"Gateway"`
-	MacAddress string            `json:"MacAddress"`
-	NetworkID  string            `json:"NetworkID"`
-	EndpointID string            `json:"EndpointID,omitempty"`
-	Aliases    []string          `json:"Aliases,omitempty"`
-	Links      []string          `json:"Links,omitempty"`
-	DriverOpts map[string]string `json:"DriverOpts,omitempty"`
+	IPAddress  string             `json:"IPAddress"`
+	Gateway    string             `json:"Gateway"`
+	MacAddress string             `json:"MacAddress"`
+	NetworkID  string             `json:"NetworkID"`
+	EndpointID string             `json:"EndpointID,omitempty"`
+	Aliases    []string           `json:"Aliases,omitempty"`
+	Links      []string           `json:"Links,omitempty"`
+	DriverOpts map[string]string  `json:"DriverOpts,omitempty"`
+	IPAMConfig *EndpointIPAMConfig `json:"IPAMConfig,omitempty"`
+}
+
+// EndpointIPAMConfig pins a static address (or LinkLocalIPs) on a single
+// network attachment. Compose deploys often supply IPv4Address here.
+type EndpointIPAMConfig struct {
+	IPv4Address  string   `json:"IPv4Address,omitempty"`
+	IPv6Address  string   `json:"IPv6Address,omitempty"`
+	LinkLocalIPs []string `json:"LinkLocalIPs,omitempty"`
 }
 
 // --- Container List ---
@@ -292,8 +338,10 @@ type ImageConfig struct {
 	WorkingDir   string              `json:"WorkingDir"`
 	Labels       map[string]string   `json:"Labels"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+	Volumes      map[string]struct{} `json:"Volumes,omitempty"`
 	User         string              `json:"User,omitempty"`
 	StopSignal   string              `json:"StopSignal,omitempty"`
+	Shell        []string            `json:"Shell,omitempty"`
 	Healthcheck  *HealthConfig       `json:"Healthcheck,omitempty"`
 }
 
@@ -490,6 +538,7 @@ type MemoryStats struct {
 	Usage    uint64         `json:"usage"`
 	MaxUsage uint64         `json:"max_usage"`
 	Limit    uint64         `json:"limit"`
+	Failcnt  uint64         `json:"failcnt"`
 	Stats    map[string]any `json:"stats"`
 }
 

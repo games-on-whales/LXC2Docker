@@ -305,6 +305,7 @@ func (h *Handler) connectNetwork(w http.ResponseWriter, r *http.Request) {
 		Aliases:    append([]string{}, req.EndpointConfig.Aliases...),
 		Links:      append([]string{}, req.EndpointConfig.Links...),
 		DriverOpts: copyStringMap(req.EndpointConfig.DriverOpts),
+		IPAMConfig: endpointIPAMToStore(req.EndpointConfig.IPAMConfig),
 	}
 	if err := h.store.AddContainer(rec); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())

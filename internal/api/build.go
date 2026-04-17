@@ -31,6 +31,8 @@ type buildState struct {
 	user        string
 	stopSignal  string
 	healthcheck *oci.ImageHealthcheck
+	volumes     []string
+	shell       []string
 }
 
 type dockerfileInstruction struct {
@@ -199,7 +201,7 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	for i, inst := range instrs {
 		send(map[string]string{"stream": fmt.Sprintf("Step %d: %s %s\n", i+3, inst.op, inst.args)})
 		switch inst.op {
-		case "FROM", "LABEL", "ARG", "USER", "STOPSIGNAL", "HEALTHCHECK":
+		case "FROM", "LABEL", "ARG", "USER", "STOPSIGNAL", "HEALTHCHECK", "VOLUME", "SHELL":
 			continue
 		case "WORKDIR":
 			dst := resolveContainerPath(state.workdir, inst.args)
@@ -222,7 +224,12 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 			if state.workdir != "" {
 				script = fmt.Sprintf("mkdir -p %q && cd %q && %s", state.workdir, state.workdir, inst.args)
 			}
-			cmd := exec.Command("chroot", rootfs, "/bin/sh", "-lc", script)
+			// Prefix chroot to the declared SHELL (default /bin/sh -lc) so
+			// subsequent RUN invocations obey a user-set SHELL directive.
+			shellArgs := runShell(state.shell)
+			args := append([]string{rootfs}, shellArgs...)
+			args = append(args, script)
+			cmd := exec.Command("chroot", args...)
 			cmd.Env = append(os.Environ(), state.env...)
 			out, err := cmd.CombinedOutput()
 			if len(out) > 0 {
@@ -402,6 +409,13 @@ func evaluateBuildState(instrs []dockerfileInstruction) (buildState, error) {
 				return state, err
 			}
 			state.healthcheck = hc
+		case "VOLUME":
+			for _, v := range parseVolumeInstruction(inst.args) {
+				state.volumes = append(state.volumes, v)
+			}
+		case "SHELL":
+			// SHELL only accepts the exec form, e.g. SHELL ["/bin/bash","-c"].
+			state.shell = parseCommandInstruction(inst.args)
 		}
 	}
 	if state.baseRef == "" {
@@ -480,6 +494,40 @@ func parseHealthcheckInstruction(args string) (*oci.ImageHealthcheck, error) {
 		out.Test = []string{"CMD-SHELL", cmdArgs}
 	}
 	return out, nil
+}
+
+// runShell returns the shell + flags a RUN instruction should invoke.
+// Defaults to /bin/sh -lc (matching Docker) when the Dockerfile didn't
+// declare SHELL. SHELL entries take the place of the shell path; we
+// append -c so the script string arrives as a single argument.
+func runShell(declared []string) []string {
+	if len(declared) == 0 {
+		return []string{"/bin/sh", "-lc"}
+	}
+	out := append([]string{}, declared...)
+	needsC := true
+	for _, a := range declared[1:] {
+		if a == "-c" || a == "-lc" {
+			needsC = false
+			break
+		}
+	}
+	if needsC {
+		out = append(out, "-c")
+	}
+	return out
+}
+
+// parseVolumeInstruction parses a Dockerfile VOLUME directive. Accepts
+// both the JSON array form (VOLUME ["/data","/logs"]) and the whitespace-
+// separated form (VOLUME /data /logs). Returns the declared paths.
+func parseVolumeInstruction(args string) []string {
+	args = strings.TrimSpace(args)
+	if strings.HasPrefix(args, "[") {
+		// Delegate to the command parser which already decodes JSON arrays.
+		return parseCommandInstruction(args)
+	}
+	return splitShellTokens(args)
 }
 
 // parseLabelInstruction parses Dockerfile LABEL arg tokens. Supports both the
@@ -854,6 +902,8 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 			OCIUser:         state.user,
 			OCIStopSignal:   state.stopSignal,
 			OCIHealthcheck:  buildHealthcheckToStore(state.healthcheck),
+			OCIVolumes:      append([]string{}, state.volumes...),
+			OCIShell:        append([]string{}, state.shell...),
 		})
 	}
 
@@ -884,6 +934,8 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 		OCIUser:        state.user,
 		OCIStopSignal:  state.stopSignal,
 		OCIHealthcheck: buildHealthcheckToStore(state.healthcheck),
+		OCIVolumes:     append([]string{}, state.volumes...),
+		OCIShell:       append([]string{}, state.shell...),
 	})
 }
 

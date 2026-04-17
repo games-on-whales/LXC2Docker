@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -252,6 +253,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Tty:              req.Tty,
 		OpenStdin:        req.OpenStdin,
 		StdinOnce:        req.StdinOnce,
+		RequestedVolumes: sortedKeys(req.Volumes),
 	}
 	rec.Networks = defaultContainerNetworks(rec)
 	if err := attachRequestedNetworks(h.store, rec, req.NetworkingConfig); err != nil {
@@ -362,6 +364,8 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			}
 			mounts = append(mounts, MountJSON{
 				Type:        mountType,
+				Name:        m.Name,
+				Driver:      volumeDriverFor(h.store, mountType, m.Name),
 				Source:      m.Source,
 				Destination: m.Destination,
 				Mode:        mode,
@@ -444,6 +448,8 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		mounts = append(mounts, MountJSON{
 			Type:        mountType,
+			Name:        m.Name,
+			Driver:      volumeDriverFor(h.store, mountType, m.Name),
 			Source:      m.Source,
 			Destination: m.Destination,
 			Mode:        mode,
@@ -477,16 +483,17 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 	includeSize := r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true"
 
 	resp := ContainerJSON{
-		ID:       rec.ID,
-		Created:  rec.Created.Format(time.RFC3339),
-		Path:     path,
-		Args:     args,
-		Name:     "/" + rec.Name,
-		Driver:   "lxc",
-		Platform: "linux",
-		Image:    rec.Image,
-		ImageID:  rec.ImageID,
-		LogPath:  h.mgr.LogPath(id),
+		ID:           rec.ID,
+		Created:      rec.Created.Format(time.RFC3339),
+		Path:         path,
+		Args:         args,
+		Name:         "/" + rec.Name,
+		Driver:       "lxc",
+		Platform:     "linux",
+		RestartCount: rec.RestartCount,
+		Image:        rec.Image,
+		ImageID:      rec.ImageID,
+		LogPath:      h.mgr.LogPath(id),
 		State: ContainerState{
 			Status:     state,
 			Running:    running,
@@ -507,18 +514,16 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Labels:       rec.Labels,
 			WorkingDir:   rec.WorkingDir,
 			ExposedPorts: imageExposedPorts(h.store, rec),
+			Volumes:      containerVolumesSet(h.store, rec),
 			StopSignal:   rec.StopSignal,
+			Shell:        containerShell(h.store, rec),
 			Healthcheck:  healthcheckFromRecord(rec.Healthcheck),
 			Tty:          rec.Tty,
 			OpenStdin:    rec.OpenStdin,
 			StdinOnce:    rec.StdinOnce,
 		},
 		HostConfig: hostConfig,
-		NetworkSettings: NetworkSettings{
-			IPAddress: rec.IPAddress,
-			Networks:  buildContainerEndpoints(rec),
-			Ports:     hostConfig.PortBindings,
-		},
+		NetworkSettings: containerNetworkSettings(h.mgr, rec, hostConfig.PortBindings),
 	}
 	if includeSize {
 		size, _ := dirSize(h.mgr.RootfsPath(id))
@@ -535,20 +540,65 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 func hostConfigExtrasFromRequest(hc HostConfig) *store.HostConfigExtras {
 	if !hc.Privileged && len(hc.CapAdd) == 0 && len(hc.CapDrop) == 0 &&
 		len(hc.ExtraHosts) == 0 && len(hc.Dns) == 0 && len(hc.DnsSearch) == 0 &&
-		len(hc.DnsOptions) == 0 && hc.Memory == 0 && hc.CPUShares == 0 && hc.NanoCPUs == 0 {
+		len(hc.DnsOptions) == 0 && hc.Memory == 0 && hc.CPUShares == 0 &&
+		hc.NanoCPUs == 0 && len(hc.Tmpfs) == 0 && !hc.ReadonlyRootfs &&
+		hc.PidMode == "" && hc.UTSMode == "" && len(hc.Devices) == 0 &&
+		len(hc.DeviceCgroupRules) == 0 && hc.UsernsMode == "" &&
+		len(hc.GroupAdd) == 0 && len(hc.SecurityOpt) == 0 &&
+		len(hc.Sysctls) == 0 && hc.PidsLimit == 0 && hc.OomScoreAdj == 0 &&
+		hc.LogConfig == nil {
 		return nil
 	}
+	tmpfs := map[string]string{}
+	for k, v := range hc.Tmpfs {
+		tmpfs[k] = v
+	}
+	if len(tmpfs) == 0 {
+		tmpfs = nil
+	}
+	devices := make([]store.DeviceMapping, 0, len(hc.Devices))
+	for _, d := range hc.Devices {
+		devices = append(devices, store.DeviceMapping{
+			PathOnHost:        d.PathOnHost,
+			PathInContainer:   d.PathInContainer,
+			CgroupPermissions: d.CgroupPermissions,
+		})
+	}
+	if len(devices) == 0 {
+		devices = nil
+	}
+	sysctls := copyStringMap(hc.Sysctls)
+	logDriver := ""
+	logOptions := map[string]string(nil)
+	if hc.LogConfig != nil {
+		logDriver = hc.LogConfig.Type
+		logOptions = copyStringMap(hc.LogConfig.Config)
+	}
 	return &store.HostConfigExtras{
-		Privileged: hc.Privileged,
-		CapAdd:     append([]string{}, hc.CapAdd...),
-		CapDrop:    append([]string{}, hc.CapDrop...),
-		ExtraHosts: append([]string{}, hc.ExtraHosts...),
-		Dns:        append([]string{}, hc.Dns...),
-		DnsSearch:  append([]string{}, hc.DnsSearch...),
-		DnsOptions: append([]string{}, hc.DnsOptions...),
-		Memory:     hc.Memory,
-		CPUShares:  hc.CPUShares,
-		NanoCPUs:   hc.NanoCPUs,
+		Privileged:        hc.Privileged,
+		CapAdd:            append([]string{}, hc.CapAdd...),
+		CapDrop:           append([]string{}, hc.CapDrop...),
+		ExtraHosts:        append([]string{}, hc.ExtraHosts...),
+		Dns:               append([]string{}, hc.Dns...),
+		DnsSearch:         append([]string{}, hc.DnsSearch...),
+		DnsOptions:        append([]string{}, hc.DnsOptions...),
+		Memory:            hc.Memory,
+		CPUShares:         hc.CPUShares,
+		NanoCPUs:          hc.NanoCPUs,
+		Tmpfs:             tmpfs,
+		ReadonlyRootfs:    hc.ReadonlyRootfs,
+		PidMode:           hc.PidMode,
+		UTSMode:           hc.UTSMode,
+		Devices:           devices,
+		DeviceCgroupRules: append([]string{}, hc.DeviceCgroupRules...),
+		UsernsMode:        hc.UsernsMode,
+		GroupAdd:          append([]string{}, hc.GroupAdd...),
+		SecurityOpt:       append([]string{}, hc.SecurityOpt...),
+		Sysctls:           sysctls,
+		PidsLimit:         hc.PidsLimit,
+		OomScoreAdj:       hc.OomScoreAdj,
+		LogDriver:         logDriver,
+		LogOptions:        logOptions,
 	}
 }
 
@@ -566,6 +616,111 @@ func healthcheckFromRecord(h *store.HealthcheckConfig) *HealthConfig {
 		StartInterval: h.StartInterval,
 		Retries:       h.Retries,
 	}
+}
+
+// containerNetworkSettings builds the NetworkSettings block for inspect.
+// Pulls top-level Bridge from the LXC bridge name, top-level IP/Gateway/
+// MAC from the first attached endpoint (matching Docker's behaviour for
+// containers with one network), and SandboxKey from the container's init
+// PID's net namespace path so Portainer's Network tab can deep-link.
+func containerNetworkSettings(mgr *lxc.Manager, rec *store.ContainerRecord, ports map[string][]PortBinding) NetworkSettings {
+	endpoints := buildContainerEndpoints(rec)
+	out := NetworkSettings{
+		Bridge:    lxc.BridgeName,
+		IPAddress: rec.IPAddress,
+		Networks:  endpoints,
+		Ports:     ports,
+	}
+	// Pick a primary endpoint to expose at the top level — prefer "gow"
+	// when present, otherwise the first one encountered.
+	var primary *EndpointSettings
+	if e, ok := endpoints["gow"]; ok {
+		primary = &e
+	} else {
+		for k := range endpoints {
+			e := endpoints[k]
+			primary = &e
+			break
+		}
+	}
+	if primary != nil {
+		if out.IPAddress == "" {
+			out.IPAddress = primary.IPAddress
+		}
+		out.Gateway = primary.Gateway
+		out.MacAddress = primary.MacAddress
+		out.EndpointID = primary.EndpointID
+		if primary.IPAddress != "" {
+			// Default LXC bridge subnet is /24.
+			out.IPPrefixLen = 24
+		}
+	}
+	if pid, err := mgr.InitPID(rec.ID); err == nil && pid > 0 {
+		out.SandboxKey = fmt.Sprintf("/proc/%d/ns/net", pid)
+		out.SandboxID = fmt.Sprintf("sandbox-%d", pid)
+	}
+	return out
+}
+
+// containerShell returns the shell that should appear on Config.Shell for
+// inspect — inherited from the image's OCIShell metadata. Returns nil when
+// the image didn't declare one so omitempty hides the field.
+func containerShell(st *store.Store, rec *store.ContainerRecord) []string {
+	if img := st.GetImage(normalizeImageRef(rec.Image)); img != nil && len(img.OCIShell) > 0 {
+		return append([]string{}, img.OCIShell...)
+	}
+	return nil
+}
+
+// volumeDriverFor returns the driver to report on a mount entry. Named
+// volume mounts (Type=="volume") inherit the driver from the volume
+// record; bind mounts have no driver.
+func volumeDriverFor(st *store.Store, mountType, name string) string {
+	if mountType != "volume" || name == "" {
+		return ""
+	}
+	if v := st.GetVolume(name); v != nil {
+		return orDefault(v.Driver, "local")
+	}
+	return ""
+}
+
+// containerVolumesSet computes the union of image-declared volumes
+// (OCIVolumes on the image record) and request-declared volumes
+// (Config.Volumes). Returns nil when both sides are empty so inspect's
+// omitempty hides the field from the response.
+func containerVolumesSet(st *store.Store, rec *store.ContainerRecord) map[string]struct{} {
+	out := map[string]struct{}{}
+	if img := st.GetImage(normalizeImageRef(rec.Image)); img != nil {
+		for _, v := range img.OCIVolumes {
+			if v != "" {
+				out[v] = struct{}{}
+			}
+		}
+	}
+	for _, v := range rec.RequestedVolumes {
+		if v != "" {
+			out[v] = struct{}{}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// sortedKeys returns the keys of m as a sorted slice. Used to persist
+// the Config.Volumes request map in a deterministic order.
+func sortedKeys(m map[string]struct{}) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // imageExposedPorts returns the ExposedPorts map Docker surfaces on
@@ -1079,6 +1234,7 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 		rec.StartedAt = &now
 		rec.FinishedAt = nil
 		rec.ExitCode = 0
+		rec.RestartCount++
 		h.store.AddContainer(rec)
 		h.publishEvent("container", "restart", id, map[string]string{
 			"name":  rec.Name,
@@ -1711,6 +1867,52 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 		hc.Memory = e.Memory
 		hc.CPUShares = e.CPUShares
 		hc.NanoCPUs = e.NanoCPUs
+		hc.ReadonlyRootfs = e.ReadonlyRootfs
+		hc.PidMode = e.PidMode
+		hc.UTSMode = e.UTSMode
+		if len(e.Tmpfs) > 0 {
+			hc.Tmpfs = map[string]string{}
+			for k, v := range e.Tmpfs {
+				hc.Tmpfs[k] = v
+			}
+		}
+		for _, d := range e.Devices {
+			hc.Devices = append(hc.Devices, DeviceMapping{
+				PathOnHost:        d.PathOnHost,
+				PathInContainer:   d.PathInContainer,
+				CgroupPermissions: d.CgroupPermissions,
+			})
+		}
+		hc.DeviceCgroupRules = append([]string{}, e.DeviceCgroupRules...)
+		hc.UsernsMode = e.UsernsMode
+		hc.GroupAdd = append([]string{}, e.GroupAdd...)
+		hc.SecurityOpt = append([]string{}, e.SecurityOpt...)
+		hc.Sysctls = copyStringMap(e.Sysctls)
+		hc.PidsLimit = e.PidsLimit
+		hc.OomScoreAdj = e.OomScoreAdj
+		if e.LogDriver != "" {
+			hc.LogConfig = &LogConfig{
+				Type:   e.LogDriver,
+				Config: copyStringMap(e.LogOptions),
+			}
+		}
+	}
+	// Reflect the stored mounts into HostConfig.Mounts — Docker's modern
+	// mount form. Portainer's container-edit dialog reads this alongside
+	// Binds; emitting both keeps old and new clients happy.
+	for _, m := range rec.Mounts {
+		src := m.Source
+		if m.Name != "" {
+			// Named volumes use the volume name as the source; bind mounts
+			// use the host path.
+			src = m.Name
+		}
+		hc.Mounts = append(hc.Mounts, MountRequest{
+			Type:     orDefault(m.Type, "bind"),
+			Source:   src,
+			Target:   m.Destination,
+			ReadOnly: m.ReadOnly,
+		})
 	}
 	return hc
 }

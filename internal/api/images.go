@@ -48,6 +48,7 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 		out = append(out, ImageSummary{
 			ID:          "sha256:" + rec.ID,
 			RepoTags:    []string{rec.Ref},
+			RepoDigests: repoDigestsFor(rec),
 			Created:     rec.Created.Unix(),
 			Size:        size,
 			VirtualSize: size,
@@ -179,7 +180,7 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, ImageInspect{
 		ID:              id,
 		RepoTags:        []string{rec.Ref},
-		RepoDigests:     []string{},
+		RepoDigests:     repoDigestsFor(rec),
 		Created:         rec.Created.Format(time.RFC3339),
 		Architecture:    rec.Arch,
 		Os:              "linux",
@@ -373,6 +374,21 @@ func (h *Handler) pushImage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// repoDigestsFor returns the RepoDigests slice for an image record. Docker
+// formats it as "<repo>@<digest>" so Portainer's image detail surfaces a
+// pin-able digest reference. Returns an empty slice when the image was
+// loaded from a non-registry source (no digest captured).
+func repoDigestsFor(rec *store.ImageRecord) []string {
+	if rec == nil || rec.OCIDigest == "" {
+		return []string{}
+	}
+	repo, _ := splitImageRef(rec.Ref)
+	if repo == "" {
+		return []string{}
+	}
+	return []string{repo + "@" + rec.OCIDigest}
+}
+
 // imageConfigFromRecord materialises an ImageConfig from the OCI metadata
 // captured during pull. ExposedPorts is built from OCIPorts (strings like
 // "80/tcp") using the map-of-empty-struct shape Docker returns.
@@ -383,6 +399,16 @@ func imageConfigFromRecord(rec *store.ImageRecord) *ImageConfig {
 			exposed[p] = struct{}{}
 		}
 	}
+	volumes := map[string]struct{}{}
+	for _, v := range rec.OCIVolumes {
+		if v != "" {
+			volumes[v] = struct{}{}
+		}
+	}
+	var volumesMap map[string]struct{}
+	if len(volumes) > 0 {
+		volumesMap = volumes
+	}
 	return &ImageConfig{
 		Hostname:     "",
 		Image:        rec.Ref,
@@ -392,8 +418,10 @@ func imageConfigFromRecord(rec *store.ImageRecord) *ImageConfig {
 		WorkingDir:   rec.OCIWorkingDir,
 		Labels:       copyLabels(rec.OCILabels),
 		ExposedPorts: exposed,
+		Volumes:      volumesMap,
 		User:         rec.OCIUser,
 		StopSignal:   rec.OCIStopSignal,
+		Shell:        append([]string{}, rec.OCIShell...),
 		Healthcheck:  healthcheckFromRecord(rec.OCIHealthcheck),
 	}
 }
