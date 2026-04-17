@@ -523,6 +523,11 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	stdout := r.URL.Query().Get("stdout") == "1" || r.URL.Query().Get("stdout") == "true"
 	stderr := r.URL.Query().Get("stderr") == "1" || r.URL.Query().Get("stderr") == "true"
 	follow := r.URL.Query().Get("follow") == "1" || r.URL.Query().Get("follow") == "true"
+	tailLines, err := parseTailLines(r.URL.Query().Get("tail"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	if !stdout && !stderr {
 		stdout = true
@@ -546,10 +551,22 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 	w.WriteHeader(http.StatusOK)
 
+	lines := make([]string, 0, 128)
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		line := scanner.Bytes()
-		writeLogFrame(w, 1, append(line, '\n')) // treat all console output as stdout
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return
+	}
+	if tailLines >= 0 && len(lines) > tailLines {
+		lines = lines[len(lines)-tailLines:]
+	}
+	for _, line := range lines {
+		writeLogFrame(w, 1, append([]byte(line), '\n'))
+	}
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
 	}
 
 	if follow {
@@ -577,6 +594,18 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+func parseTailLines(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "all" {
+		return -1, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid tail value %q", raw)
+	}
+	return n, nil
 }
 
 // POST /containers/{id}/restart
