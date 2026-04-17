@@ -107,3 +107,67 @@ func matchesLabelFilter(filters []string, labels map[string]string) bool {
 	}
 	return true
 }
+
+// matchesNetworkFilters applies /networks filter keys (driver, id, name,
+// scope, type, label) to a single network record.
+func matchesNetworkFilters(n *store.NetworkRecord, f listFilters) bool {
+	if !f.anyMatch("driver", n.Driver) {
+		return false
+	}
+	if !f.anyMatch("id", n.ID) {
+		return false
+	}
+	if !f.anyMatch("name", n.Name) {
+		return false
+	}
+	if !f.anyMatch("scope", n.Scope) {
+		return false
+	}
+	// Docker's "type" filter bucketises into "builtin" vs "custom". We don't
+	// track a bucket, so custom networks always match "custom" and the
+	// default gow network is "builtin".
+	if vals := f["type"]; len(vals) > 0 {
+		bucket := "custom"
+		if n.Name == "gow" {
+			bucket = "builtin"
+		}
+		if !f.anyMatch("type", bucket) {
+			return false
+		}
+	}
+	if !matchesLabelFilter(f["label"], n.Labels) {
+		return false
+	}
+	return true
+}
+
+// matchesVolumeFilters applies /volumes filter keys (driver, name, label,
+// dangling) to a single volume record. dangling=true keeps volumes with no
+// referencing container; refCount is supplied by the caller.
+func matchesVolumeFilters(v *store.VolumeRecord, refCount int, f listFilters) bool {
+	if !f.anyMatch("driver", orDefault(v.Driver, "local")) {
+		return false
+	}
+	if !f.anyMatch("name", v.Name) {
+		return false
+	}
+	if !matchesLabelFilter(f["label"], v.Labels) {
+		return false
+	}
+	if vals := f["dangling"]; len(vals) > 0 {
+		want := false
+		for _, val := range vals {
+			if val == "true" || val == "1" {
+				want = true
+			}
+		}
+		isDangling := refCount == 0
+		if want && !isDangling {
+			return false
+		}
+		if !want && isDangling {
+			return false
+		}
+	}
+	return true
+}

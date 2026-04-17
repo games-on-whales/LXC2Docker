@@ -11,9 +11,26 @@ import (
 )
 
 func (h *Handler) listVolumes(w http.ResponseWriter, r *http.Request) {
+	filters, err := parseListFilters(r.URL.Query().Get("filters"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
+		return
+	}
+	// Pre-compute refCount per volume so the filter can honour dangling=true.
+	refCount := map[string]int{}
+	for _, c := range h.store.ListContainers() {
+		for _, m := range c.Mounts {
+			if m.Name != "" {
+				refCount[m.Name]++
+			}
+		}
+	}
 	vols := h.store.ListVolumes()
 	out := make([]VolumeUsage, 0, len(vols))
 	for _, v := range vols {
+		if !matchesVolumeFilters(v, refCount[v.Name], filters) {
+			continue
+		}
 		size, _ := dirSize(v.Mountpoint)
 		out = append(out, volumeUsage(h.store, v, size))
 	}

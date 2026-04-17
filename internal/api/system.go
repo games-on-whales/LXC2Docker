@@ -165,8 +165,28 @@ func cgroupVersion() string {
 
 // --- network stubs (Docker clients query networks when creating containers) ---
 func (h *Handler) listNetworks(w http.ResponseWriter, r *http.Request) {
-	networks := []NetworkResource{h.defaultNetworkResource()}
+	filters, err := parseListFilters(r.URL.Query().Get("filters"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
+		return
+	}
+	networks := []NetworkResource{}
+	// The built-in gow network synthesises a store-less record; build a
+	// shim so the same filter matcher decides whether to include it.
+	gowShim := &store.NetworkRecord{
+		ID:     "gow",
+		Name:   "gow",
+		Driver: "bridge",
+		Scope:  "local",
+		Labels: map[string]string{},
+	}
+	if matchesNetworkFilters(gowShim, filters) {
+		networks = append(networks, h.defaultNetworkResource())
+	}
 	for _, n := range h.store.ListNetworks() {
+		if !matchesNetworkFilters(n, filters) {
+			continue
+		}
 		networks = append(networks, h.networkResource(n))
 	}
 	jsonResponse(w, http.StatusOK, networks)
