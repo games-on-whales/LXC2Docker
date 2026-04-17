@@ -118,9 +118,7 @@ func (h *Handler) snapshotContainerStats(id string) ContainerStats {
 			Usage:    memUsage,
 			MaxUsage: memUsage,
 			Limit:    memLimit,
-			Stats: map[string]any{
-				"cache": readUint64(filepath.Join("/sys/fs/cgroup", cg, "memory.stat.cache")),
-			},
+			Stats:    readMemoryStat(filepath.Join("/sys/fs/cgroup", cg, "memory.stat")),
 		},
 		Networks: h.snapshotNetStats(id),
 	}
@@ -240,6 +238,40 @@ func blkioEntry(major, minor uint64, op string, value uint64) map[string]any {
 		"op":    op,
 		"value": value,
 	}
+}
+
+// readMemoryStat parses cgroup v2's memory.stat (one "key value" pair per
+// line) and also synthesises the cgroup v1 keys Docker's UI — and therefore
+// Portainer's memory chart — historically reads: "cache" maps to v2's
+// "file", "rss" maps to "anon".
+func readMemoryStat(path string) map[string]any {
+	stats := map[string]any{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return stats
+	}
+	raw := map[string]uint64{}
+	for _, line := range strings.Split(string(data), "\n") {
+		k, v, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			continue
+		}
+		raw[k] = n
+		stats[k] = n
+	}
+	// Docker's classic field names — keep them present so older clients
+	// (including Portainer's memory chart) don't show zeros.
+	if _, ok := stats["cache"]; !ok {
+		stats["cache"] = raw["file"]
+	}
+	if _, ok := stats["rss"]; !ok {
+		stats["rss"] = raw["anon"]
+	}
+	return stats
 }
 
 func mountTypeForSource(st *store.Store, source string) string {
