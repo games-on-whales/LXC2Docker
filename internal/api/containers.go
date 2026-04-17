@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -824,7 +825,7 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 	w.WriteHeader(http.StatusOK)
-	runExecTTYOutput(cmd, w)
+	runAttachFallback(cmd, r.Body, w)
 }
 
 // safeJoin joins base and untrusted path, returning an error if the result
@@ -1001,6 +1002,26 @@ func writeLogFrame(w io.Writer, streamType byte, data []byte) {
 	binary.BigEndian.PutUint32(header[4:], uint32(len(data)))
 	w.Write(header)
 	w.Write(data)
+}
+
+func runAttachFallback(cmd *exec.Cmd, stdin io.Reader, w http.ResponseWriter) {
+	cmd.Stdin = stdin
+	fw := flushWriter{w: w}
+	cmd.Stdout = fw
+	cmd.Stderr = fw
+	_ = cmd.Run()
+}
+
+type flushWriter struct {
+	w http.ResponseWriter
+}
+
+func (f flushWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if fl, ok := f.w.(http.Flusher); ok {
+		fl.Flush()
+	}
+	return n, err
 }
 
 // stateToStatus returns a human-readable status string like Docker's "Up 2 hours".
