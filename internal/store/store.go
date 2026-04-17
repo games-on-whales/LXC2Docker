@@ -57,6 +57,19 @@ type ContainerRecord struct {
 	// StopSignal mirrors Docker's Config.StopSignal field (e.g. "SIGINT").
 	// We don't map it into lxc-stop, but Portainer reads it from inspect.
 	StopSignal string `json:"stop_signal,omitempty"`
+	// WorkingDir mirrors Docker's Config.WorkingDir so inspect echoes
+	// what the user picked instead of always reporting empty.
+	WorkingDir string `json:"working_dir,omitempty"`
+	// User/Domainname/Hostname mirror their Config counterparts. The
+	// daemon does not actually drop privileges to User today.
+	User       string `json:"user,omitempty"`
+	Domainname string `json:"domainname,omitempty"`
+	Hostname   string `json:"hostname,omitempty"`
+	// Tty/OpenStdin/StdinOnce mirror the Config flags; currently not
+	// propagated to lxc-start but roundtrip through inspect.
+	Tty       bool `json:"tty,omitempty"`
+	OpenStdin bool `json:"open_stdin,omitempty"`
+	StdinOnce bool `json:"stdin_once,omitempty"`
 	// HostConfigExtras holds the HostConfig fields we roundtrip through
 	// inspect without enforcing (Privileged, caps, DNS overrides,
 	// resource limits). Portainer's Host Config tab renders these.

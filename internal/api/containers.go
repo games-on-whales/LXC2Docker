@@ -229,6 +229,13 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Healthcheck:      health,
 		StopSignal:       req.StopSignal,
 		HostConfigExtras: extras,
+		WorkingDir:       workingDir,
+		User:             req.User,
+		Domainname:       req.Domainname,
+		Hostname:         req.Hostname,
+		Tty:              req.Tty,
+		OpenStdin:        req.OpenStdin,
+		StdinOnce:        req.StdinOnce,
 	}
 	rec.Networks = defaultContainerNetworks(rec)
 	if err := attachRequestedNetworks(h.store, rec, req.NetworkingConfig); err != nil {
@@ -474,15 +481,21 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		},
 		Mounts: mounts,
 		Config: &ContainerConfig{
-			Hostname:     rec.ID[:12],
+			Hostname:     orDefault(rec.Hostname, rec.ID[:12]),
+			Domainname:   rec.Domainname,
+			User:         rec.User,
 			Image:        rec.Image,
 			Cmd:          rec.Cmd,
 			Entrypoint:   rec.Entrypoint,
 			Env:          rec.Env,
 			Labels:       rec.Labels,
+			WorkingDir:   rec.WorkingDir,
 			ExposedPorts: imageExposedPorts(h.store, rec),
 			StopSignal:   rec.StopSignal,
 			Healthcheck:  healthcheckFromRecord(rec.Healthcheck),
+			Tty:          rec.Tty,
+			OpenStdin:    rec.OpenStdin,
+			StdinOnce:    rec.StdinOnce,
 		},
 		HostConfig: hostConfig,
 		NetworkSettings: NetworkSettings{

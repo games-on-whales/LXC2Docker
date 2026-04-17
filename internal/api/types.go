@@ -18,11 +18,17 @@ type ContainerCreateRequest struct {
 	Env              []string          `json:"Env"`
 	Labels           map[string]string `json:"Labels"`
 	WorkingDir       string            `json:"WorkingDir"`
+	User             string            `json:"User"`
+	Domainname       string            `json:"Domainname"`
+	Hostname         string            `json:"Hostname"`
 	Mounts           []MountRequest    `json:"Mounts"`
 	NetworkingConfig NetworkingConfig  `json:"NetworkingConfig"`
 	HostConfig       HostConfig        `json:"HostConfig"`
 	Healthcheck      *HealthConfig     `json:"Healthcheck,omitempty"`
 	StopSignal       string            `json:"StopSignal,omitempty"`
+	Tty              bool              `json:"Tty"`
+	OpenStdin        bool              `json:"OpenStdin"`
+	StdinOnce        bool              `json:"StdinOnce"`
 }
 
 // HealthConfig is Docker's healthcheck configuration block. We don't
@@ -159,6 +165,8 @@ type ContainerHealthEntry struct {
 // ContainerConfig is the image-level config embedded in ContainerJSON.
 type ContainerConfig struct {
 	Hostname     string              `json:"Hostname"`
+	Domainname   string              `json:"Domainname,omitempty"`
+	User         string              `json:"User,omitempty"`
 	Image        string              `json:"Image"`
 	Cmd          []string            `json:"Cmd"`
 	Entrypoint   []string            `json:"Entrypoint"`
@@ -169,6 +177,8 @@ type ContainerConfig struct {
 	StopSignal   string              `json:"StopSignal,omitempty"`
 	Healthcheck  *HealthConfig       `json:"Healthcheck,omitempty"`
 	Tty          bool                `json:"Tty"`
+	OpenStdin    bool                `json:"OpenStdin"`
+	StdinOnce    bool                `json:"StdinOnce"`
 	AttachStdin  bool                `json:"AttachStdin"`
 	AttachStdout bool                `json:"AttachStdout"`
 	AttachStderr bool                `json:"AttachStderr"`
