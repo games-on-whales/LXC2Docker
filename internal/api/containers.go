@@ -675,6 +675,11 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	until, err := parseLogTimestamp(r.URL.Query().Get("until"), "until")
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	if !stdout && !stderr {
 		stdout = true
@@ -706,6 +711,9 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 		if since != nil && line.Timestamp != nil && line.Timestamp.Before(*since) {
 			continue
 		}
+		if until != nil && line.Timestamp != nil && line.Timestamp.After(*until) {
+			continue
+		}
 		if tailLines < 0 {
 			lines = append(lines, line)
 			continue
@@ -731,10 +739,14 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if follow {
-		// Tail: poll for new content until client disconnects.
+		// Tail: poll for new content until client disconnects or until
+		// the caller-supplied `until` cutoff is reached.
 		ctx := r.Context()
 		pending := make([]byte, 0, 4096)
 		for {
+			if until != nil && time.Now().After(*until) {
+				return
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -750,6 +762,9 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 						break
 					}
 					line := parseLogLine(strings.TrimSuffix(string(pending[:idx]), "\r"))
+					if until != nil && line.Timestamp != nil && line.Timestamp.After(*until) {
+						return
+					}
 					writeLogFrame(w, 1, append([]byte(formatLogLine(line, timestamps)), '\n'))
 					pending = pending[idx+1:]
 				}
@@ -787,6 +802,10 @@ type logLine struct {
 var ansiRegexp = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 func parseLogSince(raw string) (*time.Time, error) {
+	return parseLogTimestamp(raw, "since")
+}
+
+func parseLogTimestamp(raw, paramName string) (*time.Time, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, nil
@@ -807,7 +826,7 @@ func parseLogSince(raw string) (*time.Time, error) {
 			return &utc, nil
 		}
 	}
-	return nil, fmt.Errorf("invalid since value %q", raw)
+	return nil, fmt.Errorf("invalid %s value %q", paramName, raw)
 }
 
 func parseLogLine(raw string) logLine {
