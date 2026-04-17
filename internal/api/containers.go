@@ -277,6 +277,29 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 				Type:        pb.Proto,
 			})
 		}
+		mounts := make([]MountJSON, 0, len(rec.Mounts))
+		for _, m := range rec.Mounts {
+			mode := "rw"
+			if m.ReadOnly {
+				mode = "ro"
+			}
+			mountType := m.Type
+			if mountType == "" {
+				mountType = "bind"
+			}
+			mounts = append(mounts, MountJSON{
+				Type:        mountType,
+				Source:      m.Source,
+				Destination: m.Destination,
+				Mode:        mode,
+				RW:          !m.ReadOnly,
+			})
+		}
+		networkMode := "bridge"
+		for name := range rec.Networks {
+			networkMode = name
+			break
+		}
 		out = append(out, ContainerSummary{
 			ID:      rec.ID,
 			Names:   []string{"/" + rec.Name},
@@ -288,6 +311,11 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			Status:  stateToStatus(state, rec.Created),
 			Ports:   ports,
 			Labels:  rec.Labels,
+			Mounts:  mounts,
+			NetworkSettings: &SummaryNetworkSetting{
+				Networks: buildContainerEndpoints(rec),
+			},
+			HostConfig: &SummaryHostConfig{NetworkMode: networkMode},
 		})
 	}
 	jsonResponse(w, http.StatusOK, out)

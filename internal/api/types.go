@@ -138,16 +138,32 @@ type EndpointSettings struct {
 
 // ContainerSummary is a single item in the GET /containers/json response.
 type ContainerSummary struct {
-	ID      string            `json:"Id"`
-	Names   []string          `json:"Names"`
-	Image   string            `json:"Image"`
-	ImageID string            `json:"ImageID"`
-	Command string            `json:"Command"`
-	Created int64             `json:"Created"` // Unix timestamp
-	Status  string            `json:"Status"`
-	State   string            `json:"State"`
-	Ports   []Port            `json:"Ports"`
-	Labels  map[string]string `json:"Labels"`
+	ID              string                 `json:"Id"`
+	Names           []string               `json:"Names"`
+	Image           string                 `json:"Image"`
+	ImageID         string                 `json:"ImageID"`
+	Command         string                 `json:"Command"`
+	Created         int64                  `json:"Created"` // Unix timestamp
+	Status          string                 `json:"Status"`
+	State           string                 `json:"State"`
+	Ports           []Port                 `json:"Ports"`
+	Labels          map[string]string      `json:"Labels"`
+	Mounts          []MountJSON            `json:"Mounts"`
+	NetworkSettings *SummaryNetworkSetting `json:"NetworkSettings,omitempty"`
+	HostConfig      *SummaryHostConfig     `json:"HostConfig,omitempty"`
+}
+
+// SummaryNetworkSetting is the shape Portainer expects for
+// ContainerSummary.NetworkSettings — just a Networks map, not the full
+// per-container NetworkSettings returned by inspect.
+type SummaryNetworkSetting struct {
+	Networks map[string]EndpointSettings `json:"Networks"`
+}
+
+// SummaryHostConfig is the minimal HostConfig block Docker includes in the
+// container-list response (NetworkMode is the only field Portainer reads).
+type SummaryHostConfig struct {
+	NetworkMode string `json:"NetworkMode"`
 }
 
 // Port describes a mapped port.
