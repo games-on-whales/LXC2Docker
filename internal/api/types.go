@@ -333,6 +333,8 @@ type ExecCreateRequest struct {
 	Tty          bool     `json:"Tty"`
 	Env          []string `json:"Env"`
 	WorkingDir   string   `json:"WorkingDir"`
+	User         string   `json:"User"`
+	Privileged   bool     `json:"Privileged"`
 }
 
 // ExecCreateResponse is the body returned by POST /containers/{id}/exec.
@@ -360,6 +362,8 @@ type ExecProcessConfig struct {
 	Tty        bool     `json:"tty"`
 	Entrypoint string   `json:"entrypoint"`
 	Arguments  []string `json:"arguments"`
+	User       string   `json:"user,omitempty"`
+	Privileged bool     `json:"privileged,omitempty"`
 }
 
 // --- System ---
@@ -655,6 +659,7 @@ type execRecord struct {
 	Tty         bool
 	Env         []string
 	WorkingDir  string
+	User        string
 	ExitCode    int
 	Running     bool
 	StartedAt   time.Time

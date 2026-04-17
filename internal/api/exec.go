@@ -84,6 +84,7 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 		Tty:         req.Tty,
 		Env:         req.Env,
 		WorkingDir:  req.WorkingDir,
+		User:        req.User,
 	}
 	h.execs.add(rec)
 
@@ -204,6 +205,7 @@ func (h *Handler) execInspect(w http.ResponseWriter, r *http.Request) {
 			Tty:        rec.Tty,
 			Entrypoint: entrypoint,
 			Arguments:  args,
+			User:       rec.User,
 		},
 	})
 }
@@ -321,12 +323,25 @@ func runExecTTYOutput(cmd *exec.Cmd, w io.Writer) {
 
 func prepareExecInvocation(rec *execRecord) ([]string, []string) {
 	env := append(os.Environ(), rec.Env...)
-	if rec.WorkingDir == "" {
+	if rec.WorkingDir == "" && rec.User == "" {
 		return rec.Cmd, env
 	}
-	script := "cd " + shellQuote(rec.WorkingDir) + " && exec"
+	script := ""
+	if rec.WorkingDir != "" {
+		script = "cd " + shellQuote(rec.WorkingDir) + " && "
+	}
+	script += "exec"
 	for _, arg := range rec.Cmd {
 		script += " " + shellQuote(arg)
+	}
+	if rec.User != "" {
+		// Wrap in su so the payload runs as the chosen user inside the
+		// container. su -s /bin/sh keeps the shell predictable when the
+		// target account's login shell is something weird; -c runs the
+		// whole script. Falls back to root gracefully if the user does
+		// not exist in the container (su exits non-zero, which the
+		// caller's exit code reflects).
+		script = "su -s /bin/sh -c " + shellQuote(script) + " " + shellQuote(rec.User)
 	}
 	return []string{"/bin/sh", "-lc", script}, env
 }
