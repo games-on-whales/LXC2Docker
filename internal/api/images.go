@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -141,16 +142,25 @@ func (h *Handler) tagImage(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) searchImages(w http.ResponseWriter, r *http.Request) {
 	term := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("term")))
-	results := []ImageSearchResult{}
-	for _, candidate := range []ImageSearchResult{
-		{Name: "ubuntu", Description: "Ubuntu LXC base image", IsOfficial: true},
-		{Name: "debian", Description: "Debian LXC base image", IsOfficial: true},
-		{Name: "alpine", Description: "Alpine LXC base image", IsOfficial: true},
-	} {
-		if term == "" || strings.Contains(candidate.Name, term) || strings.Contains(strings.ToLower(candidate.Description), term) {
-			results = append(results, candidate)
-		}
+	results := make([]ImageSearchResult, 0, 16)
+	seen := map[string]struct{}{}
+	for _, rec := range h.store.ListImages() {
+		name := strings.TrimSuffix(rec.Ref, ":latest")
+		addImageSearchResult(results, seen, ImageSearchResult{
+			Name:        name,
+			Description: "Local image available in docker-lxc-daemon",
+			IsOfficial:  strings.Count(name, "/") == 0,
+		}, term, &results)
 	}
+	for _, candidate := range curatedImageSearchResults() {
+		addImageSearchResult(results, seen, candidate, term, &results)
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].StarCount != results[j].StarCount {
+			return results[i].StarCount > results[j].StarCount
+		}
+		return results[i].Name < results[j].Name
+	})
 	jsonResponse(w, http.StatusOK, results)
 }
 
@@ -185,4 +195,38 @@ func normalizeImageRef(name string) string {
 		return name + ":latest"
 	}
 	return name
+}
+
+func addImageSearchResult(current []ImageSearchResult, seen map[string]struct{}, candidate ImageSearchResult, term string, dst *[]ImageSearchResult) {
+	nameKey := strings.ToLower(candidate.Name)
+	if _, ok := seen[nameKey]; ok {
+		return
+	}
+	if term != "" {
+		haystack := strings.ToLower(candidate.Name + " " + candidate.Description)
+		if !strings.Contains(haystack, term) {
+			return
+		}
+	}
+	seen[nameKey] = struct{}{}
+	*dst = append(*dst, candidate)
+}
+
+func curatedImageSearchResults() []ImageSearchResult {
+	return []ImageSearchResult{
+		{Name: "alpine", Description: "Minimal Alpine Linux base image", StarCount: 9000, IsOfficial: true},
+		{Name: "ubuntu", Description: "Ubuntu base image", StarCount: 15000, IsOfficial: true},
+		{Name: "debian", Description: "Debian base image", StarCount: 5000, IsOfficial: true},
+		{Name: "nginx", Description: "Official build of Nginx", StarCount: 20000, IsOfficial: true},
+		{Name: "redis", Description: "Official build of Redis", StarCount: 19000, IsOfficial: true},
+		{Name: "postgres", Description: "Official PostgreSQL image", StarCount: 17000, IsOfficial: true},
+		{Name: "mariadb", Description: "Official MariaDB server image", StarCount: 6000, IsOfficial: true},
+		{Name: "mysql", Description: "Official MySQL server image", StarCount: 14000, IsOfficial: true},
+		{Name: "busybox", Description: "BusyBox base image", StarCount: 3500, IsOfficial: true},
+		{Name: "portainer/portainer-ce", Description: "Portainer Community Edition", StarCount: 3500, IsOfficial: false},
+		{Name: "hello-world", Description: "Hello from Docker", StarCount: 3000, IsOfficial: true},
+		{Name: "traefik", Description: "Cloud native edge router", StarCount: 12000, IsOfficial: true},
+		{Name: "grafana/grafana", Description: "Grafana observability platform", StarCount: 4500, IsOfficial: false},
+		{Name: "prom/prometheus", Description: "Prometheus monitoring server", StarCount: 2800, IsOfficial: false},
+	}
 }
