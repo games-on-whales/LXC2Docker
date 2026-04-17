@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/games-on-whales/docker-lxc-daemon/internal/oci"
+	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
 	"github.com/gorilla/mux"
 )
 
@@ -44,24 +47,38 @@ func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	enc := json.NewEncoder(w)
-	send := func(status string) {
-		enc.Encode(map[string]string{"status": status})
+	send := func(v any) {
+		_ = enc.Encode(v)
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
 	}
 
-	send(fmt.Sprintf("Pulling from %s", fromImage))
+	send(map[string]string{"status": fmt.Sprintf("Pulling from %s", fromImage)})
 
-	err := h.mgr.PullImage(ref, "amd64", func(msg string) {
-		send(msg)
-	})
-	if err != nil {
-		send(fmt.Sprintf("Error: %s", err))
+	if recovered, err := h.recoverImageRecord(ref); err != nil {
+		send(map[string]any{
+			"error":       err.Error(),
+			"errorDetail": map[string]string{"message": err.Error()},
+		})
+		return
+	} else if recovered {
+		send(map[string]string{"status": fmt.Sprintf("Status: Image is up to date for %s", ref)})
 		return
 	}
 
-	send(fmt.Sprintf("Status: Downloaded newer image for %s", ref))
+	err := h.mgr.PullImage(ref, "amd64", func(msg string) {
+		send(map[string]string{"status": msg})
+	})
+	if err != nil {
+		send(map[string]any{
+			"error":       err.Error(),
+			"errorDetail": map[string]string{"message": err.Error()},
+		})
+		return
+	}
+
+	send(map[string]string{"status": fmt.Sprintf("Status: Downloaded newer image for %s", ref)})
 	h.publishEvent("image", "pull", ref, map[string]string{"name": ref})
 }
 
@@ -228,5 +245,51 @@ func curatedImageSearchResults() []ImageSearchResult {
 		{Name: "traefik", Description: "Cloud native edge router", StarCount: 12000, IsOfficial: true},
 		{Name: "grafana/grafana", Description: "Grafana observability platform", StarCount: 4500, IsOfficial: false},
 		{Name: "prom/prometheus", Description: "Prometheus monitoring server", StarCount: 2800, IsOfficial: false},
+	}
+}
+
+func (h *Handler) recoverImageRecord(ref string) (bool, error) {
+	if !h.mgr.UsePVE() {
+		return h.store.GetImage(ref) != nil, nil
+	}
+	rec := h.store.GetImage(ref)
+	if rec != nil && imageTemplateReady(h.mgr.PVEStorage(), rec) {
+		return true, nil
+	}
+	dataset := fmt.Sprintf("%s/dld-templates/%s", h.mgr.PVEStorage(), oci.SafeDirName(ref))
+	if exec.Command("zfs", "list", "-t", "snapshot", "-o", "name", "-H", dataset+"@tmpl").Run() != nil {
+		return false, nil
+	}
+	if rec == nil {
+		rec = &store.ImageRecord{
+			ID:      "oci_" + oci.SafeDirName(ref),
+			Ref:     ref,
+			Arch:    "amd64",
+			Created: time.Now(),
+		}
+	}
+	rec.TemplateDataset = dataset
+	if err := h.store.AddImage(rec); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func imageTemplateReady(pveStorage string, rec *store.ImageRecord) bool {
+	if rec == nil {
+		return false
+	}
+	switch {
+	case rec.TemplateDataset != "":
+		return exec.Command("zfs", "list", "-t", "snapshot", "-o", "name", "-H", rec.TemplateDataset+"@tmpl").Run() == nil
+	case rec.TemplateVMID > 0:
+		return true
+	case rec.TemplateName != "":
+		return true
+	default:
+		if pveStorage == "" {
+			return false
+		}
+		return false
 	}
 }
