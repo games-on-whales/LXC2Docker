@@ -34,6 +34,14 @@ type ContainerRecord struct {
 	PortBindings []PortBinding    `json:"port_bindings,omitempty"`
 	Mounts       []MountSpec      `json:"mounts"`
 	StartedAt    *time.Time        `json:"started_at,omitempty"` // nil until first start; distinguishes "created" from "exited"
+	// Ephemeral is true only for daemon-created raw-LXC containers that the
+	// GC is permitted to reap. Permanent Proxmox CTs (visible in PVE UI) and
+	// any pre-existing records that lack this flag are left strictly alone.
+	Ephemeral bool `json:"ephemeral,omitempty"`
+	// Storage records the PVE storage pool this container's rootfs lives
+	// on. Used by RemoveContainer for ephemeral containers (the ZFS clone
+	// dataset path includes the pool name) and for diagnostics on PVE CTs.
+	Storage string `json:"storage,omitempty"`
 }
 
 // PortBinding records a single host→container port mapping.

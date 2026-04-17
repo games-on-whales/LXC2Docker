@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/games-on-whales/docker-lxc-daemon/internal/image"
@@ -101,8 +102,11 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		IpcMode:           req.HostConfig.IpcMode,
 		MemoryBytes:       req.HostConfig.Memory,
 		CPUShares:         req.HostConfig.CPUShares,
-		ProxmoxCT:         req.Labels["gow.pve"] == "true",
-		LAN:               req.Labels["gow.lan"] == "true",
+		ProxmoxCT:         labelBool(req.Labels, "dld.pve", "gow.pve"),
+		LAN:               labelBool(req.Labels, "dld.lan", "gow.lan"),
+		Bridge:            labelString(req.Labels, "dld.bridge"),
+		Storage:           labelString(req.Labels, "dld.storage"),
+		ISOs:              parseISOLabel(req.Labels["dld.iso"]),
 	}
 	// LAN bridge replaces host networking: the container gets its own network
 	// namespace with dual NICs (internal + LAN) instead of sharing the host's.
@@ -857,4 +861,75 @@ func mergeEnv(imageEnv, requestEnv []string) []string {
 		result = append(result, m[key])
 	}
 	return result
+}
+
+// labelString reads the first non-empty value found under the given keys.
+// Used to honor a primary label name with deprecated aliases as fallback.
+// When a non-primary key matches, a one-time deprecation warning is logged.
+func labelString(labels map[string]string, keys ...string) string {
+	for i, k := range keys {
+		if v := labels[k]; v != "" {
+			if i > 0 {
+				warnDeprecatedLabel(k, keys[0])
+			}
+			return v
+		}
+	}
+	return ""
+}
+
+// labelBool reports whether any of the given label keys is set to "true".
+// Used so the new "dld.*" namespace honors the older "gow.*" labels for
+// one transitional release. A one-time deprecation warning is logged when
+// a non-primary key is the source of the truthy value.
+func labelBool(labels map[string]string, keys ...string) bool {
+	for i, k := range keys {
+		if labels[k] == "true" {
+			if i > 0 {
+				warnDeprecatedLabel(k, keys[0])
+			}
+			return true
+		}
+	}
+	return false
+}
+
+var deprecatedLabelOnce sync.Map // key string -> sync.Once
+
+func warnDeprecatedLabel(old, replacement string) {
+	once, _ := deprecatedLabelOnce.LoadOrStore(old, &sync.Once{})
+	once.(*sync.Once).Do(func() {
+		log.Printf("DEPRECATION: label %q is deprecated; use %q instead", old, replacement)
+	})
+}
+
+// parseISOLabel parses the comma-separated value of the "dld.iso" label
+// into ISOMount entries. Format per item: "storage:volid[:dest]".
+//   - storage: PVE storage name (e.g. "isos")
+//   - volid:   path within that storage (e.g. "iso/Win11.iso")
+//   - dest:    optional in-container path (defaults to "/mnt/<basename>")
+//
+// Empty input yields nil.
+func parseISOLabel(raw string) []lxc.ISOMount {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var out []lxc.ISOMount
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		parts := strings.SplitN(item, ":", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		iso := lxc.ISOMount{Storage: parts[0], VolumeID: parts[1]}
+		if len(parts) == 3 {
+			iso.Destination = parts[2]
+		}
+		out = append(out, iso)
+	}
+	return out
 }
