@@ -542,20 +542,33 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 func hostConfigExtrasFromRequest(hc HostConfig) *store.HostConfigExtras {
 	if !hc.Privileged && len(hc.CapAdd) == 0 && len(hc.CapDrop) == 0 &&
 		len(hc.ExtraHosts) == 0 && len(hc.Dns) == 0 && len(hc.DnsSearch) == 0 &&
-		len(hc.DnsOptions) == 0 && hc.Memory == 0 && hc.CPUShares == 0 && hc.NanoCPUs == 0 {
+		len(hc.DnsOptions) == 0 && hc.Memory == 0 && hc.CPUShares == 0 &&
+		hc.NanoCPUs == 0 && len(hc.Tmpfs) == 0 && !hc.ReadonlyRootfs &&
+		hc.PidMode == "" && hc.UTSMode == "" {
 		return nil
 	}
+	tmpfs := map[string]string{}
+	for k, v := range hc.Tmpfs {
+		tmpfs[k] = v
+	}
+	if len(tmpfs) == 0 {
+		tmpfs = nil
+	}
 	return &store.HostConfigExtras{
-		Privileged: hc.Privileged,
-		CapAdd:     append([]string{}, hc.CapAdd...),
-		CapDrop:    append([]string{}, hc.CapDrop...),
-		ExtraHosts: append([]string{}, hc.ExtraHosts...),
-		Dns:        append([]string{}, hc.Dns...),
-		DnsSearch:  append([]string{}, hc.DnsSearch...),
-		DnsOptions: append([]string{}, hc.DnsOptions...),
-		Memory:     hc.Memory,
-		CPUShares:  hc.CPUShares,
-		NanoCPUs:   hc.NanoCPUs,
+		Privileged:     hc.Privileged,
+		CapAdd:         append([]string{}, hc.CapAdd...),
+		CapDrop:        append([]string{}, hc.CapDrop...),
+		ExtraHosts:     append([]string{}, hc.ExtraHosts...),
+		Dns:            append([]string{}, hc.Dns...),
+		DnsSearch:      append([]string{}, hc.DnsSearch...),
+		DnsOptions:     append([]string{}, hc.DnsOptions...),
+		Memory:         hc.Memory,
+		CPUShares:      hc.CPUShares,
+		NanoCPUs:       hc.NanoCPUs,
+		Tmpfs:          tmpfs,
+		ReadonlyRootfs: hc.ReadonlyRootfs,
+		PidMode:        hc.PidMode,
+		UTSMode:        hc.UTSMode,
 	}
 }
 
@@ -1769,6 +1782,32 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 		hc.Memory = e.Memory
 		hc.CPUShares = e.CPUShares
 		hc.NanoCPUs = e.NanoCPUs
+		hc.ReadonlyRootfs = e.ReadonlyRootfs
+		hc.PidMode = e.PidMode
+		hc.UTSMode = e.UTSMode
+		if len(e.Tmpfs) > 0 {
+			hc.Tmpfs = map[string]string{}
+			for k, v := range e.Tmpfs {
+				hc.Tmpfs[k] = v
+			}
+		}
+	}
+	// Reflect the stored mounts into HostConfig.Mounts — Docker's modern
+	// mount form. Portainer's container-edit dialog reads this alongside
+	// Binds; emitting both keeps old and new clients happy.
+	for _, m := range rec.Mounts {
+		src := m.Source
+		if m.Name != "" {
+			// Named volumes use the volume name as the source; bind mounts
+			// use the host path.
+			src = m.Name
+		}
+		hc.Mounts = append(hc.Mounts, MountRequest{
+			Type:     orDefault(m.Type, "bind"),
+			Source:   src,
+			Target:   m.Destination,
+			ReadOnly: m.ReadOnly,
+		})
 	}
 	return hc
 }

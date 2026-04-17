@@ -63,6 +63,11 @@ type HostConfig struct {
 	Dns               []string                 `json:"Dns,omitempty"`
 	DnsSearch         []string                 `json:"DnsSearch,omitempty"`
 	DnsOptions        []string                 `json:"DnsOptions,omitempty"`
+	Mounts            []MountRequest           `json:"Mounts,omitempty"`
+	Tmpfs             map[string]string        `json:"Tmpfs,omitempty"`
+	ReadonlyRootfs    bool                     `json:"ReadonlyRootfs,omitempty"`
+	PidMode           string                   `json:"PidMode,omitempty"`
+	UTSMode           string                   `json:"UTSMode,omitempty"`
 	// AutoRemove mirrors Docker's --rm flag. When true, the daemon creates
 	// the container as ephemeral (no PVE UI presence; reaped by GC after
 	// it exits). Default false → permanent PVE CT in PVE mode.
