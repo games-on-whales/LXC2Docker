@@ -654,6 +654,7 @@ lxc.uts.name = %s
 			OCIStopSignal:  cfg.StopSignal,
 			OCIHealthcheck: imageHealthcheckToStore(cfg.Healthcheck),
 			OCIVolumes:     cfg.Volumes,
+			OCIShell:       cfg.Shell,
 		}); err == nil {
 			os.WriteFile(filepath.Join(templateDir, "oci-meta.json"), data, 0o644)
 		}
@@ -677,6 +678,7 @@ lxc.uts.name = %s
 		OCIStopSignal:   cfg.StopSignal,
 		OCIHealthcheck:  imageHealthcheckToStore(cfg.Healthcheck),
 		OCIVolumes:      cfg.Volumes,
+		OCIShell:        cfg.Shell,
 	})
 }
 

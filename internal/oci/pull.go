@@ -25,6 +25,7 @@ type ImageConfig struct {
 	StopSignal  string
 	Healthcheck *ImageHealthcheck
 	Volumes     []string // e.g. ["/var/lib/postgresql/data"]
+	Shell       []string // default shell for RUN shell form, e.g. ["/bin/bash","-c"]
 }
 
 // ImageHealthcheck is the subset of the OCI image healthcheck block we
@@ -177,6 +178,7 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 			User         string              `json:"User"`
 			StopSignal   string              `json:"StopSignal"`
 			Volumes      map[string]struct{} `json:"Volumes"`
+			Shell        []string            `json:"Shell"`
 			Healthcheck  *struct {
 				Test        []string `json:"Test"`
 				Interval    int64    `json:"Interval"`
@@ -209,6 +211,7 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 		User:       imgCfg.Config.User,
 		StopSignal: imgCfg.Config.StopSignal,
 		Volumes:    volumes,
+		Shell:      imgCfg.Config.Shell,
 	}
 	if hc := imgCfg.Config.Healthcheck; hc != nil && len(hc.Test) > 0 {
 		out.Healthcheck = &ImageHealthcheck{

@@ -364,6 +364,8 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			}
 			mounts = append(mounts, MountJSON{
 				Type:        mountType,
+				Name:        m.Name,
+				Driver:      volumeDriverFor(h.store, mountType, m.Name),
 				Source:      m.Source,
 				Destination: m.Destination,
 				Mode:        mode,
@@ -446,6 +448,8 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		mounts = append(mounts, MountJSON{
 			Type:        mountType,
+			Name:        m.Name,
+			Driver:      volumeDriverFor(h.store, mountType, m.Name),
 			Source:      m.Source,
 			Destination: m.Destination,
 			Mode:        mode,
@@ -569,6 +573,19 @@ func healthcheckFromRecord(h *store.HealthcheckConfig) *HealthConfig {
 		StartInterval: h.StartInterval,
 		Retries:       h.Retries,
 	}
+}
+
+// volumeDriverFor returns the driver to report on a mount entry. Named
+// volume mounts (Type=="volume") inherit the driver from the volume
+// record; bind mounts have no driver.
+func volumeDriverFor(st *store.Store, mountType, name string) string {
+	if mountType != "volume" || name == "" {
+		return ""
+	}
+	if v := st.GetVolume(name); v != nil {
+		return orDefault(v.Driver, "local")
+	}
+	return ""
 }
 
 // containerVolumesSet computes the union of image-declared volumes

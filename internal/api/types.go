@@ -124,10 +124,13 @@ type ContainerJSON struct {
 // MountJSON represents a mount in the inspect response.
 type MountJSON struct {
 	Type        string `json:"Type"`
+	Name        string `json:"Name,omitempty"`
+	Driver      string `json:"Driver,omitempty"`
 	Source      string `json:"Source"`
 	Destination string `json:"Destination"`
 	Mode        string `json:"Mode"`
 	RW          bool   `json:"RW"`
+	Propagation string `json:"Propagation,omitempty"`
 }
 
 // ContainerState holds the runtime state of a container.
@@ -297,6 +300,7 @@ type ImageConfig struct {
 	Volumes      map[string]struct{} `json:"Volumes,omitempty"`
 	User         string              `json:"User,omitempty"`
 	StopSignal   string              `json:"StopSignal,omitempty"`
+	Shell        []string            `json:"Shell,omitempty"`
 	Healthcheck  *HealthConfig       `json:"Healthcheck,omitempty"`
 }
 

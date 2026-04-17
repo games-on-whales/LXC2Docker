@@ -405,6 +405,7 @@ func imageConfigFromRecord(rec *store.ImageRecord) *ImageConfig {
 		Volumes:      volumesMap,
 		User:         rec.OCIUser,
 		StopSignal:   rec.OCIStopSignal,
+		Shell:        append([]string{}, rec.OCIShell...),
 		Healthcheck:  healthcheckFromRecord(rec.OCIHealthcheck),
 	}
 }
