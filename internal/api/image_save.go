@@ -260,3 +260,259 @@ func writeTarFile(tw *tar.Writer, name string, body []byte, mode int64) error {
 	_, err := tw.Write(body)
 	return err
 }
+
+// saveManifestEntry mirrors the shape of one element in a docker-save
+// manifest.json array.
+type saveManifestEntry struct {
+	Config   string   `json:"Config"`
+	RepoTags []string `json:"RepoTags"`
+	Layers   []string `json:"Layers"`
+}
+
+// saveImageConfig mirrors the subset of Docker's image config JSON we read
+// back during load. Fields line up with the saveImage synthesis so a save →
+// load round-trip preserves the OCI metadata we track.
+type saveImageConfig struct {
+	Architecture string `json:"architecture"`
+	Config       struct {
+		Env          []string            `json:"Env"`
+		Cmd          []string            `json:"Cmd"`
+		Entrypoint   []string            `json:"Entrypoint"`
+		WorkingDir   string              `json:"WorkingDir"`
+		User         string              `json:"User"`
+		StopSignal   string              `json:"StopSignal"`
+		Labels       map[string]string   `json:"Labels"`
+		ExposedPorts map[string]struct{} `json:"ExposedPorts"`
+		Healthcheck  *struct {
+			Test        []string `json:"Test"`
+			Interval    int64    `json:"Interval"`
+			Timeout     int64    `json:"Timeout"`
+			StartPeriod int64    `json:"StartPeriod"`
+			Retries     int      `json:"Retries"`
+		} `json:"Healthcheck"`
+	} `json:"config"`
+}
+
+// POST /images/load — Docker load. Accepts a tar body produced by
+// docker save (or /images/{name}/get) and registers the contained image
+// as a new template.
+//
+// Portainer's "Upload image" button and docker load both call this. The
+// response is a newline-delimited JSON stream so clients can tail
+// progress messages.
+func (h *Handler) loadImage(w http.ResponseWriter, r *http.Request) {
+	if h.mgr.PVEStorage() == "" {
+		errResponse(w, http.StatusNotImplemented,
+			"image load requires a PVE storage pool; legacy directory mode is not supported yet")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	enc := json.NewEncoder(w)
+	send := func(v any) {
+		_ = enc.Encode(v)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+	fail := func(msg string) {
+		send(map[string]any{
+			"error":       msg,
+			"errorDetail": map[string]string{"message": msg},
+		})
+	}
+
+	// Stage the uploaded tar to disk so we can read entries non-
+	// sequentially — docker save emits manifest.json first but not in all
+	// versions, so tolerate any order by materialising the whole bundle.
+	stage, err := os.MkdirTemp("", "dld-load-*")
+	if err != nil {
+		fail("stage: " + err.Error())
+		return
+	}
+	defer os.RemoveAll(stage)
+
+	if err := extractBundleTar(r.Body, stage); err != nil {
+		fail("unpack bundle: " + err.Error())
+		return
+	}
+
+	manifestPath := filepath.Join(stage, "manifest.json")
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		fail("missing manifest.json")
+		return
+	}
+	var manifest []saveManifestEntry
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		fail("parse manifest: " + err.Error())
+		return
+	}
+	if len(manifest) == 0 {
+		fail("manifest is empty")
+		return
+	}
+
+	for _, entry := range manifest {
+		if err := h.importLoadedImage(stage, entry, send); err != nil {
+			fail(err.Error())
+			return
+		}
+	}
+}
+
+// importLoadedImage imports a single manifest entry: extracts its layer
+// into a fresh ZFS dataset, snapshots @tmpl, and persists an ImageRecord
+// carrying the OCI metadata from the config JSON.
+func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send func(any)) error {
+	if len(entry.Layers) == 0 {
+		return fmt.Errorf("manifest entry has no layers")
+	}
+	if len(entry.RepoTags) == 0 {
+		return fmt.Errorf("manifest entry has no RepoTags; untagged images cannot be loaded")
+	}
+	cfgPath := filepath.Join(stage, entry.Config)
+	cfgBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return fmt.Errorf("read image config %q: %w", entry.Config, err)
+	}
+	var cfg saveImageConfig
+	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
+		return fmt.Errorf("parse image config: %w", err)
+	}
+
+	for _, ref := range entry.RepoTags {
+		normRef := normalizeImageRef(ref)
+		send(map[string]string{"status": fmt.Sprintf("Loading layer for image: %s", normRef)})
+		dataset, err := h.createLoadedImageDataset(stage, entry.Layers, normRef)
+		if err != nil {
+			return fmt.Errorf("create dataset for %s: %w", normRef, err)
+		}
+		rec := &store.ImageRecord{
+			ID:              "loaded_" + oci.SafeDirName(normRef),
+			Ref:             normRef,
+			Arch:            orDefault(cfg.Architecture, "amd64"),
+			TemplateDataset: dataset,
+			Created:         time.Now(),
+			OCIEntrypoint:   append([]string{}, cfg.Config.Entrypoint...),
+			OCICmd:          append([]string{}, cfg.Config.Cmd...),
+			OCIEnv:          append([]string{}, cfg.Config.Env...),
+			OCIWorkingDir:   cfg.Config.WorkingDir,
+			OCIPorts:        mapKeys(cfg.Config.ExposedPorts),
+			OCILabels:       cfg.Config.Labels,
+			OCIUser:         cfg.Config.User,
+			OCIStopSignal:   cfg.Config.StopSignal,
+		}
+		if hc := cfg.Config.Healthcheck; hc != nil && len(hc.Test) > 0 {
+			rec.OCIHealthcheck = &store.HealthcheckConfig{
+				Test:        append([]string{}, hc.Test...),
+				Interval:    hc.Interval,
+				Timeout:     hc.Timeout,
+				StartPeriod: hc.StartPeriod,
+				Retries:     hc.Retries,
+			}
+		}
+		if err := h.store.AddImage(rec); err != nil {
+			return fmt.Errorf("persist %s: %w", normRef, err)
+		}
+		h.publishEvent("image", "load", normRef, map[string]string{"name": normRef})
+		send(map[string]string{"status": fmt.Sprintf("Loaded image: %s", normRef)})
+	}
+	return nil
+}
+
+// createLoadedImageDataset picks a fresh ZFS dataset name, creates it
+// with an explicit mountpoint (the parent dataset inherits mountpoint=none,
+// so children need their own), extracts every referenced layer tar into
+// it in order, takes the @tmpl snapshot the rest of the daemon expects on
+// templates, and returns the dataset path.
+func (h *Handler) createLoadedImageDataset(stage string, layers []string, ref string) (string, error) {
+	storage := h.mgr.PVEStorage()
+	parentDS := storage + "/dld-templates"
+	dataset := fmt.Sprintf("%s/%s", parentDS, oci.SafeDirName(ref))
+	mountPoint := "/" + dataset
+	// Mirror pullOCI: ensure the parent dataset exists and force the new
+	// per-image dataset's mountpoint so /.zfs/snapshot/tmpl is reachable.
+	_, _ = exec.Command("zfs", "create", "-p", "-o", "mountpoint=none", parentDS).CombinedOutput()
+	// Idempotent re-load: destroy any stale dataset first so the @tmpl
+	// snapshot is replaced cleanly.
+	_, _ = exec.Command("zfs", "destroy", "-r", dataset).CombinedOutput()
+	if out, err := exec.Command("zfs", "create", "-o", "mountpoint="+mountPoint, dataset).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("zfs create %s: %s: %w", dataset, out, err)
+	}
+	for _, layer := range layers {
+		layerPath := filepath.Join(stage, layer)
+		if err := extractTarInto(layerPath, mountPoint); err != nil {
+			_, _ = exec.Command("zfs", "destroy", "-r", dataset).CombinedOutput()
+			return "", fmt.Errorf("extract %s: %w", layer, err)
+		}
+	}
+	if out, err := exec.Command("zfs", "snapshot", dataset+"@tmpl").CombinedOutput(); err != nil {
+		_, _ = exec.Command("zfs", "destroy", "-r", dataset).CombinedOutput()
+		return "", fmt.Errorf("zfs snapshot %s@tmpl: %s: %w", dataset, out, err)
+	}
+	return dataset, nil
+}
+
+// extractBundleTar unpacks a docker-save bundle into destDir. Used by
+// loadImage before parsing the manifest — the archive/tar reader is
+// stream-only, so this materialises the bundle to disk.
+func extractBundleTar(body io.Reader, destDir string) error {
+	tr := tar.NewReader(body)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		clean := filepath.Clean("/" + hdr.Name)
+		if strings.Contains(clean, "..") {
+			return fmt.Errorf("invalid path %q in bundle", hdr.Name)
+		}
+		target := filepath.Join(destDir, clean)
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				f.Close()
+				return err
+			}
+			f.Close()
+		}
+	}
+}
+
+// extractTarInto runs `tar -xf <src> -C <dst>` so symlinks, xattrs, and
+// device files are handled correctly — pure-Go tar would have to
+// reimplement half of GNU tar to get the same behaviour.
+func extractTarInto(src, dst string) error {
+	out, err := exec.Command("tar", "-xf", src, "-C", dst).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+// mapKeys returns a sorted list of the keys of m. Used for the exposed-
+// ports map which docker save emits as an object and the store keeps as
+// a string slice.
+func mapKeys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
