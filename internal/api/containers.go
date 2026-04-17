@@ -95,6 +95,21 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Labels: inherit from the image then overlay request labels so user
+	// overrides win — same semantics Docker uses. Portainer's stack grouping
+	// reads com.docker.compose.* labels on the resulting container, which
+	// were previously dropped whenever the Compose file set them via the
+	// image rather than the service block.
+	labels := map[string]string{}
+	if imgRec := h.store.GetImage(normalizeImageRef(req.Image)); imgRec != nil {
+		for k, v := range imgRec.OCILabels {
+			labels[k] = v
+		}
+	}
+	for k, v := range req.Labels {
+		labels[k] = v
+	}
+
 	// Default mode is PERMANENT (PVE CT, visible in the PVE UI). Opt out
 	// of permanence — making the container ephemeral, reapable by the GC
 	// after it exits — via Docker's --rm (HostConfig.AutoRemove) or the
@@ -187,7 +202,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Entrypoint: entrypoint,
 		Cmd:        cmd,
 		Env:        env,
-		Labels:     req.Labels,
+		Labels:     labels,
 	}
 	rec.Networks = defaultContainerNetworks(rec)
 	if err := attachRequestedNetworks(h.store, rec, req.NetworkingConfig); err != nil {
