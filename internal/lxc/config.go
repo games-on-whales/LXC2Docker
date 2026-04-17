@@ -96,6 +96,17 @@ type DeviceSpec struct {
 // Permanent Proxmox CTs (writePVEConfig) never receive this marker.
 const EphemeralMarker = "# docker-lxc-daemon: ephemeral"
 
+// ManagedTag is the Proxmox CT tag the daemon writes onto every permanent
+// container it creates. It also serves as the opt-in adoption marker:
+// any pre-existing PVE CT carrying this tag (added by the operator via
+// the PVE UI or `pct set <vmid> --tags ...`) is surfaced to Docker
+// clients via this daemon as if the daemon owned it.
+//
+// Untagged PVE CTs are invisible to the daemon — listContainers does not
+// return them and lifecycle calls against their VMIDs are rejected.
+// Removing the tag from a CT releases it from daemon management.
+const ManagedTag = "dld-managed"
+
 // rewriteConfig reads the cloned LXC config file, strips problematic lines
 // inherited from the download template (userns, apparmor, duplicate network),
 // and appends the daemon-managed config items. This is more reliable than
@@ -611,6 +622,10 @@ func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg *Cont
 	lines = append(lines, "ostype: unmanaged")
 	lines = append(lines, fmt.Sprintf("rootfs: %s", rootfsSpec))
 	lines = append(lines, "unprivileged: 0")
+	// Mark the CT as daemon-managed so listContainers / Portainer surface
+	// it. Removing this tag (via PVE UI or `pct set --tags ...`) releases
+	// the CT from daemon management.
+	lines = append(lines, "tags: "+ManagedTag)
 
 	// Raw lxc.* pass-through items (including network config).
 	items := buildPVEItems(cfg, ip)

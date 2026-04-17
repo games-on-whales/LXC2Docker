@@ -213,7 +213,9 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 // GET /containers/json
 func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
-	records := h.store.ListContainers()
+	// Use Manager.ListContainers so adopted (operator-tagged) PVE CTs
+	// surface alongside daemon-created records.
+	records := h.mgr.ListContainers()
 
 	out := make([]ContainerSummary, 0, len(records))
 	for _, rec := range records {
@@ -257,7 +259,9 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	rec := h.store.GetContainer(id)
+	// Inspect goes through the Manager so adopted CTs (tagged but not in
+	// the store) are also inspectable.
+	rec := h.mgr.GetContainer(id)
 	if rec == nil {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
@@ -824,7 +828,20 @@ func humanDuration(d time.Duration) string {
 }
 
 func (h *Handler) resolveID(idOrName string) string {
-	return h.store.ResolveID(idOrName)
+	if id := h.store.ResolveID(idOrName); id != "" {
+		return id
+	}
+	// Fall back to adopted (tagged) PVE CTs. Match exact ID, name, or
+	// 4+-char ID prefix.
+	for _, rec := range h.mgr.ListContainers() {
+		if rec.ID == idOrName || rec.Name == idOrName {
+			return rec.ID
+		}
+		if len(idOrName) >= 4 && strings.HasPrefix(rec.ID, idOrName) {
+			return rec.ID
+		}
+	}
+	return ""
 }
 
 // buildHostConfig reconstructs a HostConfig from the stored container record.

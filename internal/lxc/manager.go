@@ -5,12 +5,15 @@ package lxc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -96,12 +99,20 @@ func NewManager(lxcPath, pveStorage string, lan LANConfig, st *store.Store) (*Ma
 // containers that are still running, it re-applies port forwarding rules
 // (which may have been lost if nft state was cleared). For containers
 // whose LXC directory no longer exists, it cleans them from the store.
+// For permanent PVE CTs that pre-date the tag-based ownership scheme,
+// it backfills the ManagedTag onto the .conf so they remain visible
+// after operators rely on the tag as the source of truth.
 func (m *Manager) reconcile() {
 	for _, rec := range m.store.ListContainers() {
 		if !m.containerExists(rec.ID) {
 			log.Printf("reconcile: removing orphaned store entry %s (%s)", rec.Name, rec.ID[:12])
 			m.store.RemoveContainer(rec.ID)
 			continue
+		}
+		if rec.VMID > 0 {
+			if err := ensureManagedTag(rec.VMID); err != nil {
+				log.Printf("reconcile: tag backfill VMID %d: %v", rec.VMID, err)
+			}
 		}
 		state, _ := m.State(rec.ID)
 		if state == "running" && rec.IPAddress != "" {
@@ -115,6 +126,39 @@ func (m *Manager) reconcile() {
 				rec.Name, rec.ID[:12])
 		}
 	}
+}
+
+// ensureManagedTag idempotently adds ManagedTag to the tags line of the
+// given PVE CT's .conf. Used during reconcile to backfill CTs created
+// before tag-based ownership existed.
+func ensureManagedTag(vmid int) error {
+	path := pveConfigPath(vmid)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+	tagsIdx := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, "[") {
+			break
+		}
+		if strings.HasPrefix(line, "tags:") {
+			tagsIdx = i
+			break
+		}
+	}
+	if tagsIdx >= 0 {
+		_, tags, _ := readPVEHostnameAndTags(path)
+		if hasTag(tags, ManagedTag) {
+			return nil
+		}
+		tags = append(tags, ManagedTag)
+		lines[tagsIdx] = "tags: " + strings.Join(tags, ",")
+	} else {
+		lines = append(lines, "tags: "+ManagedTag)
+	}
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644)
 }
 
 // StartGC launches a background goroutine that periodically reaps stopped
@@ -214,6 +258,132 @@ func (m *Manager) hasEphemeralMarker(id string) bool {
 		}
 	}
 	return false
+}
+
+// adoptedID returns a deterministic Docker-style 64-hex ID for a Proxmox
+// CT discovered via tag adoption. Hashing a constant prefix with the VMID
+// guarantees: (1) stable across daemon restarts, (2) no collision with
+// daemon-generated IDs (which use crypto/rand), (3) reversible only if
+// the daemon enumerates VMIDs (no need for a persistent map).
+func adoptedID(vmid int) string {
+	sum := sha256.Sum256([]byte("dld-adopted:" + strconv.Itoa(vmid)))
+	return hex.EncodeToString(sum[:])
+}
+
+// discoverAdopted scans /etc/pve/lxc/*.conf for CTs carrying the
+// ManagedTag and returns synthesized records for those NOT already
+// represented in the daemon's own store. Daemon-created CTs already
+// have store records (with full Docker metadata) and are skipped here.
+//
+// Synthesized records have minimal Docker metadata — Image is "adopted",
+// Mounts/Env/PortBindings are unknown. Lifecycle ops on adopted CTs
+// route through pct via the recorded VMID exactly like daemon-created
+// permanent CTs.
+func (m *Manager) discoverAdopted() map[string]*store.ContainerRecord {
+	out := map[string]*store.ContainerRecord{}
+	if !m.UsePVE() {
+		return out
+	}
+	known := map[int]bool{}
+	for _, rec := range m.store.ListContainers() {
+		if rec.VMID > 0 {
+			known[rec.VMID] = true
+		}
+	}
+	files, err := filepath.Glob("/etc/pve/lxc/*.conf")
+	if err != nil {
+		return out
+	}
+	for _, path := range files {
+		base := strings.TrimSuffix(filepath.Base(path), ".conf")
+		vmid, err := strconv.Atoi(base)
+		if err != nil || vmid == 0 || known[vmid] {
+			continue
+		}
+		hostname, tags, ok := readPVEHostnameAndTags(path)
+		if !ok || !hasTag(tags, ManagedTag) {
+			continue
+		}
+		fi, _ := os.Stat(path)
+		created := time.Now()
+		if fi != nil {
+			created = fi.ModTime()
+		}
+		id := adoptedID(vmid)
+		if hostname == "" {
+			hostname = fmt.Sprintf("ct-%d", vmid)
+		}
+		out[id] = &store.ContainerRecord{
+			ID:        id,
+			VMID:      vmid,
+			Name:      hostname,
+			Image:     "adopted",
+			Created:   created,
+			Ephemeral: false,
+		}
+	}
+	return out
+}
+
+// readPVEHostnameAndTags parses just the hostname and tags fields out of
+// a Proxmox CT .conf. Returns ok=false on read failure. Other fields are
+// ignored — discovery only needs identity and the adoption marker.
+func readPVEHostnameAndTags(path string) (hostname string, tags []string, ok bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", nil, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		// PVE configs use "[section]" headers (e.g. "[snapshot]") to
+		// separate per-snapshot blocks. Stop at the first one — we only
+		// want the active config in the file head.
+		if strings.HasPrefix(line, "[") {
+			break
+		}
+		if v, found := strings.CutPrefix(line, "hostname:"); found {
+			hostname = strings.TrimSpace(v)
+		} else if v, found := strings.CutPrefix(line, "tags:"); found {
+			for _, t := range strings.Split(strings.TrimSpace(v), ",") {
+				if t = strings.TrimSpace(t); t != "" {
+					tags = append(tags, t)
+				}
+			}
+		}
+	}
+	return hostname, tags, true
+}
+
+func hasTag(tags []string, want string) bool {
+	for _, t := range tags {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
+// ListContainers returns the union of the daemon's own store records and
+// records synthesized for adopted (operator-tagged) Proxmox CTs.
+// Use this in API handlers instead of the bare store.
+func (m *Manager) ListContainers() []*store.ContainerRecord {
+	out := m.store.ListContainers()
+	for _, rec := range m.discoverAdopted() {
+		out = append(out, rec)
+	}
+	return out
+}
+
+// GetContainer resolves an ID against the daemon's store first, falling
+// back to adopted (tagged) CT discovery. Returns nil when neither source
+// has the ID.
+func (m *Manager) GetContainer(id string) *store.ContainerRecord {
+	if rec := m.store.GetContainer(id); rec != nil {
+		return rec
+	}
+	if rec, ok := m.discoverAdopted()[id]; ok {
+		return rec
+	}
+	return nil
 }
 
 // PullImage ensures a template container exists for the given image ref.
@@ -832,14 +1002,15 @@ func (m *Manager) prepareRootfs(rootfs string, cfg ContainerConfig) {
 }
 
 // StartContainer starts a stopped container.
-// For Proxmox CTs (VMID > 0), uses pct start; otherwise lxc-start.
+// For Proxmox CTs (VMID > 0, including adopted ones), uses pct start;
+// otherwise lxc-start.
 func (m *Manager) StartContainer(id string) error {
 	state, _ := m.State(id)
 	if state == "running" {
 		return nil
 	}
 
-	rec := m.store.GetContainer(id)
+	rec := m.GetContainer(id)
 	if rec != nil && rec.VMID > 0 {
 		return m.startPVEContainer(id, rec.VMID)
 	}
@@ -902,7 +1073,7 @@ func (m *Manager) StopContainer(id string, timeout time.Duration) error {
 		return nil
 	}
 
-	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+	if rec := m.GetContainer(id); rec != nil && rec.VMID > 0 {
 		out, err := exec.Command("pct", "shutdown",
 			fmt.Sprintf("%d", rec.VMID),
 			"--timeout", fmt.Sprintf("%d", int(timeout.Seconds())),
@@ -933,7 +1104,7 @@ func (m *Manager) KillContainer(id, signal string) error {
 		signal = "KILL"
 	}
 
-	rec := m.store.GetContainer(id)
+	rec := m.GetContainer(id)
 
 	if signal == "KILL" || signal == "9" || signal == "SIGKILL" {
 		if rec != nil && rec.VMID > 0 {
@@ -986,15 +1157,19 @@ func (m *Manager) RemoveContainer(id string) error {
 		return fmt.Errorf("manager: cannot remove running container %s; stop it first", id)
 	}
 
-	rec := m.store.GetContainer(id)
+	rec := m.GetContainer(id)
 
 	if rec != nil && rec.VMID > 0 {
-		// Proxmox CT — destroy via pct.
+		// Proxmox CT — destroy via pct. Removing the underlying CT also
+		// removes its tag-based discoverability for adopted records, so
+		// store.RemoveContainer is best-effort: nothing to remove for an
+		// adopted CT (it was never persisted) and that's fine.
 		out, err := exec.Command("pct", "destroy", fmt.Sprintf("%d", rec.VMID), "--force").CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("manager: pct destroy %d: %s: %w", rec.VMID, out, err)
 		}
-		return m.store.RemoveContainer(id)
+		m.store.RemoveContainer(id)
+		return nil
 	}
 
 	if m.UsePVE() {
@@ -1056,7 +1231,7 @@ func (m *Manager) RemoveImage(ref string) error {
 // State returns the Docker-compatible state string for a container.
 // For PVE CTs uses pct status; otherwise lxc-info.
 func (m *Manager) State(id string) (string, error) {
-	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+	if rec := m.GetContainer(id); rec != nil && rec.VMID > 0 {
 		out, err := exec.Command("pct", "status", fmt.Sprintf("%d", rec.VMID)).Output()
 		if err != nil {
 			return "exited", nil
@@ -1092,7 +1267,7 @@ func (m *Manager) State(id string) (string, error) {
 // Exec runs cmd inside the container. For PVE CTs uses pct exec;
 // otherwise lxc-attach. Returns an *exec.Cmd not yet started.
 func (m *Manager) Exec(id string, cmd []string, env []string) *exec.Cmd {
-	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+	if rec := m.GetContainer(id); rec != nil && rec.VMID > 0 {
 		args := []string{"exec", fmt.Sprintf("%d", rec.VMID), "--"}
 		args = append(args, cmd...)
 		c := exec.Command("pct", args...)
@@ -1117,7 +1292,7 @@ func (m *Manager) LXCPath() string { return m.lxcPath }
 // RootfsPath returns the rootfs path for a container.
 // For PVE CTs returns the ZFS subvol path; otherwise the lxcpath rootfs.
 func (m *Manager) RootfsPath(id string) string {
-	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+	if rec := m.GetContainer(id); rec != nil && rec.VMID > 0 {
 		return m.pveRootfsPath(rec.VMID)
 	}
 	// For ephemeral PVE containers, the rootfs is a ZFS clone mounted
