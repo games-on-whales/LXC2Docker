@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,6 +83,7 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 		Cmd:         req.Cmd,
 		Tty:         req.Tty,
 		Env:         req.Env,
+		WorkingDir:  req.WorkingDir,
 	}
 	h.execs.add(rec)
 
@@ -104,7 +107,8 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 
 	if req.Detach {
 		// Fire-and-forget: run the command, don't stream output.
-		cmd := h.mgr.Exec(rec.ContainerID, rec.Cmd, rec.Env)
+		cmdArgs, env := prepareExecInvocation(rec)
+		cmd := h.mgr.Exec(rec.ContainerID, cmdArgs, env)
 		go func() {
 			err := cmd.Run()
 			code := 0
@@ -122,41 +126,45 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hijack the connection for streaming.
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		errResponse(w, http.StatusInternalServerError, "streaming not supported")
-		return
-	}
-	conn, buf, err := hj.Hijack()
-	if err != nil {
-		return
-	}
-	// conn is closed by runExecTTY/runExecMux or deferred below for non-TTY.
-	closeConn := true
-	defer func() {
-		if closeConn {
-			conn.Close()
-		}
-	}()
-
-	// Write HTTP response preamble manually.
-	buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
-	buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
-	buf.WriteString("Connection: Upgrade\r\n")
-	buf.WriteString("Upgrade: tcp\r\n")
-	buf.WriteString("\r\n")
-	buf.Flush()
-
 	h.execs.update(rec.ID, func(r *execRecord) { r.Running = true; r.StartedAt = time.Now() })
 
-	cmd := h.mgr.Exec(rec.ContainerID, rec.Cmd, rec.Env)
+	cmdArgs, env := prepareExecInvocation(rec)
+	cmd := h.mgr.Exec(rec.ContainerID, cmdArgs, env)
 
-	if rec.Tty {
-		closeConn = false // runExecTTY closes conn itself
-		runExecTTY(cmd, conn)
+	hj, ok := w.(http.Hijacker)
+	if ok {
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		closeConn := true
+		defer func() {
+			if closeConn {
+				conn.Close()
+			}
+		}()
+
+		buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
+		buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
+		buf.WriteString("Connection: Upgrade\r\n")
+		buf.WriteString("Upgrade: tcp\r\n")
+		buf.WriteString("\r\n")
+		buf.Flush()
+
+		if rec.Tty {
+			closeConn = false
+			runExecTTY(cmd, conn)
+		} else {
+			runExecMux(cmd, conn)
+		}
 	} else {
-		runExecMux(cmd, conn)
+		w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
+		w.WriteHeader(http.StatusOK)
+		if rec.Tty {
+			runExecTTYOutput(cmd, w)
+		} else {
+			runExecMuxOutput(cmd, w)
+		}
 	}
 
 	code := 0
@@ -236,13 +244,17 @@ func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter) {
 // runExecMux runs cmd with pipes and multiplexes stdout/stderr into the
 // Docker raw-stream format. Used when Tty=false.
 func runExecMux(cmd *exec.Cmd, conn io.ReadWriter) {
+	runExecMuxOutput(cmd, conn)
+}
+
+func runExecMuxOutput(cmd *exec.Cmd, w io.Writer) {
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
 
 	if err := cmd.Start(); err != nil {
-		writeLogFrame(conn, 2, []byte("error: "+err.Error()+"\n"))
+		writeLogFrame(w, 2, []byte("error: "+err.Error()+"\n"))
 		return
 	}
 
@@ -255,7 +267,7 @@ func runExecMux(cmd *exec.Cmd, conn io.ReadWriter) {
 		for {
 			n, err := stdoutR.Read(b)
 			if n > 0 {
-				writeLogFrame(conn, 1, b[:n])
+				writeLogFrame(w, 1, b[:n])
 			}
 			if err != nil {
 				return
@@ -269,7 +281,7 @@ func runExecMux(cmd *exec.Cmd, conn io.ReadWriter) {
 		for {
 			n, err := stderrR.Read(b)
 			if n > 0 {
-				writeLogFrame(conn, 2, b[:n])
+				writeLogFrame(w, 2, b[:n])
 			}
 			if err != nil {
 				return
@@ -282,6 +294,36 @@ func runExecMux(cmd *exec.Cmd, conn io.ReadWriter) {
 	stdoutW.Close()
 	stderrW.Close()
 	wg.Wait()
+}
+
+func runExecTTYOutput(cmd *exec.Cmd, w io.Writer) {
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		fmt.Fprintf(w, "error starting pty: %s\n", err)
+		return
+	}
+	defer ptmx.Close()
+	_, _ = io.Copy(w, ptmx)
+	_ = cmd.Wait()
+}
+
+func prepareExecInvocation(rec *execRecord) ([]string, []string) {
+	env := append(os.Environ(), rec.Env...)
+	if rec.WorkingDir == "" {
+		return rec.Cmd, env
+	}
+	script := "cd " + shellQuote(rec.WorkingDir) + " && exec"
+	for _, arg := range rec.Cmd {
+		script += " " + shellQuote(arg)
+	}
+	return []string{"/bin/sh", "-lc", script}, env
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
 
 // generateID returns a 64-character hex ID matching Docker's container ID length.
