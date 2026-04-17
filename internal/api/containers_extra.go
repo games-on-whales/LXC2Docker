@@ -32,11 +32,21 @@ func (h *Handler) containerChanges(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rootfs := h.mgr.RootfsPath(id)
-	base := h.mgr.ImageRootfsPath(normalizeImageRef(rec.Image))
-	if rootfs == "" || base == "" {
+	if rootfs == "" {
 		jsonResponse(w, http.StatusOK, []ChangeResponse{})
 		return
 	}
+	base, cleanup, err := h.resolveImageBaseDir(rec.Image)
+	if err != nil || base == "" {
+		// No base to diff against — return an empty change list rather
+		// than a 500 so Portainer's Filesystem tab renders cleanly.
+		if cleanup != nil {
+			cleanup()
+		}
+		jsonResponse(w, http.StatusOK, []ChangeResponse{})
+		return
+	}
+	defer cleanup()
 
 	changes, err := diffRootfs(base, rootfs)
 	if err != nil {
@@ -44,6 +54,35 @@ func (h *Handler) containerChanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusOK, changes)
+}
+
+// resolveImageBaseDir picks a directory containing the image's rootfs the
+// caller can diff against. Tries the legacy template path first (cheap),
+// then falls back to the ZFS @tmpl snapshot via the .zfs/snapshot/tmpl
+// accessor — exactly the approach openImageRootfs takes for image save.
+func (h *Handler) resolveImageBaseDir(ref string) (string, func(), error) {
+	noop := func() {}
+	if path := h.mgr.ImageRootfsPath(normalizeImageRef(ref)); path != "" {
+		if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+			return path, noop, nil
+		}
+	}
+	rec := h.store.GetImage(normalizeImageRef(ref))
+	if rec == nil {
+		return "", noop, nil
+	}
+	if rec.TemplateDataset == "" {
+		return "", noop, nil
+	}
+	mp, err := zfsMountpoint(rec.TemplateDataset)
+	if err != nil {
+		return "", noop, err
+	}
+	snap := filepath.Join(mp, ".zfs", "snapshot", "tmpl")
+	if fi, err := os.Stat(snap); err != nil || !fi.IsDir() {
+		return "", noop, nil
+	}
+	return snap, noop, nil
 }
 
 func (h *Handler) containerStats(w http.ResponseWriter, r *http.Request) {
