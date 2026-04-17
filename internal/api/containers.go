@@ -386,6 +386,17 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	hostConfig := buildHostConfig(rec)
+	if hostConfig.NetworkMode == "" {
+		for name := range rec.Networks {
+			hostConfig.NetworkMode = name
+			break
+		}
+		if hostConfig.NetworkMode == "" {
+			hostConfig.NetworkMode = "bridge"
+		}
+	}
+
 	resp := ContainerJSON{
 		ID:       rec.ID,
 		Created:  rec.Created.Format(time.RFC3339),
@@ -394,6 +405,9 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		Name:     "/" + rec.Name,
 		Driver:   "lxc",
 		Platform: "linux",
+		Image:    rec.Image,
+		ImageID:  rec.ImageID,
+		LogPath:  h.mgr.LogPath(id),
 		State: ContainerState{
 			Status:     state,
 			Running:    running,
@@ -402,7 +416,6 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			StartedAt:  startedAt,
 			FinishedAt: finishedAt,
 		},
-		Image:  rec.Image,
 		Mounts: mounts,
 		Config: &ContainerConfig{
 			Hostname:   rec.ID[:12],
@@ -412,10 +425,11 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Env:        rec.Env,
 			Labels:     rec.Labels,
 		},
-		HostConfig: buildHostConfig(rec),
+		HostConfig: hostConfig,
 		NetworkSettings: NetworkSettings{
 			IPAddress: rec.IPAddress,
 			Networks:  buildContainerEndpoints(rec),
+			Ports:     hostConfig.PortBindings,
 		},
 	}
 	jsonResponse(w, http.StatusOK, resp)

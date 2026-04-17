@@ -80,6 +80,11 @@ type ContainerJSON struct {
 	Platform        string           `json:"Platform"`
 	State           ContainerState   `json:"State"`
 	Image           string           `json:"Image"`
+	ImageID         string           `json:"ImageID,omitempty"`
+	LogPath         string           `json:"LogPath"`
+	ResolvConfPath  string           `json:"ResolvConfPath"`
+	HostnamePath    string           `json:"HostnamePath"`
+	HostsPath       string           `json:"HostsPath"`
 	Config          *ContainerConfig `json:"Config"`
 	HostConfig      *HostConfig      `json:"HostConfig"`
 	Mounts          []MountJSON      `json:"Mounts"`
@@ -123,6 +128,7 @@ type ContainerConfig struct {
 type NetworkSettings struct {
 	IPAddress string                      `json:"IPAddress"`
 	Networks  map[string]EndpointSettings `json:"Networks"`
+	Ports     map[string][]PortBinding    `json:"Ports,omitempty"`
 }
 
 // EndpointSettings is a per-network settings block.
