@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,13 +21,16 @@ import (
 )
 
 type buildState struct {
-	baseRef    string
-	workdir    string
-	env        []string
-	cmd        []string
-	entrypoint []string
-	exposed    []string
-	labels     map[string]string
+	baseRef     string
+	workdir     string
+	env         []string
+	cmd         []string
+	entrypoint  []string
+	exposed     []string
+	labels      map[string]string
+	user        string
+	stopSignal  string
+	healthcheck *oci.ImageHealthcheck
 }
 
 type dockerfileInstruction struct {
@@ -195,7 +199,7 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	for i, inst := range instrs {
 		send(map[string]string{"stream": fmt.Sprintf("Step %d: %s %s\n", i+3, inst.op, inst.args)})
 		switch inst.op {
-		case "FROM", "LABEL", "ARG":
+		case "FROM", "LABEL", "ARG", "USER", "STOPSIGNAL", "HEALTHCHECK":
 			continue
 		case "WORKDIR":
 			dst := resolveContainerPath(state.workdir, inst.args)
@@ -388,12 +392,94 @@ func evaluateBuildState(instrs []dockerfileInstruction) (buildState, error) {
 			for k, v := range parseLabelInstruction(inst.args) {
 				state.labels[k] = v
 			}
+		case "USER":
+			state.user = strings.TrimSpace(inst.args)
+		case "STOPSIGNAL":
+			state.stopSignal = strings.TrimSpace(inst.args)
+		case "HEALTHCHECK":
+			hc, err := parseHealthcheckInstruction(inst.args)
+			if err != nil {
+				return state, err
+			}
+			state.healthcheck = hc
 		}
 	}
 	if state.baseRef == "" {
 		return state, fmt.Errorf("Dockerfile must contain FROM")
 	}
 	return state, nil
+}
+
+// parseHealthcheckInstruction handles the two HEALTHCHECK forms:
+//
+//	HEALTHCHECK NONE                               → disable
+//	HEALTHCHECK [OPTIONS] CMD <cmd>                → shell or exec cmd
+//
+// Options are --interval=<duration>, --timeout=<duration>,
+// --start-period=<duration>, --retries=<n>. Durations accept Go's time.
+// ParseDuration syntax (e.g. "30s", "1m30s").
+func parseHealthcheckInstruction(args string) (*oci.ImageHealthcheck, error) {
+	raw := strings.TrimSpace(args)
+	if strings.EqualFold(raw, "NONE") {
+		return &oci.ImageHealthcheck{Test: []string{"NONE"}}, nil
+	}
+	out := &oci.ImageHealthcheck{}
+	for {
+		if !strings.HasPrefix(raw, "--") {
+			break
+		}
+		space := strings.IndexAny(raw, " \t")
+		if space < 0 {
+			return nil, fmt.Errorf("HEALTHCHECK: expected CMD after options")
+		}
+		opt := raw[:space]
+		raw = strings.TrimSpace(raw[space+1:])
+		k, v, ok := strings.Cut(opt, "=")
+		if !ok {
+			return nil, fmt.Errorf("HEALTHCHECK: option %q requires a value", opt)
+		}
+		switch k {
+		case "--interval":
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return nil, fmt.Errorf("HEALTHCHECK --interval: %w", err)
+			}
+			out.Interval = int64(d)
+		case "--timeout":
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return nil, fmt.Errorf("HEALTHCHECK --timeout: %w", err)
+			}
+			out.Timeout = int64(d)
+		case "--start-period":
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return nil, fmt.Errorf("HEALTHCHECK --start-period: %w", err)
+			}
+			out.StartPeriod = int64(d)
+		case "--retries":
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, fmt.Errorf("HEALTHCHECK --retries: %w", err)
+			}
+			out.Retries = n
+		default:
+			return nil, fmt.Errorf("HEALTHCHECK: unknown option %q", k)
+		}
+	}
+	// Remaining tokens must start with CMD. Docker accepts both shell form
+	// (`CMD curl -f ...`) and exec form (`CMD ["curl","-f","..."]`).
+	if !strings.HasPrefix(strings.ToUpper(raw), "CMD") {
+		return nil, fmt.Errorf("HEALTHCHECK: expected CMD, got %q", raw)
+	}
+	cmdArgs := strings.TrimSpace(raw[len("CMD"):])
+	if strings.HasPrefix(cmdArgs, "[") {
+		// Exec form: reuse the command parser which handles JSON arrays.
+		out.Test = append([]string{"CMD"}, parseCommandInstruction(cmdArgs)...)
+	} else {
+		out.Test = []string{"CMD-SHELL", cmdArgs}
+	}
+	return out, nil
 }
 
 // parseLabelInstruction parses Dockerfile LABEL arg tokens. Supports both the
@@ -765,6 +851,9 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 			OCIWorkingDir:   state.workdir,
 			OCIPorts:        state.exposed,
 			OCILabels:       state.labels,
+			OCIUser:         state.user,
+			OCIStopSignal:   state.stopSignal,
+			OCIHealthcheck:  buildHealthcheckToStore(state.healthcheck),
 		})
 	}
 
@@ -781,16 +870,36 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 	}
 	_ = h.store.RemoveContainer(tmpID)
 	return h.store.AddImage(&store.ImageRecord{
-		ID:            "build_" + strings.TrimPrefix(targetName, "__template_build_"),
-		Ref:           ref,
-		Arch:          "amd64",
-		TemplateName:  targetName,
-		Created:       time.Now(),
-		OCIEntrypoint: state.entrypoint,
-		OCICmd:        state.cmd,
-		OCIEnv:        state.env,
-		OCIWorkingDir: state.workdir,
-		OCIPorts:      state.exposed,
-		OCILabels:     state.labels,
+		ID:             "build_" + strings.TrimPrefix(targetName, "__template_build_"),
+		Ref:            ref,
+		Arch:           "amd64",
+		TemplateName:   targetName,
+		Created:        time.Now(),
+		OCIEntrypoint:  state.entrypoint,
+		OCICmd:         state.cmd,
+		OCIEnv:         state.env,
+		OCIWorkingDir:  state.workdir,
+		OCIPorts:       state.exposed,
+		OCILabels:      state.labels,
+		OCIUser:        state.user,
+		OCIStopSignal:  state.stopSignal,
+		OCIHealthcheck: buildHealthcheckToStore(state.healthcheck),
 	})
+}
+
+// buildHealthcheckToStore converts an oci.ImageHealthcheck (captured from
+// the Dockerfile) into the store's HealthcheckConfig shape. Mirrors
+// imageHealthcheckToStore in internal/lxc — kept here to avoid widening
+// the oci↔store surface for a one-off conversion.
+func buildHealthcheckToStore(h *oci.ImageHealthcheck) *store.HealthcheckConfig {
+	if h == nil {
+		return nil
+	}
+	return &store.HealthcheckConfig{
+		Test:        append([]string{}, h.Test...),
+		Interval:    h.Interval,
+		Timeout:     h.Timeout,
+		StartPeriod: h.StartPeriod,
+		Retries:     h.Retries,
+	}
 }
