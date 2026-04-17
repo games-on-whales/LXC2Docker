@@ -541,7 +541,8 @@ func hostConfigExtrasFromRequest(hc HostConfig) *store.HostConfigExtras {
 		len(hc.ExtraHosts) == 0 && len(hc.Dns) == 0 && len(hc.DnsSearch) == 0 &&
 		len(hc.DnsOptions) == 0 && hc.Memory == 0 && hc.CPUShares == 0 &&
 		hc.NanoCPUs == 0 && len(hc.Tmpfs) == 0 && !hc.ReadonlyRootfs &&
-		hc.PidMode == "" && hc.UTSMode == "" {
+		hc.PidMode == "" && hc.UTSMode == "" && len(hc.Devices) == 0 &&
+		len(hc.DeviceCgroupRules) == 0 {
 		return nil
 	}
 	tmpfs := map[string]string{}
@@ -551,21 +552,34 @@ func hostConfigExtrasFromRequest(hc HostConfig) *store.HostConfigExtras {
 	if len(tmpfs) == 0 {
 		tmpfs = nil
 	}
+	devices := make([]store.DeviceMapping, 0, len(hc.Devices))
+	for _, d := range hc.Devices {
+		devices = append(devices, store.DeviceMapping{
+			PathOnHost:        d.PathOnHost,
+			PathInContainer:   d.PathInContainer,
+			CgroupPermissions: d.CgroupPermissions,
+		})
+	}
+	if len(devices) == 0 {
+		devices = nil
+	}
 	return &store.HostConfigExtras{
-		Privileged:     hc.Privileged,
-		CapAdd:         append([]string{}, hc.CapAdd...),
-		CapDrop:        append([]string{}, hc.CapDrop...),
-		ExtraHosts:     append([]string{}, hc.ExtraHosts...),
-		Dns:            append([]string{}, hc.Dns...),
-		DnsSearch:      append([]string{}, hc.DnsSearch...),
-		DnsOptions:     append([]string{}, hc.DnsOptions...),
-		Memory:         hc.Memory,
-		CPUShares:      hc.CPUShares,
-		NanoCPUs:       hc.NanoCPUs,
-		Tmpfs:          tmpfs,
-		ReadonlyRootfs: hc.ReadonlyRootfs,
-		PidMode:        hc.PidMode,
-		UTSMode:        hc.UTSMode,
+		Privileged:        hc.Privileged,
+		CapAdd:            append([]string{}, hc.CapAdd...),
+		CapDrop:           append([]string{}, hc.CapDrop...),
+		ExtraHosts:        append([]string{}, hc.ExtraHosts...),
+		Dns:               append([]string{}, hc.Dns...),
+		DnsSearch:         append([]string{}, hc.DnsSearch...),
+		DnsOptions:        append([]string{}, hc.DnsOptions...),
+		Memory:            hc.Memory,
+		CPUShares:         hc.CPUShares,
+		NanoCPUs:          hc.NanoCPUs,
+		Tmpfs:             tmpfs,
+		ReadonlyRootfs:    hc.ReadonlyRootfs,
+		PidMode:           hc.PidMode,
+		UTSMode:           hc.UTSMode,
+		Devices:           devices,
+		DeviceCgroupRules: append([]string{}, hc.DeviceCgroupRules...),
 	}
 }
 
@@ -1842,6 +1856,14 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 				hc.Tmpfs[k] = v
 			}
 		}
+		for _, d := range e.Devices {
+			hc.Devices = append(hc.Devices, DeviceMapping{
+				PathOnHost:        d.PathOnHost,
+				PathInContainer:   d.PathInContainer,
+				CgroupPermissions: d.CgroupPermissions,
+			})
+		}
+		hc.DeviceCgroupRules = append([]string{}, e.DeviceCgroupRules...)
 	}
 	// Reflect the stored mounts into HostConfig.Mounts — Docker's modern
 	// mount form. Portainer's container-edit dialog reads this alongside

@@ -84,20 +84,29 @@ type ContainerRecord struct {
 // HostConfigExtras is the persisted subset of Docker's HostConfig we
 // echo on inspect. Each field maps 1:1 to its Docker counterpart.
 type HostConfigExtras struct {
-	Privileged     bool              `json:"privileged,omitempty"`
-	CapAdd         []string          `json:"cap_add,omitempty"`
-	CapDrop        []string          `json:"cap_drop,omitempty"`
-	ExtraHosts     []string          `json:"extra_hosts,omitempty"`
-	Dns            []string          `json:"dns,omitempty"`
-	DnsSearch      []string          `json:"dns_search,omitempty"`
-	DnsOptions     []string          `json:"dns_options,omitempty"`
-	Memory         int64             `json:"memory,omitempty"`
-	CPUShares      int64             `json:"cpu_shares,omitempty"`
-	NanoCPUs       int64             `json:"nano_cpus,omitempty"`
-	Tmpfs          map[string]string `json:"tmpfs,omitempty"`
-	ReadonlyRootfs bool              `json:"readonly_rootfs,omitempty"`
-	PidMode        string            `json:"pid_mode,omitempty"`
-	UTSMode        string            `json:"uts_mode,omitempty"`
+	Privileged        bool              `json:"privileged,omitempty"`
+	CapAdd            []string          `json:"cap_add,omitempty"`
+	CapDrop           []string          `json:"cap_drop,omitempty"`
+	ExtraHosts        []string          `json:"extra_hosts,omitempty"`
+	Dns               []string          `json:"dns,omitempty"`
+	DnsSearch         []string          `json:"dns_search,omitempty"`
+	DnsOptions        []string          `json:"dns_options,omitempty"`
+	Memory            int64             `json:"memory,omitempty"`
+	CPUShares         int64             `json:"cpu_shares,omitempty"`
+	NanoCPUs          int64             `json:"nano_cpus,omitempty"`
+	Tmpfs             map[string]string `json:"tmpfs,omitempty"`
+	ReadonlyRootfs    bool              `json:"readonly_rootfs,omitempty"`
+	PidMode           string            `json:"pid_mode,omitempty"`
+	UTSMode           string            `json:"uts_mode,omitempty"`
+	Devices           []DeviceMapping   `json:"devices,omitempty"`
+	DeviceCgroupRules []string          `json:"device_cgroup_rules,omitempty"`
+}
+
+// DeviceMapping mirrors Docker's HostConfig.Devices entries.
+type DeviceMapping struct {
+	PathOnHost        string `json:"path_on_host"`
+	PathInContainer   string `json:"path_in_container,omitempty"`
+	CgroupPermissions string `json:"cgroup_permissions,omitempty"`
 }
 
 // HealthcheckConfig mirrors Docker's Config.Healthcheck. Stored verbatim;
