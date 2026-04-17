@@ -151,13 +151,35 @@ type VolumeRecord struct {
 
 // NetworkRecord holds metadata for a Docker-style network object.
 type NetworkRecord struct {
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	Driver    string            `json:"driver"`
-	Scope     string            `json:"scope"`
-	CreatedAt time.Time         `json:"created_at"`
-	Labels    map[string]string `json:"labels,omitempty"`
-	Options   map[string]string `json:"options,omitempty"`
+	ID         string            `json:"id"`
+	Name       string            `json:"name"`
+	Driver     string            `json:"driver"`
+	Scope      string            `json:"scope"`
+	CreatedAt  time.Time         `json:"created_at"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	Options    map[string]string `json:"options,omitempty"`
+	Internal   bool              `json:"internal,omitempty"`
+	Attachable bool              `json:"attachable,omitempty"`
+	// IPAM is roundtripped verbatim on inspect. The daemon does not use
+	// these addresses for allocation — containers still get addresses
+	// from the single gow bridge — but Portainer's network detail page
+	// displays the configured Subnet/Gateway/IPRange.
+	IPAM *NetworkIPAM `json:"ipam,omitempty"`
+}
+
+// NetworkIPAM mirrors Docker's IPAM block.
+type NetworkIPAM struct {
+	Driver  string              `json:"driver,omitempty"`
+	Options map[string]string   `json:"options,omitempty"`
+	Config  []NetworkIPAMConfig `json:"config,omitempty"`
+}
+
+// NetworkIPAMConfig is one entry inside NetworkIPAM.Config.
+type NetworkIPAMConfig struct {
+	Subnet     string            `json:"subnet,omitempty"`
+	IPRange    string            `json:"ip_range,omitempty"`
+	Gateway    string            `json:"gateway,omitempty"`
+	AuxAddress map[string]string `json:"aux_address,omitempty"`
 }
 
 // ImageRecord holds metadata for a pulled image. Templates can be backed

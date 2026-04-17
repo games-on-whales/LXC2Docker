@@ -223,13 +223,16 @@ func (h *Handler) createNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 	id := generateID()[:12]
 	rec := &store.NetworkRecord{
-		ID:        id,
-		Name:      req.Name,
-		Driver:    orDefault(req.Driver, "bridge"),
-		Scope:     "local",
-		CreatedAt: time.Now().UTC(),
-		Labels:    req.Labels,
-		Options:   req.Options,
+		ID:         id,
+		Name:       req.Name,
+		Driver:     orDefault(req.Driver, "bridge"),
+		Scope:      "local",
+		CreatedAt:  time.Now().UTC(),
+		Labels:     req.Labels,
+		Options:    req.Options,
+		Internal:   req.Internal,
+		Attachable: req.Attachable,
+		IPAM:       ipamFromRequest(req.IPAM),
 	}
 	if err := h.store.AddNetwork(rec); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
@@ -505,13 +508,65 @@ func (h *Handler) networkResource(n *store.NetworkRecord) NetworkResource {
 		Driver:     orDefault(n.Driver, "bridge"),
 		EnableIPv4: true,
 		EnableIPv6: false,
-		IPAM: map[string]any{
-			"Driver": "default",
-			"Config": []map[string]string{},
-		},
+		Internal:   n.Internal,
+		Attachable: n.Attachable,
+		IPAM:       ipamToResource(n.IPAM),
 		Options:    n.Options,
 		Labels:     n.Labels,
 		Containers: h.networkContainersFor(n.Name, n.ID),
+	}
+}
+
+// ipamFromRequest copies the create-request IPAM block into the store's
+// shape. Returns nil when the caller didn't submit an IPAM block so older
+// persisted records stay untouched.
+func ipamFromRequest(in *IPAMRequest) *store.NetworkIPAM {
+	if in == nil {
+		return nil
+	}
+	out := &store.NetworkIPAM{
+		Driver:  in.Driver,
+		Options: in.Options,
+	}
+	for _, c := range in.Config {
+		out.Config = append(out.Config, store.NetworkIPAMConfig{
+			Subnet:     c.Subnet,
+			IPRange:    c.IPRange,
+			Gateway:    c.Gateway,
+			AuxAddress: c.AuxAddress,
+		})
+	}
+	return out
+}
+
+// ipamToResource materialises the shape Docker's inspect response uses from
+// a stored IPAM block. Falls back to "default" driver with an empty Config
+// list so network detail views always see a populated block.
+func ipamToResource(in *store.NetworkIPAM) map[string]any {
+	if in == nil {
+		return map[string]any{
+			"Driver": "default",
+			"Config": []map[string]string{},
+		}
+	}
+	cfg := make([]map[string]string, 0, len(in.Config))
+	for _, c := range in.Config {
+		entry := map[string]string{}
+		if c.Subnet != "" {
+			entry["Subnet"] = c.Subnet
+		}
+		if c.IPRange != "" {
+			entry["IPRange"] = c.IPRange
+		}
+		if c.Gateway != "" {
+			entry["Gateway"] = c.Gateway
+		}
+		cfg = append(cfg, entry)
+	}
+	return map[string]any{
+		"Driver":  orDefault(in.Driver, "default"),
+		"Config":  cfg,
+		"Options": in.Options,
 	}
 }
 

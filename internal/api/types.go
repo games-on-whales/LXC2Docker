@@ -602,10 +602,29 @@ type NetworkEndpoint struct {
 }
 
 type NetworkCreateRequest struct {
-	Name    string            `json:"Name"`
+	Name       string            `json:"Name"`
+	Driver     string            `json:"Driver"`
+	Options    map[string]string `json:"Options"`
+	Labels     map[string]string `json:"Labels"`
+	Internal   bool              `json:"Internal"`
+	Attachable bool              `json:"Attachable"`
+	IPAM       *IPAMRequest      `json:"IPAM"`
+}
+
+// IPAMRequest is the subset of Docker's IPAM block we honour on create.
+type IPAMRequest struct {
 	Driver  string            `json:"Driver"`
+	Config  []IPAMConfigEntry `json:"Config"`
 	Options map[string]string `json:"Options"`
-	Labels  map[string]string `json:"Labels"`
+}
+
+// IPAMConfigEntry mirrors a single IPAM.Config entry. Roundtripped verbatim
+// through inspect — the daemon doesn't use it for address allocation today.
+type IPAMConfigEntry struct {
+	Subnet     string            `json:"Subnet,omitempty"`
+	IPRange    string            `json:"IPRange,omitempty"`
+	Gateway    string            `json:"Gateway,omitempty"`
+	AuxAddress map[string]string `json:"AuxiliaryAddresses,omitempty"`
 }
 
 type NetworkCreateResponse struct {
