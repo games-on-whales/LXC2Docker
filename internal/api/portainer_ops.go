@@ -230,6 +230,33 @@ func (h *Handler) pruneBuildCache(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// POST /auth
+// Portainer calls /auth when the user configures a registry credential. We
+// don't authenticate against registries ourselves — pulls go through whatever
+// the host has set up — so accept any payload and return the shape Docker's
+// "login succeeded" response uses.
+func (h *Handler) auth(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	jsonResponse(w, http.StatusOK, map[string]string{
+		"Status":        "Login Succeeded",
+		"IdentityToken": "",
+	})
+}
+
+// GET /plugins
+func (h *Handler) listPlugins(w http.ResponseWriter, r *http.Request) {
+	jsonResponse(w, http.StatusOK, []any{})
+}
+
+// swarmUnavailable is shared by all swarm-mode endpoints. Docker returns 503
+// with the exact message below when swarm isn't initialised; Portainer keys
+// off both the status code and the message text.
+func (h *Handler) swarmUnavailable(w http.ResponseWriter, r *http.Request) {
+	errResponse(w, http.StatusServiceUnavailable,
+		"This node is not a swarm manager. Use \"docker swarm init\" or \"docker swarm join\" to connect this node to swarm and try again.")
+}
+
 // GET /distribution/{name}/json
 // Portainer calls this before pulling so it can show manifest details. We
 // don't have registry access of our own, so we synthesise a minimal response

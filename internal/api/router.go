@@ -68,6 +68,25 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/system/df", h.systemDiskUsage).Methods(http.MethodGet)
 		sub.HandleFunc("/build/prune", h.pruneBuildCache).Methods(http.MethodPost)
 		sub.HandleFunc("/distribution/{name:.*}/json", h.inspectDistribution).Methods(http.MethodGet)
+		sub.HandleFunc("/auth", h.auth).Methods(http.MethodPost)
+		sub.HandleFunc("/plugins", h.listPlugins).Methods(http.MethodGet)
+
+		// Swarm-mode endpoints. Docker returns 503 "This node is not a swarm
+		// manager" when swarm isn't initialised; Portainer treats that as
+		// "swarm unavailable" and hides the feature. A 404 instead is
+		// surfaced as a scary error banner.
+		sub.HandleFunc("/swarm", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/swarm/{rest:.*}", h.swarmUnavailable)
+		sub.HandleFunc("/nodes", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/nodes/{rest:.*}", h.swarmUnavailable)
+		sub.HandleFunc("/services", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/services/{rest:.*}", h.swarmUnavailable)
+		sub.HandleFunc("/tasks", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/tasks/{rest:.*}", h.swarmUnavailable)
+		sub.HandleFunc("/configs", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/configs/{rest:.*}", h.swarmUnavailable)
+		sub.HandleFunc("/secrets", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/secrets/{rest:.*}", h.swarmUnavailable)
 
 		// Containers
 		sub.HandleFunc("/containers/json", h.listContainers).Methods(http.MethodGet)
