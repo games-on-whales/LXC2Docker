@@ -211,6 +211,22 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			Retries:       req.Healthcheck.Retries,
 		}
 	}
+	// Inherit image-declared User/StopSignal/Healthcheck when the request
+	// didn't specify them (matches Docker's create semantics).
+	user := req.User
+	stopSignal := req.StopSignal
+	if imgRec := h.store.GetImage(normalizeImageRef(req.Image)); imgRec != nil {
+		if user == "" {
+			user = imgRec.OCIUser
+		}
+		if stopSignal == "" {
+			stopSignal = imgRec.OCIStopSignal
+		}
+		if health == nil && imgRec.OCIHealthcheck != nil {
+			hc := *imgRec.OCIHealthcheck
+			health = &hc
+		}
+	}
 
 	extras := hostConfigExtrasFromRequest(req.HostConfig)
 
@@ -227,10 +243,10 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Labels:        labels,
 		RestartPolicy:    restart,
 		Healthcheck:      health,
-		StopSignal:       req.StopSignal,
+		StopSignal:       stopSignal,
 		HostConfigExtras: extras,
 		WorkingDir:       workingDir,
-		User:             req.User,
+		User:             user,
 		Domainname:       req.Domainname,
 		Hostname:         req.Hostname,
 		Tty:              req.Tty,

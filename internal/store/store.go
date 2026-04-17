@@ -172,12 +172,15 @@ type ImageRecord struct {
 	TemplateDataset string    `json:"template_dataset"` // ZFS dataset path of the template (preferred for new pulls; e.g. "large/dld-templates/nginx-alpine")
 	Created         time.Time `json:"created"`
 	// OCI image metadata (populated only for OCI-pulled images).
-	OCIEntrypoint []string          `json:"oci_entrypoint,omitempty"`
-	OCICmd        []string          `json:"oci_cmd,omitempty"`
-	OCIEnv        []string          `json:"oci_env,omitempty"`
-	OCIWorkingDir string            `json:"oci_working_dir,omitempty"`
-	OCIPorts      []string          `json:"oci_ports,omitempty"`
-	OCILabels     map[string]string `json:"oci_labels,omitempty"`
+	OCIEntrypoint  []string           `json:"oci_entrypoint,omitempty"`
+	OCICmd         []string           `json:"oci_cmd,omitempty"`
+	OCIEnv         []string           `json:"oci_env,omitempty"`
+	OCIWorkingDir  string             `json:"oci_working_dir,omitempty"`
+	OCIPorts       []string           `json:"oci_ports,omitempty"`
+	OCILabels      map[string]string  `json:"oci_labels,omitempty"`
+	OCIUser        string             `json:"oci_user,omitempty"`
+	OCIStopSignal  string             `json:"oci_stop_signal,omitempty"`
+	OCIHealthcheck *HealthcheckConfig `json:"oci_healthcheck,omitempty"`
 }
 
 type state struct {

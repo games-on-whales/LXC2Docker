@@ -15,12 +15,26 @@ import (
 // ImageConfig holds the fields extracted from an OCI image configuration
 // that are needed to run a container.
 type ImageConfig struct {
-	Entrypoint []string
-	Cmd        []string
-	Env        []string
-	WorkingDir string
-	Ports      []string // e.g. ["80/tcp", "443/tcp"]
-	Labels     map[string]string
+	Entrypoint  []string
+	Cmd         []string
+	Env         []string
+	WorkingDir  string
+	Ports       []string // e.g. ["80/tcp", "443/tcp"]
+	Labels      map[string]string
+	User        string
+	StopSignal  string
+	Healthcheck *ImageHealthcheck
+}
+
+// ImageHealthcheck is the subset of the OCI image healthcheck block we
+// carry through. Fields match Docker's JSON naming so the container-create
+// flow can mirror them verbatim.
+type ImageHealthcheck struct {
+	Test        []string `json:"Test,omitempty"`
+	Interval    int64    `json:"Interval,omitempty"`
+	Timeout     int64    `json:"Timeout,omitempty"`
+	StartPeriod int64    `json:"StartPeriod,omitempty"`
+	Retries     int      `json:"Retries,omitempty"`
 }
 
 // Pull downloads an OCI image from a registry and unpacks it to a rootfs
@@ -159,6 +173,15 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 			WorkingDir   string              `json:"WorkingDir"`
 			ExposedPorts map[string]struct{} `json:"ExposedPorts"`
 			Labels       map[string]string   `json:"Labels"`
+			User         string              `json:"User"`
+			StopSignal   string              `json:"StopSignal"`
+			Healthcheck  *struct {
+				Test        []string `json:"Test"`
+				Interval    int64    `json:"Interval"`
+				Timeout     int64    `json:"Timeout"`
+				StartPeriod int64    `json:"StartPeriod"`
+				Retries     int      `json:"Retries"`
+			} `json:"Healthcheck"`
 		} `json:"config"`
 	}
 	if err := json.Unmarshal(configData, &imgCfg); err != nil {
@@ -170,14 +193,26 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 		ports = append(ports, p)
 	}
 
-	return &ImageConfig{
+	out := &ImageConfig{
 		Entrypoint: imgCfg.Config.Entrypoint,
 		Cmd:        imgCfg.Config.Cmd,
 		Env:        imgCfg.Config.Env,
 		WorkingDir: imgCfg.Config.WorkingDir,
 		Ports:      ports,
 		Labels:     imgCfg.Config.Labels,
-	}, nil
+		User:       imgCfg.Config.User,
+		StopSignal: imgCfg.Config.StopSignal,
+	}
+	if hc := imgCfg.Config.Healthcheck; hc != nil && len(hc.Test) > 0 {
+		out.Healthcheck = &ImageHealthcheck{
+			Test:        hc.Test,
+			Interval:    hc.Interval,
+			Timeout:     hc.Timeout,
+			StartPeriod: hc.StartPeriod,
+			Retries:     hc.Retries,
+		}
+	}
+	return out, nil
 }
 
 // digestToPath converts "sha256:abc123..." to "sha256/abc123...".

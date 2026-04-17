@@ -392,6 +392,9 @@ func imageConfigFromRecord(rec *store.ImageRecord) *ImageConfig {
 		WorkingDir:   rec.OCIWorkingDir,
 		Labels:       copyLabels(rec.OCILabels),
 		ExposedPorts: exposed,
+		User:         rec.OCIUser,
+		StopSignal:   rec.OCIStopSignal,
+		Healthcheck:  healthcheckFromRecord(rec.OCIHealthcheck),
 	}
 }
 

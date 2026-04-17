@@ -640,16 +640,19 @@ lxc.uts.name = %s
 		oci.Cleanup(ociStoreDir, r.Ref)
 
 		if data, err := json.Marshal(store.ImageRecord{
-			ID:            "oci_" + oci.SafeDirName(r.Ref),
-			Ref:           r.Ref,
-			Arch:          r.Arch,
-			TemplateName:  r.TemplateContainerName,
-			OCIEntrypoint: cfg.Entrypoint,
-			OCICmd:        cfg.Cmd,
-			OCIEnv:        cfg.Env,
-			OCIWorkingDir: cfg.WorkingDir,
-			OCIPorts:      cfg.Ports,
-			OCILabels:     cfg.Labels,
+			ID:             "oci_" + oci.SafeDirName(r.Ref),
+			Ref:            r.Ref,
+			Arch:           r.Arch,
+			TemplateName:   r.TemplateContainerName,
+			OCIEntrypoint:  cfg.Entrypoint,
+			OCICmd:         cfg.Cmd,
+			OCIEnv:         cfg.Env,
+			OCIWorkingDir:  cfg.WorkingDir,
+			OCIPorts:       cfg.Ports,
+			OCILabels:      cfg.Labels,
+			OCIUser:        cfg.User,
+			OCIStopSignal:  cfg.StopSignal,
+			OCIHealthcheck: imageHealthcheckToStore(cfg.Healthcheck),
 		}); err == nil {
 			os.WriteFile(filepath.Join(templateDir, "oci-meta.json"), data, 0o644)
 		}
@@ -669,7 +672,23 @@ lxc.uts.name = %s
 		OCIWorkingDir:   cfg.WorkingDir,
 		OCIPorts:        cfg.Ports,
 		OCILabels:       cfg.Labels,
+		OCIUser:         cfg.User,
+		OCIStopSignal:   cfg.StopSignal,
+		OCIHealthcheck:  imageHealthcheckToStore(cfg.Healthcheck),
 	})
+}
+
+func imageHealthcheckToStore(h *oci.ImageHealthcheck) *store.HealthcheckConfig {
+	if h == nil {
+		return nil
+	}
+	return &store.HealthcheckConfig{
+		Test:        append([]string{}, h.Test...),
+		Interval:    h.Interval,
+		Timeout:     h.Timeout,
+		StartPeriod: h.StartPeriod,
+		Retries:     h.Retries,
+	}
 }
 
 // CreateContainer clones the image template, applies the given config, and
