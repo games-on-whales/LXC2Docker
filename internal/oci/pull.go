@@ -26,6 +26,7 @@ type ImageConfig struct {
 	Healthcheck *ImageHealthcheck
 	Volumes     []string // e.g. ["/var/lib/postgresql/data"]
 	Shell       []string // default shell for RUN shell form, e.g. ["/bin/bash","-c"]
+	Digest      string   // sha256:... of the registry manifest (for RepoDigests)
 }
 
 // ImageHealthcheck is the subset of the OCI image healthcheck block we
@@ -212,6 +213,7 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 		StopSignal: imgCfg.Config.StopSignal,
 		Volumes:    volumes,
 		Shell:      imgCfg.Config.Shell,
+		Digest:     manifestDigest,
 	}
 	if hc := imgCfg.Config.Healthcheck; hc != nil && len(hc.Test) > 0 {
 		out.Healthcheck = &ImageHealthcheck{
