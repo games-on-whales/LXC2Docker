@@ -3,6 +3,7 @@ package api
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -594,6 +595,7 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	if follow {
 		// Tail: poll for new content until client disconnects.
 		ctx := r.Context()
+		pending := make([]byte, 0, 4096)
 		for {
 			select {
 			case <-ctx.Done():
@@ -603,7 +605,16 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 			buf := make([]byte, 32*1024)
 			n, err := f.Read(buf)
 			if n > 0 {
-				writeLogFrame(w, 1, buf[:n])
+				pending = append(pending, buf[:n]...)
+				for {
+					idx := bytes.IndexByte(pending, '\n')
+					if idx < 0 {
+						break
+					}
+					line := parseLogLine(strings.TrimSuffix(string(pending[:idx]), "\r"))
+					writeLogFrame(w, 1, append([]byte(formatLogLine(line, timestamps)), '\n'))
+					pending = pending[idx+1:]
+				}
 				if fl, ok := w.(http.Flusher); ok {
 					fl.Flush()
 				}
