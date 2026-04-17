@@ -526,7 +526,12 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	if err := h.mgr.StopContainer(id, 10*time.Second); err != nil {
+	timeout, err := parseStopTimeout(r.URL.Query().Get("t"), 10*time.Second)
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.mgr.StopContainer(id, timeout); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -894,9 +899,14 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
+	timeout, err := parseStopTimeout(r.URL.Query().Get("t"), 10*time.Second)
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	state, _ := h.mgr.State(id)
 	if state == "running" {
-		if err := h.mgr.StopContainer(id, 10*time.Second); err != nil {
+		if err := h.mgr.StopContainer(id, timeout); err != nil {
 			errResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -920,6 +930,24 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// parseStopTimeout interprets Docker's ?t=<seconds> query param. Missing or
+// empty returns the caller's default; negative values mean "no timeout" in
+// Docker (kill immediately), so clamp to zero.
+func parseStopTimeout(raw string, fallback time.Duration) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid t value %q", raw)
+	}
+	if n < 0 {
+		return 0, nil
+	}
+	return time.Duration(n) * time.Second, nil
 }
 
 // POST /containers/{id}/rename
