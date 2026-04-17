@@ -1126,6 +1126,10 @@ func (h *Handler) topViaNsenter(id, psArgs string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	allowed, err := processTreeSet(pid)
+	if err != nil {
+		return nil, err
+	}
 	candidates := [][]string{}
 	if psArgs != "" {
 		candidates = append(candidates, append([]string{"ps"}, strings.Fields(psArgs)...))
@@ -1142,10 +1146,93 @@ func (h *Handler) topViaNsenter(id, psArgs string) ([]byte, error) {
 		}, argv...)...)
 		out, err := cmd.Output()
 		if err == nil && strings.TrimSpace(string(out)) != "" {
-			return out, nil
+			filtered := filterTopOutputByPIDSet(out, allowed)
+			if strings.TrimSpace(string(filtered)) != "" {
+				return filtered, nil
+			}
 		}
 	}
 	return nil, fmt.Errorf("no usable ps variant found")
+}
+
+func filterTopOutputByPIDSet(out []byte, allowed map[int]struct{}) []byte {
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 {
+		return nil
+	}
+	titles := strings.Fields(lines[0])
+	pidIdx := -1
+	for i, title := range titles {
+		if strings.EqualFold(title, "PID") {
+			pidIdx = i
+			break
+		}
+	}
+	if pidIdx < 0 {
+		return out
+	}
+
+	filtered := []string{lines[0]}
+	for _, line := range lines[1:] {
+		fields := splitFieldsWithTail(line, len(titles))
+		if len(fields) != len(titles) {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[pidIdx])
+		if err != nil {
+			continue
+		}
+		if _, ok := allowed[pid]; ok {
+			filtered = append(filtered, line)
+		}
+	}
+	return []byte(strings.Join(filtered, "\n"))
+}
+
+func processTreeSet(root int) (map[int]struct{}, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	ppids := make(map[int]int)
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
+		if err != nil {
+			continue
+		}
+		ppids[pid] = parsePPIDFromStatus(data)
+	}
+	allowed := map[int]struct{}{root: {}}
+	for {
+		changed := false
+		for pid, ppid := range ppids {
+			if _, ok := allowed[pid]; ok {
+				continue
+			}
+			if _, ok := allowed[ppid]; ok {
+				allowed[pid] = struct{}{}
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return allowed, nil
+}
+
+func parsePPIDFromStatus(data []byte) int {
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "PPid:") {
+			ppid, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "PPid:")))
+			return ppid
+		}
+	}
+	return -1
 }
 
 func splitFieldsWithTail(line string, want int) []string {
