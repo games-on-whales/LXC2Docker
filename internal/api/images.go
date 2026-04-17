@@ -159,18 +159,21 @@ func (h *Handler) tagImage(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) searchImages(w http.ResponseWriter, r *http.Request) {
 	term := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("term")))
-	results := make([]ImageSearchResult, 0, 16)
-	seen := map[string]struct{}{}
+	index := map[string]ImageSearchResult{}
 	for _, rec := range h.store.ListImages() {
-		name := strings.TrimSuffix(rec.Ref, ":latest")
-		addImageSearchResult(results, seen, ImageSearchResult{
+		name := imageSearchName(rec.Ref)
+		addImageSearchResult(index, ImageSearchResult{
 			Name:        name,
-			Description: "Local image available in docker-lxc-daemon",
+			Description: "Image available locally in docker-lxc-daemon",
 			IsOfficial:  strings.Count(name, "/") == 0,
-		}, term, &results)
+		}, term)
 	}
 	for _, candidate := range curatedImageSearchResults() {
-		addImageSearchResult(results, seen, candidate, term, &results)
+		addImageSearchResult(index, candidate, term)
+	}
+	results := make([]ImageSearchResult, 0, len(index))
+	for _, candidate := range index {
+		results = append(results, candidate)
 	}
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].StarCount != results[j].StarCount {
@@ -214,19 +217,52 @@ func normalizeImageRef(name string) string {
 	return name
 }
 
-func addImageSearchResult(current []ImageSearchResult, seen map[string]struct{}, candidate ImageSearchResult, term string, dst *[]ImageSearchResult) {
+func addImageSearchResult(index map[string]ImageSearchResult, candidate ImageSearchResult, term string) {
 	nameKey := strings.ToLower(candidate.Name)
-	if _, ok := seen[nameKey]; ok {
-		return
-	}
 	if term != "" {
 		haystack := strings.ToLower(candidate.Name + " " + candidate.Description)
 		if !strings.Contains(haystack, term) {
 			return
 		}
 	}
-	seen[nameKey] = struct{}{}
-	*dst = append(*dst, candidate)
+	if existing, ok := index[nameKey]; ok {
+		index[nameKey] = mergeImageSearchResult(existing, candidate)
+		return
+	}
+	index[nameKey] = candidate
+}
+
+func mergeImageSearchResult(a, b ImageSearchResult) ImageSearchResult {
+	out := a
+	aLocal := strings.Contains(strings.ToLower(a.Description), "available locally")
+	bLocal := strings.Contains(strings.ToLower(b.Description), "available locally")
+	if b.StarCount > out.StarCount {
+		out.StarCount = b.StarCount
+	}
+	out.IsOfficial = out.IsOfficial || b.IsOfficial
+	out.IsAutomated = out.IsAutomated || b.IsAutomated
+	if aLocal && !bLocal {
+		out.Description = b.Description
+	} else if !aLocal && bLocal {
+		// Keep the richer non-local description already present.
+	} else if len(b.Description) > len(out.Description) {
+		out.Description = b.Description
+	}
+	if aLocal || bLocal {
+		if !strings.Contains(strings.ToLower(out.Description), "available locally") {
+			out.Description += "; available locally"
+		}
+	}
+	return out
+}
+
+func imageSearchName(ref string) string {
+	lastSlash := strings.LastIndex(ref, "/")
+	lastColon := strings.LastIndex(ref, ":")
+	if lastColon > lastSlash {
+		return ref[:lastColon]
+	}
+	return ref
 }
 
 func curatedImageSearchResults() []ImageSearchResult {
