@@ -444,20 +444,51 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	// Poll until the container stops.
+	condition := strings.TrimSpace(r.URL.Query().Get("condition"))
+	if condition == "" {
+		condition = "not-running"
+	}
+	switch condition {
+	case "not-running", "next-exit", "removed":
+	default:
+		errResponse(w, http.StatusBadRequest, "unsupported wait condition")
+		return
+	}
+	lastExitCode := 0
+	if rec := h.store.GetContainer(id); rec != nil {
+		lastExitCode = rec.ExitCode
+	}
+
 	ctx := r.Context()
 	for {
+		if condition == "removed" {
+			if h.mgr.GetContainer(id) == nil {
+				jsonResponse(w, http.StatusOK, map[string]any{
+					"StatusCode": lastExitCode,
+					"Error":      nil,
+				})
+				return
+			}
+		}
+
 		state, _ := h.mgr.State(id)
 		if state != "running" {
 			if rec := h.store.GetContainer(id); rec != nil && rec.StartedAt != nil && rec.FinishedAt == nil {
 				h.markContainerExited(rec, rec.ExitCode)
 			}
-			statusCode := 0
 			if rec := h.store.GetContainer(id); rec != nil {
-				statusCode = rec.ExitCode
+				lastExitCode = rec.ExitCode
+			}
+			if condition == "removed" {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(500 * time.Millisecond):
+				}
+				continue
 			}
 			jsonResponse(w, http.StatusOK, map[string]any{
-				"StatusCode": statusCode,
+				"StatusCode": lastExitCode,
 				"Error":      nil,
 			})
 			return
