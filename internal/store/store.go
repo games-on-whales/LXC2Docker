@@ -100,6 +100,14 @@ type HostConfigExtras struct {
 	UTSMode           string            `json:"uts_mode,omitempty"`
 	Devices           []DeviceMapping   `json:"devices,omitempty"`
 	DeviceCgroupRules []string          `json:"device_cgroup_rules,omitempty"`
+	UsernsMode        string            `json:"userns_mode,omitempty"`
+	GroupAdd          []string          `json:"group_add,omitempty"`
+	SecurityOpt       []string          `json:"security_opt,omitempty"`
+	Sysctls           map[string]string `json:"sysctls,omitempty"`
+	PidsLimit         int64             `json:"pids_limit,omitempty"`
+	OomScoreAdj       int               `json:"oom_score_adj,omitempty"`
+	LogDriver         string            `json:"log_driver,omitempty"`
+	LogOptions        map[string]string `json:"log_options,omitempty"`
 }
 
 // DeviceMapping mirrors Docker's HostConfig.Devices entries.

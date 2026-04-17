@@ -542,7 +542,10 @@ func hostConfigExtrasFromRequest(hc HostConfig) *store.HostConfigExtras {
 		len(hc.DnsOptions) == 0 && hc.Memory == 0 && hc.CPUShares == 0 &&
 		hc.NanoCPUs == 0 && len(hc.Tmpfs) == 0 && !hc.ReadonlyRootfs &&
 		hc.PidMode == "" && hc.UTSMode == "" && len(hc.Devices) == 0 &&
-		len(hc.DeviceCgroupRules) == 0 {
+		len(hc.DeviceCgroupRules) == 0 && hc.UsernsMode == "" &&
+		len(hc.GroupAdd) == 0 && len(hc.SecurityOpt) == 0 &&
+		len(hc.Sysctls) == 0 && hc.PidsLimit == 0 && hc.OomScoreAdj == 0 &&
+		hc.LogConfig == nil {
 		return nil
 	}
 	tmpfs := map[string]string{}
@@ -563,6 +566,13 @@ func hostConfigExtrasFromRequest(hc HostConfig) *store.HostConfigExtras {
 	if len(devices) == 0 {
 		devices = nil
 	}
+	sysctls := copyStringMap(hc.Sysctls)
+	logDriver := ""
+	logOptions := map[string]string(nil)
+	if hc.LogConfig != nil {
+		logDriver = hc.LogConfig.Type
+		logOptions = copyStringMap(hc.LogConfig.Config)
+	}
 	return &store.HostConfigExtras{
 		Privileged:        hc.Privileged,
 		CapAdd:            append([]string{}, hc.CapAdd...),
@@ -580,6 +590,14 @@ func hostConfigExtrasFromRequest(hc HostConfig) *store.HostConfigExtras {
 		UTSMode:           hc.UTSMode,
 		Devices:           devices,
 		DeviceCgroupRules: append([]string{}, hc.DeviceCgroupRules...),
+		UsernsMode:        hc.UsernsMode,
+		GroupAdd:          append([]string{}, hc.GroupAdd...),
+		SecurityOpt:       append([]string{}, hc.SecurityOpt...),
+		Sysctls:           sysctls,
+		PidsLimit:         hc.PidsLimit,
+		OomScoreAdj:       hc.OomScoreAdj,
+		LogDriver:         logDriver,
+		LogOptions:        logOptions,
 	}
 }
 
@@ -1864,6 +1882,18 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 			})
 		}
 		hc.DeviceCgroupRules = append([]string{}, e.DeviceCgroupRules...)
+		hc.UsernsMode = e.UsernsMode
+		hc.GroupAdd = append([]string{}, e.GroupAdd...)
+		hc.SecurityOpt = append([]string{}, e.SecurityOpt...)
+		hc.Sysctls = copyStringMap(e.Sysctls)
+		hc.PidsLimit = e.PidsLimit
+		hc.OomScoreAdj = e.OomScoreAdj
+		if e.LogDriver != "" {
+			hc.LogConfig = &LogConfig{
+				Type:   e.LogDriver,
+				Config: copyStringMap(e.LogOptions),
+			}
+		}
 	}
 	// Reflect the stored mounts into HostConfig.Mounts — Docker's modern
 	// mount form. Portainer's container-edit dialog reads this alongside

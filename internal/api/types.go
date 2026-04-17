@@ -68,6 +68,13 @@ type HostConfig struct {
 	ReadonlyRootfs    bool                     `json:"ReadonlyRootfs,omitempty"`
 	PidMode           string                   `json:"PidMode,omitempty"`
 	UTSMode           string                   `json:"UTSMode,omitempty"`
+	UsernsMode        string                   `json:"UsernsMode,omitempty"`
+	GroupAdd          []string                 `json:"GroupAdd,omitempty"`
+	SecurityOpt       []string                 `json:"SecurityOpt,omitempty"`
+	Sysctls           map[string]string        `json:"Sysctls,omitempty"`
+	PidsLimit         int64                    `json:"PidsLimit,omitempty"`
+	OomScoreAdj       int                      `json:"OomScoreAdj,omitempty"`
+	LogConfig         *LogConfig               `json:"LogConfig,omitempty"`
 	// AutoRemove mirrors Docker's --rm flag. When true, the daemon creates
 	// the container as ephemeral (no PVE UI presence; reaped by GC after
 	// it exits). Default false → permanent PVE CT in PVE mode.
@@ -79,6 +86,15 @@ type DeviceMapping struct {
 	PathOnHost        string `json:"PathOnHost"`
 	PathInContainer   string `json:"PathInContainer"`
 	CgroupPermissions string `json:"CgroupPermissions"`
+}
+
+// LogConfig mirrors Docker's HostConfig.LogConfig. We don't actually
+// route container output through alternate log drivers — the daemon
+// always writes to lxc-start's console log — but Portainer's "Log
+// driver" dropdown reads the type back from inspect.
+type LogConfig struct {
+	Type   string            `json:"Type"`
+	Config map[string]string `json:"Config,omitempty"`
 }
 
 // PortBinding maps a container port to a host port.
