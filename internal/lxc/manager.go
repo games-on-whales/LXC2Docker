@@ -551,66 +551,59 @@ func (m *Manager) pullOCI(r *image.ResolvedImage, progress func(string)) error {
 		return fmt.Errorf("manager: oci pull: %w", err)
 	}
 
-	var templateVMID int
+	var templateDataset string
 
 	if m.UsePVE() {
-		// --- Proxmox CT mode ---
-		// Create a tarball from the rootfs, then use pct create to make a
-		// Proxmox CT template on the configured storage (ZFS).
-		progress("Creating Proxmox CT template from OCI rootfs")
+		// --- Proxmox CT mode (ZFS-only template, invisible to PVE UI) ---
+		// We do NOT register the template as a Proxmox CT (no `pct create`,
+		// no template VMID). Instead the rootfs lives in a ZFS dataset
+		// under <storage>/dld-templates/<safe-name>, with a snapshot
+		// `@tmpl` that permanent and ephemeral containers clone from.
+		progress("Creating ZFS template from OCI rootfs")
 
-		tarball := filepath.Join(os.TempDir(), "oci-template-"+oci.SafeDirName(r.Ref)+".tar.gz")
-		defer os.Remove(tarball)
+		safeName := oci.SafeDirName(r.Ref)
+		parentDS := m.pveStorage + "/dld-templates"
+		templateDataset = parentDS + "/" + safeName
+		mountPoint := "/" + templateDataset
 
-		out, err := exec.Command("tar", "czf", tarball, "-C", rootfsPath, ".").CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("manager: create tarball: %s: %w", out, err)
-		}
+		// Ensure parent dataset exists (idempotent).
+		exec.Command("zfs", "create", "-p", "-o", "mountpoint=none", parentDS).Run()
 
-		vmid, err := allocateVMID()
-		if err != nil {
-			return err
-		}
-		templateVMID = vmid
-
-		hostname := sanitizeHostname("tmpl-" + oci.SafeDirName(r.Ref))
-
-		out, err = exec.Command("pct", "create", fmt.Sprintf("%d", vmid), tarball,
-			"--storage", m.pveStorage,
-			"--ostype", "unmanaged",
-			"--arch", "amd64",
-			"--hostname", hostname,
-			"--unprivileged", "0",
-			"--rootfs", fmt.Sprintf("%s:4", m.pveStorage),
+		// Create the per-image dataset, mounted so we can populate it.
+		out, err := exec.Command("zfs", "create",
+			"-o", "mountpoint="+mountPoint,
+			templateDataset,
 		).CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("manager: pct create template %d: %s: %w", vmid, out, err)
+			return fmt.Errorf("manager: zfs create %s: %s: %w", templateDataset, out, err)
 		}
 
-		// Mark it as a template so it can't be accidentally started.
-		exec.Command("pct", "template", fmt.Sprintf("%d", vmid)).Run()
-
-		// Create a ZFS snapshot for instant ephemeral container cloning.
-		// pct template converts subvol → basevol, so snapshot the basevol.
-		snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, vmid)
-		if snapOut, snapErr := exec.Command("zfs", "snapshot", snapDataset).CombinedOutput(); snapErr != nil {
-			log.Printf("pullOCI: warning: could not create ZFS snapshot %s: %s: %v", snapDataset, snapOut, snapErr)
-		} else {
-			log.Printf("pullOCI: created ZFS snapshot %s for ephemeral cloning", snapDataset)
+		// Populate it with the OCI rootfs.
+		out, err = exec.Command("cp", "-a", rootfsPath+"/.", mountPoint+"/").CombinedOutput()
+		if err != nil {
+			exec.Command("zfs", "destroy", templateDataset).Run()
+			return fmt.Errorf("manager: copy OCI rootfs into %s: %s: %w", mountPoint, out, err)
 		}
 
-		// Write resolv.conf into the template rootfs.
-		templateRootfs := m.pveRootfsPath(vmid)
-		resolvPath := filepath.Join(templateRootfs, "etc", "resolv.conf")
+		// Bake DNS resolution into the template.
+		resolvPath := filepath.Join(mountPoint, "etc", "resolv.conf")
 		os.Remove(resolvPath)
 		os.MkdirAll(filepath.Dir(resolvPath), 0o755)
 		os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644)
+
+		// Snapshot for instant cloning by both permanent and ephemeral CTs.
+		out, err = exec.Command("zfs", "snapshot", templateDataset+"@tmpl").CombinedOutput()
+		if err != nil {
+			exec.Command("zfs", "destroy", "-r", templateDataset).Run()
+			return fmt.Errorf("manager: zfs snapshot %s@tmpl: %s: %w", templateDataset, out, err)
+		}
 
 		// Clean up the OCI working directory.
 		os.RemoveAll(rootfsPath)
 		oci.Cleanup(ociStoreDir, r.Ref)
 
-		log.Printf("pullOCI: created Proxmox template VMID %d for %s", vmid, r.Ref)
+		log.Printf("pullOCI: created ZFS template %s@tmpl for %s (no PVE CT registered)",
+			templateDataset, r.Ref)
 	} else {
 		// --- Legacy direct-LXC mode ---
 		progress("Creating LXC template from OCI rootfs")
@@ -662,17 +655,17 @@ lxc.uts.name = %s
 
 	progress("Image ready")
 	return m.store.AddImage(&store.ImageRecord{
-		ID:            "oci_" + oci.SafeDirName(r.Ref),
-		Ref:           r.Ref,
-		Arch:          r.Arch,
-		TemplateName:  r.TemplateContainerName,
-		TemplateVMID:  templateVMID,
-		Created:       time.Now(),
-		OCIEntrypoint: cfg.Entrypoint,
-		OCICmd:        cfg.Cmd,
-		OCIEnv:        cfg.Env,
-		OCIWorkingDir: cfg.WorkingDir,
-		OCIPorts:      cfg.Ports,
+		ID:              "oci_" + oci.SafeDirName(r.Ref),
+		Ref:             r.Ref,
+		Arch:            r.Arch,
+		TemplateName:    r.TemplateContainerName,
+		TemplateDataset: templateDataset,
+		Created:         time.Now(),
+		OCIEntrypoint:   cfg.Entrypoint,
+		OCICmd:          cfg.Cmd,
+		OCIEnv:          cfg.Env,
+		OCIWorkingDir:   cfg.WorkingDir,
+		OCIPorts:        cfg.Ports,
 	})
 }
 
@@ -695,10 +688,13 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 		cfg.Mounts = append(cfg.Mounts, mounts...)
 	}
 
-	if m.UsePVE() && cfg.ProxmoxCT && rec.TemplateVMID > 0 {
-		return m.createPVEContainer(id, rec, cfg)
-	}
-	if m.UsePVE() && rec.TemplateVMID > 0 {
+	// In PVE mode, dispatch by ProxmoxCT (permanent vs. ephemeral). Both
+	// new ZFS-only templates (TemplateDataset != "") and legacy template
+	// VMIDs (TemplateVMID > 0) trigger PVE paths.
+	if m.UsePVE() && (rec.TemplateDataset != "" || rec.TemplateVMID > 0) {
+		if cfg.ProxmoxCT {
+			return m.createPVEContainer(id, rec, cfg)
+		}
 		return m.createEphemeralPVE(id, rec, cfg)
 	}
 	return m.createLegacyContainer(id, rec, cfg)
@@ -732,8 +728,12 @@ func resolveISOMounts(isos []ISOMount) ([]MountSpec, error) {
 	return out, nil
 }
 
-// createPVEContainer creates a full Proxmox CT via pct clone. The container
-// is visible in the Proxmox web UI and managed via pct commands.
+// createPVEContainer creates a permanent Proxmox CT visible in the PVE
+// web UI. Provisioning uses a ZFS clone of the image's template snapshot
+// directly into the PVE-conventional subvol path, then writes the CT's
+// .conf file. We deliberately avoid `pct clone` so we don't depend on
+// (and don't create) a PVE-registered template VMID — the OCI template
+// is a raw ZFS dataset under <storage>/dld-templates/, invisible to PVE.
 func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
 	vmid, err := allocateVMID()
 	if err != nil {
@@ -762,16 +762,29 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 		storage = m.pveStorage
 	}
 
-	log.Printf("CreateContainer[PVE]: pct clone %d → VMID %d for %s (storage=%s)",
-		imgRec.TemplateVMID, vmid, id[:12], storage)
-	out, err := exec.Command("pct", "clone",
-		fmt.Sprintf("%d", imgRec.TemplateVMID),
-		fmt.Sprintf("%d", vmid),
-		"--full",
-		"--storage", storage,
+	// Resolve the template snapshot to clone from. Prefer the new-style
+	// ZFS-only template; fall back to the legacy basevol path so existing
+	// state.json records keep working until the operator re-pulls.
+	snapDataset := ""
+	if imgRec.TemplateDataset != "" {
+		snapDataset = imgRec.TemplateDataset + "@tmpl"
+	} else if imgRec.TemplateVMID > 0 {
+		snapDataset = fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, imgRec.TemplateVMID)
+	} else {
+		return fmt.Errorf("manager: image %q has no clonable template", imgRec.Ref)
+	}
+
+	targetDataset := fmt.Sprintf("%s/subvol-%d-disk-0", storage, vmid)
+	mountPoint := pveRootfsPathOn(storage, vmid)
+
+	log.Printf("CreateContainer[PVE]: zfs clone %s → %s for %s",
+		snapDataset, targetDataset, id[:12])
+	out, err := exec.Command("zfs", "clone",
+		"-o", "mountpoint="+mountPoint,
+		snapDataset, targetDataset,
 	).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: pct clone %d → %d: %s: %w", imgRec.TemplateVMID, vmid, out, err)
+		return fmt.Errorf("manager: zfs clone %s → %s: %s: %w", snapDataset, targetDataset, out, err)
 	}
 
 	// Allocate IP for bridge networking (internal gow0).
@@ -823,21 +836,29 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	return nil
 }
 
-// createEphemeralPVE creates a raw-LXC container by ZFS-cloning the PVE
-// template's rootfs. The container is NOT visible in the Proxmox UI but its
-// rootfs lives on the PVE storage pool (ZFS). Note: cfg.Storage cannot
-// override the pool here — ZFS clones must live on the same pool as their
-// source snapshot. A request for a different storage is honored only by
-// permanent CTs (createPVEContainer); for ephemeral we log and proceed.
+// createEphemeralPVE creates a raw-LXC container by ZFS-cloning the
+// template's rootfs snapshot. The container is NOT visible in the
+// Proxmox UI but its rootfs lives on the PVE storage pool (ZFS).
+// Note: cfg.Storage cannot override the pool here — ZFS clones must
+// live on the same pool as their source snapshot. A request for a
+// different storage is honored only by permanent CTs.
 func (m *Manager) createEphemeralPVE(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
 	if cfg.Storage != "" && cfg.Storage != m.pveStorage {
 		log.Printf("CreateContainer[ephemeral]: ignoring requested storage %q "+
 			"(ephemeral containers must use template's pool %q; ZFS clone is pool-local)",
 			cfg.Storage, m.pveStorage)
 	}
-	// ZFS clone the template rootfs for instant provisioning.
-	// pct template converts subvol → basevol, so clone from basevol.
-	snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, imgRec.TemplateVMID)
+	// Resolve the template snapshot. Prefer the new ZFS-only template
+	// dataset; fall back to the legacy basevol-<vmid> path so existing
+	// state.json records keep working until the operator re-pulls.
+	snapDataset := ""
+	if imgRec.TemplateDataset != "" {
+		snapDataset = imgRec.TemplateDataset + "@tmpl"
+	} else if imgRec.TemplateVMID > 0 {
+		snapDataset = fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, imgRec.TemplateVMID)
+	} else {
+		return fmt.Errorf("manager: image %q has no clonable template", imgRec.Ref)
+	}
 	cloneDataset := fmt.Sprintf("%s/lxc-%s", m.pveStorage, id)
 	cloneMountpoint := fmt.Sprintf("/%s/lxc-%s", m.pveStorage, id)
 
@@ -1206,9 +1227,22 @@ func (m *Manager) RemoveImage(ref string) error {
 		return fmt.Errorf("manager: image %q not found", ref)
 	}
 
+	if rec.TemplateDataset != "" {
+		// New-style ZFS-only template — destroy the dataset (which removes
+		// its snapshot too via -r). Outstanding clones (running containers)
+		// will block the destroy with EBUSY; that's the right behavior —
+		// the caller should remove dependent containers first.
+		out, err := exec.Command("zfs", "destroy", "-r", rec.TemplateDataset).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("manager: zfs destroy %s: %s: %w", rec.TemplateDataset, out, err)
+		}
+		return m.store.RemoveImage(ref)
+	}
+
 	if rec.TemplateVMID > 0 {
-		// PVE template — first destroy any ZFS snapshots (used by ephemeral
-		// clones), then destroy the CT template via pct.
+		// Legacy PVE template — first destroy any ZFS snapshots, then the
+		// CT template via pct. Kept for backwards compatibility with
+		// pre-Apr-2026 templates that still appear as PVE CTs.
 		snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, rec.TemplateVMID)
 		exec.Command("zfs", "destroy", snapDataset).Run() // best-effort
 		out, err := exec.Command("pct", "destroy", fmt.Sprintf("%d", rec.TemplateVMID), "--force").CombinedOutput()
@@ -1218,7 +1252,7 @@ func (m *Manager) RemoveImage(ref string) error {
 		return m.store.RemoveImage(ref)
 	}
 
-	// Legacy template — lxc-destroy.
+	// Legacy direct-LXC template — lxc-destroy.
 	if m.containerExists(rec.TemplateName) {
 		out, err := exec.Command("lxc-destroy", "-n", rec.TemplateName, "--lxcpath", m.lxcPath).CombinedOutput()
 		if err != nil {
@@ -1388,9 +1422,17 @@ func (m *Manager) containerExists(name string) bool {
 		_, err := os.Stat(pveConfigPath(rec.VMID))
 		return err == nil
 	}
-	// Check image records for PVE template by name.
+	// Check image records for templates registered under this name.
 	for _, img := range m.store.ListImages() {
-		if img.TemplateName == name && img.TemplateVMID > 0 {
+		if img.TemplateName != name {
+			continue
+		}
+		if img.TemplateDataset != "" {
+			// New-style ZFS template — exists iff the dataset's @tmpl
+			// snapshot is present.
+			return zfsSnapshotExists(img.TemplateDataset + "@tmpl")
+		}
+		if img.TemplateVMID > 0 {
 			_, err := os.Stat(pveConfigPath(img.TemplateVMID))
 			return err == nil
 		}
@@ -1399,6 +1441,11 @@ func (m *Manager) containerExists(name string) bool {
 	configPath := filepath.Join(m.lxcPath, name, "config")
 	_, err := os.Stat(configPath)
 	return err == nil
+}
+
+// zfsSnapshotExists reports whether the given ZFS snapshot exists.
+func zfsSnapshotExists(snap string) bool {
+	return exec.Command("zfs", "list", "-t", "snapshot", "-o", "name", "-H", snap).Run() == nil
 }
 
 func waitRunning(c *liblxc.Container, timeout time.Duration) error {
