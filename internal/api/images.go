@@ -226,20 +226,38 @@ func (h *Handler) imageSize(rec *store.ImageRecord) int64 {
 		return 0
 	}
 	if rec.TemplateDataset != "" {
-		out, err := exec.Command("zfs", "get", "-Hpo", "value",
-			"logicalreferenced", rec.TemplateDataset+"@tmpl").Output()
-		if err == nil {
-			if n, parseErr := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); parseErr == nil {
-				return n
-			}
+		if n, ok := zfsLogicalReferenced(rec.TemplateDataset); ok {
+			return n
 		}
 	}
 	if root := h.mgr.ImageRootfsPath(rec.Ref); root != "" {
-		if n, err := dirSize(root); err == nil {
+		if n, err := dirSize(root); err == nil && n > 0 {
+			return n
+		}
+	}
+	// Legacy OCI records store only TemplateName even when their data lives
+	// in ZFS. Mirror the recoverImageRecord logic and probe the guessed
+	// dataset path so those rows don't render as 0 B forever.
+	if storage := h.mgr.PVEStorage(); storage != "" {
+		guess := fmt.Sprintf("%s/dld-templates/%s", storage, oci.SafeDirName(rec.Ref))
+		if n, ok := zfsLogicalReferenced(guess); ok {
 			return n
 		}
 	}
 	return 0
+}
+
+func zfsLogicalReferenced(dataset string) (int64, bool) {
+	out, err := exec.Command("zfs", "get", "-Hpo", "value",
+		"logicalreferenced", dataset+"@tmpl").Output()
+	if err != nil {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 func normalizeImageRef(name string) string {
