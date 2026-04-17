@@ -522,11 +522,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			StdinOnce:    rec.StdinOnce,
 		},
 		HostConfig: hostConfig,
-		NetworkSettings: NetworkSettings{
-			IPAddress: rec.IPAddress,
-			Networks:  buildContainerEndpoints(rec),
-			Ports:     hostConfig.PortBindings,
-		},
+		NetworkSettings: containerNetworkSettings(h.mgr, rec, hostConfig.PortBindings),
 	}
 	if includeSize {
 		size, _ := dirSize(h.mgr.RootfsPath(id))
@@ -587,6 +583,50 @@ func healthcheckFromRecord(h *store.HealthcheckConfig) *HealthConfig {
 		StartInterval: h.StartInterval,
 		Retries:       h.Retries,
 	}
+}
+
+// containerNetworkSettings builds the NetworkSettings block for inspect.
+// Pulls top-level Bridge from the LXC bridge name, top-level IP/Gateway/
+// MAC from the first attached endpoint (matching Docker's behaviour for
+// containers with one network), and SandboxKey from the container's init
+// PID's net namespace path so Portainer's Network tab can deep-link.
+func containerNetworkSettings(mgr *lxc.Manager, rec *store.ContainerRecord, ports map[string][]PortBinding) NetworkSettings {
+	endpoints := buildContainerEndpoints(rec)
+	out := NetworkSettings{
+		Bridge:    lxc.BridgeName,
+		IPAddress: rec.IPAddress,
+		Networks:  endpoints,
+		Ports:     ports,
+	}
+	// Pick a primary endpoint to expose at the top level — prefer "gow"
+	// when present, otherwise the first one encountered.
+	var primary *EndpointSettings
+	if e, ok := endpoints["gow"]; ok {
+		primary = &e
+	} else {
+		for k := range endpoints {
+			e := endpoints[k]
+			primary = &e
+			break
+		}
+	}
+	if primary != nil {
+		if out.IPAddress == "" {
+			out.IPAddress = primary.IPAddress
+		}
+		out.Gateway = primary.Gateway
+		out.MacAddress = primary.MacAddress
+		out.EndpointID = primary.EndpointID
+		if primary.IPAddress != "" {
+			// Default LXC bridge subnet is /24.
+			out.IPPrefixLen = 24
+		}
+	}
+	if pid, err := mgr.InitPID(rec.ID); err == nil && pid > 0 {
+		out.SandboxKey = fmt.Sprintf("/proc/%d/ns/net", pid)
+		out.SandboxID = fmt.Sprintf("sandbox-%d", pid)
+	}
+	return out
 }
 
 // containerShell returns the shell that should appear on Config.Shell for

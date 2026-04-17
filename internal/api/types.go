@@ -197,9 +197,19 @@ type ContainerConfig struct {
 
 // NetworkSettings holds the IP and network info for a container.
 type NetworkSettings struct {
-	IPAddress string                      `json:"IPAddress"`
-	Networks  map[string]EndpointSettings `json:"Networks"`
-	Ports     map[string][]PortBinding    `json:"Ports,omitempty"`
+	Bridge                 string                      `json:"Bridge"`
+	SandboxID              string                      `json:"SandboxID,omitempty"`
+	SandboxKey             string                      `json:"SandboxKey,omitempty"`
+	HairpinMode            bool                        `json:"HairpinMode"`
+	LinkLocalIPv6Address   string                      `json:"LinkLocalIPv6Address,omitempty"`
+	LinkLocalIPv6PrefixLen int                         `json:"LinkLocalIPv6PrefixLen,omitempty"`
+	Gateway                string                      `json:"Gateway"`
+	IPAddress              string                      `json:"IPAddress"`
+	IPPrefixLen            int                         `json:"IPPrefixLen"`
+	MacAddress             string                      `json:"MacAddress,omitempty"`
+	EndpointID             string                      `json:"EndpointID,omitempty"`
+	Networks               map[string]EndpointSettings `json:"Networks"`
+	Ports                  map[string][]PortBinding    `json:"Ports,omitempty"`
 }
 
 // EndpointSettings is a per-network settings block.
