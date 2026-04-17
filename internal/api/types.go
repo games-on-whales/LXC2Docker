@@ -185,6 +185,7 @@ type ContainerConfig struct {
 	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
 	Volumes      map[string]struct{} `json:"Volumes,omitempty"`
 	StopSignal   string              `json:"StopSignal,omitempty"`
+	Shell        []string            `json:"Shell,omitempty"`
 	Healthcheck  *HealthConfig       `json:"Healthcheck,omitempty"`
 	Tty          bool                `json:"Tty"`
 	OpenStdin    bool                `json:"OpenStdin"`
@@ -203,14 +204,23 @@ type NetworkSettings struct {
 
 // EndpointSettings is a per-network settings block.
 type EndpointSettings struct {
-	IPAddress  string            `json:"IPAddress"`
-	Gateway    string            `json:"Gateway"`
-	MacAddress string            `json:"MacAddress"`
-	NetworkID  string            `json:"NetworkID"`
-	EndpointID string            `json:"EndpointID,omitempty"`
-	Aliases    []string          `json:"Aliases,omitempty"`
-	Links      []string          `json:"Links,omitempty"`
-	DriverOpts map[string]string `json:"DriverOpts,omitempty"`
+	IPAddress  string             `json:"IPAddress"`
+	Gateway    string             `json:"Gateway"`
+	MacAddress string             `json:"MacAddress"`
+	NetworkID  string             `json:"NetworkID"`
+	EndpointID string             `json:"EndpointID,omitempty"`
+	Aliases    []string           `json:"Aliases,omitempty"`
+	Links      []string           `json:"Links,omitempty"`
+	DriverOpts map[string]string  `json:"DriverOpts,omitempty"`
+	IPAMConfig *EndpointIPAMConfig `json:"IPAMConfig,omitempty"`
+}
+
+// EndpointIPAMConfig pins a static address (or LinkLocalIPs) on a single
+// network attachment. Compose deploys often supply IPv4Address here.
+type EndpointIPAMConfig struct {
+	IPv4Address  string   `json:"IPv4Address,omitempty"`
+	IPv6Address  string   `json:"IPv6Address,omitempty"`
+	LinkLocalIPs []string `json:"LinkLocalIPs,omitempty"`
 }
 
 // --- Container List ---

@@ -515,6 +515,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			ExposedPorts: imageExposedPorts(h.store, rec),
 			Volumes:      containerVolumesSet(h.store, rec),
 			StopSignal:   rec.StopSignal,
+			Shell:        containerShell(h.store, rec),
 			Healthcheck:  healthcheckFromRecord(rec.Healthcheck),
 			Tty:          rec.Tty,
 			OpenStdin:    rec.OpenStdin,
@@ -586,6 +587,16 @@ func healthcheckFromRecord(h *store.HealthcheckConfig) *HealthConfig {
 		StartInterval: h.StartInterval,
 		Retries:       h.Retries,
 	}
+}
+
+// containerShell returns the shell that should appear on Config.Shell for
+// inspect — inherited from the image's OCIShell metadata. Returns nil when
+// the image didn't declare one so omitempty hides the field.
+func containerShell(st *store.Store, rec *store.ContainerRecord) []string {
+	if img := st.GetImage(normalizeImageRef(rec.Image)); img != nil && len(img.OCIShell) > 0 {
+		return append([]string{}, img.OCIShell...)
+	}
+	return nil
 }
 
 // volumeDriverFor returns the driver to report on a mount entry. Named

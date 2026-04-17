@@ -122,14 +122,24 @@ type RestartPolicy struct {
 
 // NetworkAttachment records a container's membership in a Docker-style network.
 type NetworkAttachment struct {
-	NetworkID  string            `json:"network_id"`
-	IPAddress  string            `json:"ip_address,omitempty"`
-	Gateway    string            `json:"gateway,omitempty"`
-	MacAddress string            `json:"mac_address,omitempty"`
-	EndpointID string            `json:"endpoint_id,omitempty"`
-	Aliases    []string          `json:"aliases,omitempty"`
-	Links      []string          `json:"links,omitempty"`
-	DriverOpts map[string]string `json:"driver_opts,omitempty"`
+	NetworkID  string             `json:"network_id"`
+	IPAddress  string             `json:"ip_address,omitempty"`
+	Gateway    string             `json:"gateway,omitempty"`
+	MacAddress string             `json:"mac_address,omitempty"`
+	EndpointID string             `json:"endpoint_id,omitempty"`
+	Aliases    []string           `json:"aliases,omitempty"`
+	Links      []string           `json:"links,omitempty"`
+	DriverOpts map[string]string  `json:"driver_opts,omitempty"`
+	IPAMConfig *EndpointIPAMConfig `json:"ipam_config,omitempty"`
+}
+
+// EndpointIPAMConfig persists the per-endpoint IPAM block. The daemon
+// does not pin static addresses today; the field is roundtripped so
+// clients can read back what they submitted.
+type EndpointIPAMConfig struct {
+	IPv4Address  string   `json:"ipv4_address,omitempty"`
+	IPv6Address  string   `json:"ipv6_address,omitempty"`
+	LinkLocalIPs []string `json:"link_local_ips,omitempty"`
 }
 
 // PortBinding records a single host→container port mapping.

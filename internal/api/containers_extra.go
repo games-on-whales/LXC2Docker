@@ -394,9 +394,36 @@ func attachRequestedNetworks(st *store.Store, rec *store.ContainerRecord, cfg Ne
 			Aliases:    append([]string{}, ep.Aliases...),
 			Links:      append([]string{}, ep.Links...),
 			DriverOpts: copyStringMap(ep.DriverOpts),
+			IPAMConfig: endpointIPAMToStore(ep.IPAMConfig),
 		}
 	}
 	return nil
+}
+
+// endpointIPAMToStore copies the API-level EndpointIPAMConfig into its
+// store counterpart. Returns nil when nothing meaningful was set so older
+// records keep deserialising untouched.
+func endpointIPAMToStore(in *EndpointIPAMConfig) *store.EndpointIPAMConfig {
+	if in == nil || (in.IPv4Address == "" && in.IPv6Address == "" && len(in.LinkLocalIPs) == 0) {
+		return nil
+	}
+	return &store.EndpointIPAMConfig{
+		IPv4Address:  in.IPv4Address,
+		IPv6Address:  in.IPv6Address,
+		LinkLocalIPs: append([]string{}, in.LinkLocalIPs...),
+	}
+}
+
+// endpointIPAMFromStore is the inverse of endpointIPAMToStore.
+func endpointIPAMFromStore(in *store.EndpointIPAMConfig) *EndpointIPAMConfig {
+	if in == nil {
+		return nil
+	}
+	return &EndpointIPAMConfig{
+		IPv4Address:  in.IPv4Address,
+		IPv6Address:  in.IPv6Address,
+		LinkLocalIPs: append([]string{}, in.LinkLocalIPs...),
+	}
 }
 
 // copyStringMap returns a defensive copy of src so persisted store records
@@ -427,6 +454,7 @@ func buildContainerEndpoints(rec *store.ContainerRecord) map[string]EndpointSett
 			Aliases:    append([]string{}, attached.Aliases...),
 			Links:      append([]string{}, attached.Links...),
 			DriverOpts: copyStringMap(attached.DriverOpts),
+			IPAMConfig: endpointIPAMFromStore(attached.IPAMConfig),
 		}
 	}
 	return out
