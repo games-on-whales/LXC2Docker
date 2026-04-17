@@ -553,14 +553,25 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 
 	lines := make([]string, 0, 128)
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+		line := scanner.Text()
+		if tailLines < 0 {
+			lines = append(lines, line)
+			continue
+		}
+		if tailLines == 0 {
+			continue
+		}
+		if len(lines) < tailLines {
+			lines = append(lines, line)
+			continue
+		}
+		copy(lines, lines[1:])
+		lines[len(lines)-1] = line
 	}
 	if err := scanner.Err(); err != nil {
 		return
-	}
-	if tailLines >= 0 && len(lines) > tailLines {
-		lines = lines[len(lines)-tailLines:]
 	}
 	for _, line := range lines {
 		writeLogFrame(w, 1, append([]byte(line), '\n'))
