@@ -9,14 +9,15 @@ import "time"
 // ContainerCreateRequest mirrors the relevant subset of the Docker Engine
 // POST /containers/create body.
 type ContainerCreateRequest struct {
-	Image      string            `json:"Image"`
-	Cmd        []string          `json:"Cmd"`
-	Entrypoint []string          `json:"Entrypoint"`
-	Env        []string          `json:"Env"`
-	Labels     map[string]string `json:"Labels"`
-	WorkingDir string            `json:"WorkingDir"`
-	Mounts     []MountRequest    `json:"Mounts"`
-	HostConfig HostConfig        `json:"HostConfig"`
+	Image            string            `json:"Image"`
+	Cmd              []string          `json:"Cmd"`
+	Entrypoint       []string          `json:"Entrypoint"`
+	Env              []string          `json:"Env"`
+	Labels           map[string]string `json:"Labels"`
+	WorkingDir       string            `json:"WorkingDir"`
+	Mounts           []MountRequest    `json:"Mounts"`
+	NetworkingConfig NetworkingConfig  `json:"NetworkingConfig"`
+	HostConfig       HostConfig        `json:"HostConfig"`
 }
 
 // HostConfig holds the host-level container options.
@@ -122,6 +123,7 @@ type EndpointSettings struct {
 	Gateway    string `json:"Gateway"`
 	MacAddress string `json:"MacAddress"`
 	NetworkID  string `json:"NetworkID"`
+	EndpointID string `json:"EndpointID,omitempty"`
 }
 
 // --- Container List ---
@@ -177,6 +179,11 @@ type MountRequest struct {
 	Source   string `json:"Source"`
 	Target   string `json:"Target"`
 	ReadOnly bool   `json:"ReadOnly"`
+}
+
+// NetworkingConfig mirrors the Docker container-create networking block.
+type NetworkingConfig struct {
+	EndpointsConfig map[string]EndpointSettings `json:"EndpointsConfig"`
 }
 
 // --- Exec ---
@@ -416,6 +423,11 @@ type NetworkCreateRequest struct {
 type NetworkCreateResponse struct {
 	ID      string `json:"Id"`
 	Warning string `json:"Warning"`
+}
+
+type NetworkConnectRequest struct {
+	Container      string           `json:"Container"`
+	EndpointConfig EndpointSettings `json:"EndpointConfig"`
 }
 
 type ImageHistoryItem struct {

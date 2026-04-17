@@ -1064,6 +1064,7 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 func (m *Manager) startLXCContainer(id string) error {
 	log.Printf("StartContainer[LXC]: starting %s", id)
 	out, err := exec.Command("lxc-start", "-n", id, "--lxcpath", m.lxcPath,
+		"-d",
 		"--logfile", filepath.Join(m.lxcPath, id, "lxc-start.log"),
 		"--logpriority", "DEBUG").CombinedOutput()
 	if err != nil {
@@ -1323,6 +1324,10 @@ func (m *Manager) LogPath(id string) string {
 
 // LXCPath returns the container storage root.
 func (m *Manager) LXCPath() string { return m.lxcPath }
+
+// PVEStorage returns the configured Proxmox storage pool name, or empty in
+// legacy direct-LXC mode.
+func (m *Manager) PVEStorage() string { return m.pveStorage }
 
 // RootfsPath returns the rootfs path for a container.
 // For PVE CTs returns the ZFS subvol path; otherwise the lxcpath rootfs.

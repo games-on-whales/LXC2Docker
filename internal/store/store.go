@@ -20,20 +20,21 @@ const defaultPath = "/var/lib/docker-lxc-daemon"
 
 // ContainerRecord holds Docker-layer metadata for a single container.
 type ContainerRecord struct {
-	ID           string            `json:"id"`       // Docker hex ID (API-facing)
-	VMID         int               `json:"vmid"`     // Proxmox CT VMID (0 = legacy direct LXC)
-	Name         string            `json:"name"`     // Docker-style name (no leading slash)
-	Image        string            `json:"image"`    // Original image:tag as requested
-	ImageID      string            `json:"image_id"` // Resolved image identifier
-	Created      time.Time         `json:"created"`
-	Entrypoint   []string          `json:"entrypoint"`
-	Cmd          []string          `json:"cmd"`
-	Env          []string          `json:"env"`
-	Labels       map[string]string `json:"labels"`
-	IPAddress    string            `json:"ip_address"`
-	PortBindings []PortBinding     `json:"port_bindings,omitempty"`
-	Mounts       []MountSpec       `json:"mounts"`
-	StartedAt    *time.Time        `json:"started_at,omitempty"` // nil until first start; distinguishes "created" from "exited"
+	ID           string                       `json:"id"`       // Docker hex ID (API-facing)
+	VMID         int                          `json:"vmid"`     // Proxmox CT VMID (0 = legacy direct LXC)
+	Name         string                       `json:"name"`     // Docker-style name (no leading slash)
+	Image        string                       `json:"image"`    // Original image:tag as requested
+	ImageID      string                       `json:"image_id"` // Resolved image identifier
+	Created      time.Time                    `json:"created"`
+	Entrypoint   []string                     `json:"entrypoint"`
+	Cmd          []string                     `json:"cmd"`
+	Env          []string                     `json:"env"`
+	Labels       map[string]string            `json:"labels"`
+	IPAddress    string                       `json:"ip_address"`
+	PortBindings []PortBinding                `json:"port_bindings,omitempty"`
+	Mounts       []MountSpec                  `json:"mounts"`
+	Networks     map[string]NetworkAttachment `json:"networks,omitempty"`
+	StartedAt    *time.Time                   `json:"started_at,omitempty"` // nil until first start; distinguishes "created" from "exited"
 	// Ephemeral is true only for daemon-created raw-LXC containers that the
 	// GC is permitted to reap. Permanent Proxmox CTs (visible in PVE UI) and
 	// any pre-existing records that lack this flag are left strictly alone.
@@ -42,6 +43,15 @@ type ContainerRecord struct {
 	// on. Used by RemoveContainer for ephemeral containers (the ZFS clone
 	// dataset path includes the pool name) and for diagnostics on PVE CTs.
 	Storage string `json:"storage,omitempty"`
+}
+
+// NetworkAttachment records a container's membership in a Docker-style network.
+type NetworkAttachment struct {
+	NetworkID  string `json:"network_id"`
+	IPAddress  string `json:"ip_address,omitempty"`
+	Gateway    string `json:"gateway,omitempty"`
+	MacAddress string `json:"mac_address,omitempty"`
+	EndpointID string `json:"endpoint_id,omitempty"`
 }
 
 // PortBinding records a single host→container port mapping.
