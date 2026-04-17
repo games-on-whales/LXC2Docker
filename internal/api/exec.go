@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -87,8 +88,59 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 		User:        req.User,
 	}
 	h.execs.add(rec)
+	h.publishExecEvent("exec_create", containerID, rec)
 
 	jsonResponse(w, http.StatusCreated, ExecCreateResponse{ID: rec.ID})
+}
+
+// publishExecEvent emits a Docker-style container exec_{create,start,die}
+// event. Docker encodes the action as `exec_create: <cmd>` so subscribers
+// can match against the command text; we do the same.
+func (h *Handler) publishExecEvent(action, containerID string, rec *execRecord) {
+	cmdText := strings.Join(rec.Cmd, " ")
+	attrs := map[string]string{
+		"execID": rec.ID,
+	}
+	if name := h.containerName(containerID); name != "" {
+		attrs["name"] = name
+	}
+	if image := h.containerImage(containerID); image != "" {
+		attrs["image"] = image
+	}
+	if cmdText != "" {
+		action = action + ": " + cmdText
+	}
+	h.publishEvent("container", action, containerID, attrs)
+}
+
+// publishExecDieEvent is the exec_die counterpart and carries the final
+// exit code as an attribute, matching Docker's event body.
+func (h *Handler) publishExecDieEvent(containerID string, rec *execRecord) {
+	attrs := map[string]string{
+		"execID":   rec.ID,
+		"exitCode": strconv.Itoa(rec.ExitCode),
+	}
+	if name := h.containerName(containerID); name != "" {
+		attrs["name"] = name
+	}
+	if image := h.containerImage(containerID); image != "" {
+		attrs["image"] = image
+	}
+	h.publishEvent("container", "exec_die", containerID, attrs)
+}
+
+func (h *Handler) containerName(id string) string {
+	if rec := h.store.GetContainer(id); rec != nil {
+		return rec.Name
+	}
+	return ""
+}
+
+func (h *Handler) containerImage(id string) string {
+	if rec := h.store.GetContainer(id); rec != nil {
+		return normalizeImageRef(rec.Image)
+	}
+	return ""
 }
 
 // POST /exec/{id}/start
@@ -110,6 +162,7 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		// Fire-and-forget: run the command, don't stream output.
 		cmdArgs, env := prepareExecInvocation(rec)
 		cmd := h.mgr.Exec(rec.ContainerID, cmdArgs, env)
+		h.publishExecEvent("exec_start", rec.ContainerID, rec)
 		go func() {
 			err := cmd.Run()
 			code := 0
@@ -122,12 +175,14 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 				r.Running = false
 				r.ExitCode = code
 			})
+			h.publishExecDieEvent(rec.ContainerID, rec)
 		}()
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
 	h.execs.update(rec.ID, func(r *execRecord) { r.Running = true; r.StartedAt = time.Now() })
+	h.publishExecEvent("exec_start", rec.ContainerID, rec)
 
 	cmdArgs, env := prepareExecInvocation(rec)
 	cmd := h.mgr.Exec(rec.ContainerID, cmdArgs, env)
@@ -178,6 +233,11 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		r.Running = false
 		r.ExitCode = code
 	})
+	// Re-read the record so ExitCode is the just-written value; the
+	// publishExecDieEvent helper reads rec.ExitCode directly.
+	if final := h.execs.get(rec.ID); final != nil {
+		h.publishExecDieEvent(rec.ContainerID, final)
+	}
 }
 
 // GET /exec/{id}/json
