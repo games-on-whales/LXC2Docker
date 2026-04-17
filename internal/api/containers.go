@@ -705,26 +705,28 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		errResponse(w, http.StatusInternalServerError, "streaming not supported")
-		return
-	}
-	conn, buf, err := hj.Hijack()
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
-	buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
-	buf.WriteString("Connection: Upgrade\r\n")
-	buf.WriteString("Upgrade: tcp\r\n")
-	buf.WriteString("\r\n")
-	buf.Flush()
-
 	cmd := h.mgr.Exec(id, []string{"/bin/sh"}, nil)
-	runExecTTY(cmd, conn)
+	if hj, ok := w.(http.Hijacker); ok {
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
+		buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
+		buf.WriteString("Connection: Upgrade\r\n")
+		buf.WriteString("Upgrade: tcp\r\n")
+		buf.WriteString("\r\n")
+		buf.Flush()
+
+		runExecTTY(cmd, conn)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
+	w.WriteHeader(http.StatusOK)
+	runExecTTYOutput(cmd, w)
 }
 
 // safeJoin joins base and untrusted path, returning an error if the result
