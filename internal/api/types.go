@@ -137,13 +137,19 @@ type ContainerHealthEntry struct {
 
 // ContainerConfig is the image-level config embedded in ContainerJSON.
 type ContainerConfig struct {
-	Hostname   string            `json:"Hostname"`
-	Image      string            `json:"Image"`
-	Cmd        []string          `json:"Cmd"`
-	Entrypoint []string          `json:"Entrypoint"`
-	Env        []string          `json:"Env"`
-	Labels     map[string]string `json:"Labels"`
-	WorkingDir string            `json:"WorkingDir"`
+	Hostname     string              `json:"Hostname"`
+	Image        string              `json:"Image"`
+	Cmd          []string            `json:"Cmd"`
+	Entrypoint   []string            `json:"Entrypoint"`
+	Env          []string            `json:"Env"`
+	Labels       map[string]string   `json:"Labels"`
+	WorkingDir   string              `json:"WorkingDir"`
+	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+	StopSignal   string              `json:"StopSignal,omitempty"`
+	Tty          bool                `json:"Tty"`
+	AttachStdin  bool                `json:"AttachStdin"`
+	AttachStdout bool                `json:"AttachStdout"`
+	AttachStderr bool                `json:"AttachStderr"`
 }
 
 // NetworkSettings holds the IP and network info for a container.

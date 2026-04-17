@@ -448,12 +448,13 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		},
 		Mounts: mounts,
 		Config: &ContainerConfig{
-			Hostname:   rec.ID[:12],
-			Image:      rec.Image,
-			Cmd:        rec.Cmd,
-			Entrypoint: rec.Entrypoint,
-			Env:        rec.Env,
-			Labels:     rec.Labels,
+			Hostname:     rec.ID[:12],
+			Image:        rec.Image,
+			Cmd:          rec.Cmd,
+			Entrypoint:   rec.Entrypoint,
+			Env:          rec.Env,
+			Labels:       rec.Labels,
+			ExposedPorts: imageExposedPorts(h.store, rec),
 		},
 		HostConfig: hostConfig,
 		NetworkSettings: NetworkSettings{
@@ -469,6 +470,30 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		resp.SizeRootFs = &size
 	}
 	jsonResponse(w, http.StatusOK, resp)
+}
+
+// imageExposedPorts returns the ExposedPorts map Docker surfaces on
+// container inspect's Config block — derived from the image's OCI Ports.
+// Portainer reads this alongside HostConfig.PortBindings to show "exposed
+// but not published" ports in the detail view. Also merges any container
+// port from the existing port bindings so manually-published ports appear
+// even when the image didn't declare them.
+func imageExposedPorts(st *store.Store, rec *store.ContainerRecord) map[string]struct{} {
+	out := map[string]struct{}{}
+	if img := st.GetImage(normalizeImageRef(rec.Image)); img != nil {
+		for _, p := range img.OCIPorts {
+			if p != "" {
+				out[p] = struct{}{}
+			}
+		}
+	}
+	for _, pb := range rec.PortBindings {
+		out[fmt.Sprintf("%d/%s", pb.ContainerPort, pb.Proto)] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // splitPathArgs reproduces Docker's Path/Args split: the entrypoint (or first
