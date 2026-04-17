@@ -944,6 +944,9 @@ func (h *Handler) getArchive(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Docker-Container-Path-Stat", base64.StdEncoding.EncodeToString(statJSON))
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
 	tw := tar.NewWriter(w)
 	defer tw.Close()
 
