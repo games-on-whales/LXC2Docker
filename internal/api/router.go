@@ -105,6 +105,7 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/containers/{id}/logs", h.containerLogs).Methods(http.MethodGet)
 		sub.HandleFunc("/containers/{id}/archive", h.putArchive).Methods(http.MethodPut)
 		sub.HandleFunc("/containers/{id}/archive", h.getArchive).Methods(http.MethodGet, http.MethodHead)
+		sub.HandleFunc("/containers/{id}/export", h.exportContainer).Methods(http.MethodGet)
 		sub.HandleFunc("/containers/{id}/resize", h.resizeContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/pause", h.pauseContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/unpause", h.unpauseContainer).Methods(http.MethodPost)

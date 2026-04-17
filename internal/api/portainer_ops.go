@@ -3,8 +3,10 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -279,6 +281,40 @@ func (h *Handler) inspectDistribution(w http.ResponseWriter, r *http.Request) {
 			{"architecture": "amd64", "os": "linux"},
 		},
 	})
+}
+
+// GET /containers/{id}/export
+// Streams the container rootfs as an uncompressed tar. Portainer's "export
+// container" button and `docker export` both consume this.
+func (h *Handler) exportContainer(w http.ResponseWriter, r *http.Request) {
+	id := h.resolveID(mux.Vars(r)["id"])
+	if id == "" {
+		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+	rootfs := h.mgr.RootfsPath(id)
+	if rootfs == "" {
+		errResponse(w, http.StatusConflict, "container rootfs unavailable")
+		return
+	}
+	if _, err := os.Stat(rootfs); err != nil {
+		errResponse(w, http.StatusNotFound, "container rootfs not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.WriteHeader(http.StatusOK)
+
+	cmd := exec.CommandContext(r.Context(), "tar", "-cf", "-", "-C", rootfs, ".")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	_, _ = io.Copy(w, stdout)
+	_ = cmd.Wait()
 }
 
 // POST /commit
