@@ -88,18 +88,14 @@ func matchesImageFilters(rec *store.ImageRecord, f listFilters) bool {
 	return true
 }
 
-// POST /images/create  (docker pull)
-// Query params: fromImage=<name>, tag=<tag>
+// POST /images/create  (docker pull, or docker import when fromSrc is set)
+// Query params: fromImage=<name>, tag=<tag>, fromSrc=<url-or-dash>
 func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 	fromImage := r.URL.Query().Get("fromImage")
+	fromSrc := r.URL.Query().Get("fromSrc")
 	tag := r.URL.Query().Get("tag")
 	if tag == "" {
 		tag = "latest"
-	}
-
-	ref := fromImage
-	if !strings.Contains(fromImage, ":") {
-		ref = fromImage + ":" + tag
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -111,6 +107,25 @@ func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
+	}
+
+	// Portainer's "Import image" UI calls /images/create with fromSrc
+	// instead of fromImage. We don't ingest rootfs tarballs into the LXC
+	// template store yet, but returning a framed JSON error (with the
+	// same envelope pull uses) keeps Portainer's progress dialog from
+	// hanging on an empty stream.
+	if fromSrc != "" && fromImage == "" {
+		msg := "image import via fromSrc is not supported by docker-lxc-daemon; pull the image from a registry instead"
+		send(map[string]any{
+			"error":       msg,
+			"errorDetail": map[string]string{"message": msg},
+		})
+		return
+	}
+
+	ref := fromImage
+	if !strings.Contains(fromImage, ":") {
+		ref = fromImage + ":" + tag
 	}
 
 	send(map[string]string{"status": fmt.Sprintf("Pulling from %s", fromImage)})
