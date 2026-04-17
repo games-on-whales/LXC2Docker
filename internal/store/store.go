@@ -70,6 +70,11 @@ type ContainerRecord struct {
 	Tty       bool `json:"tty,omitempty"`
 	OpenStdin bool `json:"open_stdin,omitempty"`
 	StdinOnce bool `json:"stdin_once,omitempty"`
+	// RequestedVolumes captures Config.Volumes from the create body so
+	// inspect can echo it back alongside the image-declared volumes.
+	// We do not auto-create anonymous volumes for these paths today; the
+	// field is purely roundtripped.
+	RequestedVolumes []string `json:"requested_volumes,omitempty"`
 	// HostConfigExtras holds the HostConfig fields we roundtrip through
 	// inspect without enforcing (Privileged, caps, DNS overrides,
 	// resource limits). Portainer's Host Config tab renders these.

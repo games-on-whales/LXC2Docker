@@ -12,23 +12,24 @@ import (
 // ContainerCreateRequest mirrors the relevant subset of the Docker Engine
 // POST /containers/create body.
 type ContainerCreateRequest struct {
-	Image            string            `json:"Image"`
-	Cmd              []string          `json:"Cmd"`
-	Entrypoint       []string          `json:"Entrypoint"`
-	Env              []string          `json:"Env"`
-	Labels           map[string]string `json:"Labels"`
-	WorkingDir       string            `json:"WorkingDir"`
-	User             string            `json:"User"`
-	Domainname       string            `json:"Domainname"`
-	Hostname         string            `json:"Hostname"`
-	Mounts           []MountRequest    `json:"Mounts"`
-	NetworkingConfig NetworkingConfig  `json:"NetworkingConfig"`
-	HostConfig       HostConfig        `json:"HostConfig"`
-	Healthcheck      *HealthConfig     `json:"Healthcheck,omitempty"`
-	StopSignal       string            `json:"StopSignal,omitempty"`
-	Tty              bool              `json:"Tty"`
-	OpenStdin        bool              `json:"OpenStdin"`
-	StdinOnce        bool              `json:"StdinOnce"`
+	Image            string              `json:"Image"`
+	Cmd              []string            `json:"Cmd"`
+	Entrypoint       []string            `json:"Entrypoint"`
+	Env              []string            `json:"Env"`
+	Labels           map[string]string   `json:"Labels"`
+	WorkingDir       string              `json:"WorkingDir"`
+	User             string              `json:"User"`
+	Domainname       string              `json:"Domainname"`
+	Hostname         string              `json:"Hostname"`
+	Mounts           []MountRequest      `json:"Mounts"`
+	Volumes          map[string]struct{} `json:"Volumes"`
+	NetworkingConfig NetworkingConfig    `json:"NetworkingConfig"`
+	HostConfig       HostConfig          `json:"HostConfig"`
+	Healthcheck      *HealthConfig       `json:"Healthcheck,omitempty"`
+	StopSignal       string              `json:"StopSignal,omitempty"`
+	Tty              bool                `json:"Tty"`
+	OpenStdin        bool                `json:"OpenStdin"`
+	StdinOnce        bool                `json:"StdinOnce"`
 }
 
 // HealthConfig is Docker's healthcheck configuration block. We don't
@@ -174,6 +175,7 @@ type ContainerConfig struct {
 	Labels       map[string]string   `json:"Labels"`
 	WorkingDir   string              `json:"WorkingDir"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+	Volumes      map[string]struct{} `json:"Volumes,omitempty"`
 	StopSignal   string              `json:"StopSignal,omitempty"`
 	Healthcheck  *HealthConfig       `json:"Healthcheck,omitempty"`
 	Tty          bool                `json:"Tty"`

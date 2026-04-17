@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -252,6 +253,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Tty:              req.Tty,
 		OpenStdin:        req.OpenStdin,
 		StdinOnce:        req.StdinOnce,
+		RequestedVolumes: sortedKeys(req.Volumes),
 	}
 	rec.Networks = defaultContainerNetworks(rec)
 	if err := attachRequestedNetworks(h.store, rec, req.NetworkingConfig); err != nil {
@@ -507,6 +509,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Labels:       rec.Labels,
 			WorkingDir:   rec.WorkingDir,
 			ExposedPorts: imageExposedPorts(h.store, rec),
+			Volumes:      containerVolumesSet(h.store, rec),
 			StopSignal:   rec.StopSignal,
 			Healthcheck:  healthcheckFromRecord(rec.Healthcheck),
 			Tty:          rec.Tty,
@@ -566,6 +569,44 @@ func healthcheckFromRecord(h *store.HealthcheckConfig) *HealthConfig {
 		StartInterval: h.StartInterval,
 		Retries:       h.Retries,
 	}
+}
+
+// containerVolumesSet computes the union of image-declared volumes
+// (OCIVolumes on the image record) and request-declared volumes
+// (Config.Volumes). Returns nil when both sides are empty so inspect's
+// omitempty hides the field from the response.
+func containerVolumesSet(st *store.Store, rec *store.ContainerRecord) map[string]struct{} {
+	out := map[string]struct{}{}
+	if img := st.GetImage(normalizeImageRef(rec.Image)); img != nil {
+		for _, v := range img.OCIVolumes {
+			if v != "" {
+				out[v] = struct{}{}
+			}
+		}
+	}
+	for _, v := range rec.RequestedVolumes {
+		if v != "" {
+			out[v] = struct{}{}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// sortedKeys returns the keys of m as a sorted slice. Used to persist
+// the Config.Volumes request map in a deterministic order.
+func sortedKeys(m map[string]struct{}) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // imageExposedPorts returns the ExposedPorts map Docker surfaces on
