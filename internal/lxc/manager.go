@@ -4,6 +4,7 @@
 package lxc
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -1338,6 +1339,73 @@ func (m *Manager) RootfsPath(id string) string {
 		}
 	}
 	return filepath.Join(m.lxcPath, id, "rootfs")
+}
+
+// ImageRootfsPath returns the template rootfs path for an image reference.
+func (m *Manager) ImageRootfsPath(ref string) string {
+	rec := m.store.GetImage(ref)
+	if rec == nil {
+		return ""
+	}
+	if rec.TemplateVMID > 0 {
+		return m.pveRootfsPath(rec.TemplateVMID)
+	}
+	if rec.TemplateName != "" {
+		return filepath.Join(m.lxcPath, rec.TemplateName, "rootfs")
+	}
+	return ""
+}
+
+// InitPID returns the host PID of the container's init process.
+func (m *Manager) InitPID(id string) (int, error) {
+	rec := m.store.GetContainer(id)
+	var out []byte
+	var err error
+	if rec != nil && rec.VMID > 0 {
+		out, err = exec.Command("lxc-info", "-n", fmt.Sprintf("%d", rec.VMID), "-pH").Output()
+	} else {
+		out, err = exec.Command("lxc-info", "-n", id, "--lxcpath", m.lxcPath, "-pH").Output()
+	}
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, err
+	}
+	if pid <= 0 {
+		return 0, fmt.Errorf("container %s is not running", id)
+	}
+	return pid, nil
+}
+
+// CgroupPath returns the unified cgroup v2 path for a running container.
+func (m *Manager) CgroupPath(id string) (string, error) {
+	pid, err := m.InitPID(id)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Open(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		if parts[0] == "0" || parts[1] == "" {
+			return parts[2], nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return "", fmt.Errorf("no cgroup path found for container %s", id)
 }
 
 // --- helpers ---

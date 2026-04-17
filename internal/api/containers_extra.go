@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
 	"github.com/gorilla/mux"
+	"golang.org/x/sys/unix"
 )
 
 func (h *Handler) containerChanges(w http.ResponseWriter, r *http.Request) {
@@ -21,7 +24,26 @@ func (h *Handler) containerChanges(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	jsonResponse(w, http.StatusOK, []ChangeResponse{})
+
+	rec := h.store.GetContainer(id)
+	if rec == nil {
+		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+
+	rootfs := h.mgr.RootfsPath(id)
+	base := h.mgr.ImageRootfsPath(normalizeImageRef(rec.Image))
+	if rootfs == "" || base == "" {
+		jsonResponse(w, http.StatusOK, []ChangeResponse{})
+		return
+	}
+
+	changes, err := diffRootfs(base, rootfs)
+	if err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonResponse(w, http.StatusOK, changes)
 }
 
 func (h *Handler) containerStats(w http.ResponseWriter, r *http.Request) {
@@ -57,7 +79,16 @@ func (h *Handler) containerStats(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) snapshotContainerStats(id string) ContainerStats {
 	now := time.Now().UTC()
-	memUsage, memLimit, pids := h.collectContainerUsage(id)
+	cg, _ := h.mgr.CgroupPath(id)
+	memUsage := readUint64(filepath.Join("/sys/fs/cgroup", cg, "memory.current"))
+	memLimit := readUint64(filepath.Join("/sys/fs/cgroup", cg, "memory.max"))
+	if memLimit == 0 || memLimit == ^uint64(0) {
+		memLimit = systemMemTotal()
+	}
+	pids := int(readUint64(filepath.Join("/sys/fs/cgroup", cg, "pids.current")))
+	cpuTotal, cpuUser, cpuKernel := readCPUStat(filepath.Join("/sys/fs/cgroup", cg, "cpu.stat"))
+	systemCPU := readSystemCPUUsage()
+
 	return ContainerStats{
 		Read:    now.Format(time.RFC3339Nano),
 		PreRead: now.Add(-time.Second).Format(time.RFC3339Nano),
@@ -69,9 +100,13 @@ func (h *Handler) snapshotContainerStats(id string) ContainerStats {
 		StorageStats: map[string]any{},
 		CPUStats: CPUStats{
 			CPUUsage: CPUUsage{
-				PercpuUsage: make([]uint64, runtime.NumCPU()),
+				TotalUsage:        cpuTotal,
+				PercpuUsage:       make([]uint64, runtime.NumCPU()),
+				UsageInKernelmode: cpuKernel,
+				UsageInUsermode:   cpuUser,
 			},
-			OnlineCPUs: runtime.NumCPU(),
+			SystemCPUUsage: systemCPU,
+			OnlineCPUs:     runtime.NumCPU(),
 		},
 		PreCPUStats: CPUStats{
 			CPUUsage: CPUUsage{
@@ -80,45 +115,17 @@ func (h *Handler) snapshotContainerStats(id string) ContainerStats {
 			OnlineCPUs: runtime.NumCPU(),
 		},
 		MemoryStats: MemoryStats{
-			Usage:    uint64(memUsage),
-			MaxUsage: uint64(memUsage),
-			Limit:    uint64(memLimit),
+			Usage:    memUsage,
+			MaxUsage: memUsage,
+			Limit:    memLimit,
 			Stats: map[string]any{
-				"cache": 0,
+				"cache": readUint64(filepath.Join("/sys/fs/cgroup", cg, "memory.stat.cache")),
 			},
 		},
 		Networks: map[string]NetStats{
 			"gow": {},
 		},
 	}
-}
-
-func (h *Handler) collectContainerUsage(id string) (memUsage int64, memLimit int64, pids int) {
-	rec := h.store.GetContainer(id)
-	if rec != nil && rec.VMID == 0 {
-		if rootfsSize, err := dirSize(h.mgr.RootfsPath(id)); err == nil && rootfsSize > 0 {
-			memLimit = rootfsSize
-		}
-	}
-	if rec != nil && rec.StartedAt == nil {
-		return 0, max(memLimit, 1), 0
-	}
-	out, err := h.mgr.Exec(id, []string{"sh", "-lc", "ps -eo rss= | awk '{s+=$1} END {print s+0}'; ps -eo pid= | wc -l"}, nil).Output()
-	if err != nil {
-		return 0, max(memLimit, 1), 0
-	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) > 0 {
-		if kb, err := strconv.ParseInt(strings.TrimSpace(lines[0]), 10, 64); err == nil {
-			memUsage = kb * 1024
-		}
-	}
-	if len(lines) > 1 {
-		if n, err := strconv.Atoi(strings.TrimSpace(lines[1])); err == nil {
-			pids = n
-		}
-	}
-	return memUsage, max(memLimit, memUsage+1), pids
 }
 
 func mountTypeForSource(st *store.Store, source string) string {
@@ -156,17 +163,11 @@ func dirSize(root string) (int64, error) {
 	return total, err
 }
 
-func max(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func (h *Handler) publishEvent(kind, action, id string, attrs map[string]string) {
 	if attrs == nil {
 		attrs = map[string]string{}
 	}
+	now := time.Now()
 	h.eventsHub.publish(EventMessage{
 		Type:   kind,
 		Action: action,
@@ -175,8 +176,8 @@ func (h *Handler) publishEvent(kind, action, id string, attrs map[string]string)
 			Attributes: attrs,
 		},
 		Scope:    "local",
-		Time:     time.Now().Unix(),
-		TimeNano: time.Now().UnixNano(),
+		Time:     now.Unix(),
+		TimeNano: now.UnixNano(),
 	})
 }
 
@@ -207,4 +208,167 @@ func (h *Handler) ensureVolume(name string) (*store.VolumeRecord, error) {
 	}
 	h.publishEvent("volume", "create", name, map[string]string{"name": name, "driver": "local"})
 	return v, nil
+}
+
+func diffRootfs(baseRoot, currentRoot string) ([]ChangeResponse, error) {
+	baseEntries, err := walkRootfs(baseRoot)
+	if err != nil {
+		return nil, err
+	}
+	currentEntries, err := walkRootfs(currentRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	changes := make([]ChangeResponse, 0)
+	for path, base := range baseEntries {
+		current, ok := currentEntries[path]
+		if !ok {
+			changes = append(changes, ChangeResponse{Path: path, Kind: 2})
+			continue
+		}
+		if fileChanged(base, current) {
+			changes = append(changes, ChangeResponse{Path: path, Kind: 0})
+		}
+	}
+	for path := range currentEntries {
+		if _, ok := baseEntries[path]; !ok {
+			changes = append(changes, ChangeResponse{Path: path, Kind: 1})
+		}
+	}
+	return changes, nil
+}
+
+type fileSnapshot struct {
+	mode    fs.FileMode
+	size    int64
+	modTime time.Time
+	link    string
+}
+
+func walkRootfs(root string) (map[string]fileSnapshot, error) {
+	out := map[string]fileSnapshot{}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if path == root {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		key := "/" + filepath.ToSlash(rel)
+		snap := fileSnapshot{
+			mode:    info.Mode(),
+			size:    info.Size(),
+			modTime: info.ModTime().UTC().Truncate(time.Second),
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			if target, err := os.Readlink(path); err == nil {
+				snap.link = target
+			}
+		}
+		out[key] = snap
+		return nil
+	})
+	return out, err
+}
+
+func fileChanged(a, b fileSnapshot) bool {
+	if a.mode.Type() != b.mode.Type() {
+		return true
+	}
+	if a.mode.Perm() != b.mode.Perm() {
+		return true
+	}
+	if a.mode&os.ModeSymlink != 0 {
+		return a.link != b.link
+	}
+	if a.mode.IsRegular() && (a.size != b.size || !a.modTime.Equal(b.modTime)) {
+		return true
+	}
+	return false
+}
+
+func readUint64(path string) uint64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	s := strings.TrimSpace(string(data))
+	if s == "" || s == "max" {
+		return ^uint64(0)
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+func readCPUStat(path string) (total, user, system uint64) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0, 0
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 2 {
+			continue
+		}
+		v, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch fields[0] {
+		case "usage_usec":
+			total = v * 1000
+		case "user_usec":
+			user = v * 1000
+		case "system_usec":
+			system = v * 1000
+		}
+	}
+	return total, user, system
+}
+
+func readSystemCPUUsage() uint64 {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "cpu ") {
+			continue
+		}
+		fields := strings.Fields(line)[1:]
+		var total uint64
+		for _, field := range fields {
+			v, err := strconv.ParseUint(field, 10, 64)
+			if err != nil {
+				continue
+			}
+			total += v
+		}
+		ticks := uint64(100)
+		return total * uint64(time.Second) / ticks
+	}
+	return 0
+}
+
+func systemMemTotal() uint64 {
+	var si unix.Sysinfo_t
+	if err := unix.Sysinfo(&si); err != nil {
+		return 0
+	}
+	return uint64(si.Totalram) * uint64(si.Unit)
 }
