@@ -34,7 +34,9 @@ type ContainerRecord struct {
 	PortBindings []PortBinding                `json:"port_bindings,omitempty"`
 	Mounts       []MountSpec                  `json:"mounts"`
 	Networks     map[string]NetworkAttachment `json:"networks,omitempty"`
-	StartedAt    *time.Time                   `json:"started_at,omitempty"` // nil until first start; distinguishes "created" from "exited"
+	StartedAt    *time.Time                   `json:"started_at,omitempty"`  // nil until first start; distinguishes "created" from "exited"
+	FinishedAt   *time.Time                   `json:"finished_at,omitempty"` // nil while running or before first exit
+	ExitCode     int                          `json:"exit_code,omitempty"`
 	// Ephemeral is true only for daemon-created raw-LXC containers that the
 	// GC is permitted to reap. Permanent Proxmox CTs (visible in PVE UI) and
 	// any pre-existing records that lack this flag are left strictly alone.

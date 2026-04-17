@@ -321,6 +321,10 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 	if rec.StartedAt != nil {
 		startedAt = rec.StartedAt.Format(time.RFC3339)
 	}
+	finishedAt := "0001-01-01T00:00:00Z"
+	if rec.FinishedAt != nil {
+		finishedAt = rec.FinishedAt.Format(time.RFC3339)
+	}
 
 	// Build Mounts array from stored mount specs.
 	mounts := make([]MountJSON, 0, len(rec.Mounts))
@@ -349,8 +353,9 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		State: ContainerState{
 			Status:     state,
 			Running:    running,
+			ExitCode:   rec.ExitCode,
 			StartedAt:  startedAt,
-			FinishedAt: "0001-01-01T00:00:00Z",
+			FinishedAt: finishedAt,
 		},
 		Image:  rec.Image,
 		Mounts: mounts,
@@ -383,10 +388,12 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Record first-start timestamp so inspect can distinguish "created" from "exited".
-	if rec := h.store.GetContainer(id); rec != nil && rec.StartedAt == nil {
+	// Reset runtime state on each successful start.
+	if rec := h.store.GetContainer(id); rec != nil {
 		now := time.Now()
 		rec.StartedAt = &now
+		rec.FinishedAt = nil
+		rec.ExitCode = 0
 		h.store.AddContainer(rec)
 	}
 	if rec := h.store.GetContainer(id); rec != nil {
@@ -421,6 +428,7 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rec := h.store.GetContainer(id); rec != nil {
+		h.markContainerExited(rec, 0)
 		h.publishEvent("container", "stop", id, map[string]string{
 			"name":  rec.Name,
 			"image": normalizeImageRef(rec.Image),
@@ -441,8 +449,15 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 	for {
 		state, _ := h.mgr.State(id)
 		if state != "running" {
+			if rec := h.store.GetContainer(id); rec != nil && rec.StartedAt != nil && rec.FinishedAt == nil {
+				h.markContainerExited(rec, rec.ExitCode)
+			}
+			statusCode := 0
+			if rec := h.store.GetContainer(id); rec != nil {
+				statusCode = rec.ExitCode
+			}
 			jsonResponse(w, http.StatusOK, map[string]any{
-				"StatusCode": 0,
+				"StatusCode": statusCode,
 				"Error":      nil,
 			})
 			return
@@ -468,6 +483,7 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rec := h.store.GetContainer(id); rec != nil {
+		h.markContainerExited(rec, exitCodeForSignal(signal))
 		h.publishEvent("container", "kill", id, map[string]string{
 			"name":   rec.Name,
 			"image":  normalizeImageRef(rec.Image),
@@ -731,12 +747,20 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 			errResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if rec := h.store.GetContainer(id); rec != nil {
+			h.markContainerExited(rec, 0)
+		}
 	}
 	if err := h.mgr.StartContainer(id); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if rec := h.store.GetContainer(id); rec != nil {
+		now := time.Now()
+		rec.StartedAt = &now
+		rec.FinishedAt = nil
+		rec.ExitCode = 0
+		h.store.AddContainer(rec)
 		h.publishEvent("container", "restart", id, map[string]string{
 			"name":  rec.Name,
 			"image": normalizeImageRef(rec.Image),
@@ -1027,6 +1051,27 @@ func writeLogFrame(w io.Writer, streamType byte, data []byte) {
 	binary.BigEndian.PutUint32(header[4:], uint32(len(data)))
 	w.Write(header)
 	w.Write(data)
+}
+
+func (h *Handler) markContainerExited(rec *store.ContainerRecord, exitCode int) {
+	now := time.Now()
+	rec.FinishedAt = &now
+	rec.ExitCode = exitCode
+	_ = h.store.AddContainer(rec)
+}
+
+func exitCodeForSignal(signal string) int {
+	signal = strings.TrimSpace(strings.ToUpper(signal))
+	switch signal {
+	case "", "KILL", "SIGKILL", "9":
+		return 137
+	case "TERM", "SIGTERM", "15":
+		return 143
+	}
+	if n, err := strconv.Atoi(signal); err == nil && n > 0 {
+		return 128 + n
+	}
+	return 137
 }
 
 func parseTopOutput(lines []string) ([]string, [][]string) {
