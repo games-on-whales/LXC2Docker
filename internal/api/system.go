@@ -11,6 +11,8 @@ import (
 
 func (h *Handler) ping(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("API-Version", apiVersion)
+	w.Header().Set("OSType", runtime.GOOS)
+	w.Header().Set("Builder-Version", "1")
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
