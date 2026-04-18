@@ -572,6 +572,11 @@ func (h *Handler) commitContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, "container query parameter is required")
 		return
 	}
+	cfg, err := decodeCommitConfig(r)
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid commit config: "+err.Error())
+		return
+	}
 	id := h.resolveID(containerParam)
 	if id == "" {
 		errResponse(w, http.StatusNotFound, "No such container: "+containerParam)
@@ -618,6 +623,7 @@ func (h *Handler) commitContainer(w http.ResponseWriter, r *http.Request) {
 	dup.OCIStopSignal = committedString(rec.StopSignal, src.OCIStopSignal)
 	dup.OCIHealthcheck = committedHealthcheck(rec, src.OCIHealthcheck)
 	dup.OCIVolumes = committedSetKeys(rec.Volumes, src.OCIVolumes)
+	applyCommitConfig(&dup, cfg)
 	if err := applyCommitChanges(&dup, r.URL.Query()["changes"]); err != nil {
 		errResponse(w, http.StatusBadRequest, "invalid commit change: "+err.Error())
 		return
@@ -725,6 +731,80 @@ func safeCommitTemplateName(ref string) string {
 	ref = normalizeImageRef(ref)
 	ref = strings.NewReplacer(":", "_", "/", "_", ".", "_", " ", "_").Replace(ref)
 	return "__template_commit_" + ref
+}
+
+type commitConfig struct {
+	Cmd          []string            `json:"Cmd"`
+	Entrypoint   []string            `json:"Entrypoint"`
+	Env          []string            `json:"Env"`
+	Labels       map[string]string   `json:"Labels"`
+	User         *string             `json:"User"`
+	WorkingDir   *string             `json:"WorkingDir"`
+	StopSignal   *string             `json:"StopSignal"`
+	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
+	Volumes      map[string]struct{} `json:"Volumes"`
+	Healthcheck  *Healthcheck        `json:"Healthcheck"`
+	Shell        []string            `json:"Shell"`
+}
+
+func decodeCommitConfig(r *http.Request) (*commitConfig, error) {
+	if r.Body == nil || r.Body == http.NoBody {
+		return nil, nil
+	}
+	defer r.Body.Close()
+	var cfg commitConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		if err == io.EOF {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func applyCommitConfig(rec *store.ImageRecord, cfg *commitConfig) {
+	if rec == nil || cfg == nil {
+		return
+	}
+	if cfg.Cmd != nil {
+		rec.OCICmd = append([]string{}, cfg.Cmd...)
+	}
+	if cfg.Entrypoint != nil {
+		rec.OCIEntrypoint = append([]string{}, cfg.Entrypoint...)
+	}
+	if cfg.Env != nil {
+		rec.OCIEnv = append([]string{}, cfg.Env...)
+	}
+	if cfg.Labels != nil {
+		rec.OCILabels = copyLabels(cfg.Labels)
+	}
+	if cfg.User != nil {
+		rec.OCIUser = *cfg.User
+	}
+	if cfg.WorkingDir != nil {
+		rec.OCIWorkingDir = *cfg.WorkingDir
+	}
+	if cfg.StopSignal != nil {
+		rec.OCIStopSignal = *cfg.StopSignal
+	}
+	if cfg.ExposedPorts != nil {
+		rec.OCIPorts = mapKeys(cfg.ExposedPorts)
+	}
+	if cfg.Volumes != nil {
+		rec.OCIVolumes = mapKeys(cfg.Volumes)
+	}
+	if cfg.Healthcheck != nil {
+		rec.OCIHealthcheck = &store.HealthcheckConfig{
+			Test:        append([]string{}, cfg.Healthcheck.Test...),
+			Interval:    cfg.Healthcheck.Interval,
+			Timeout:     cfg.Healthcheck.Timeout,
+			Retries:     cfg.Healthcheck.Retries,
+			StartPeriod: cfg.Healthcheck.StartPeriod,
+		}
+	}
+	if cfg.Shell != nil {
+		rec.OCIShell = append([]string{}, cfg.Shell...)
+	}
 }
 
 func applyCommitChanges(rec *store.ImageRecord, changes []string) error {
