@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -297,6 +298,15 @@ func (h *Handler) createNetwork(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"Name"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Name != "" {
+		for _, n := range defaultNetworks() {
+			if n["Name"] == body.Name {
+				errResponse(w, http.StatusConflict,
+					fmt.Sprintf("network with name %s already exists", body.Name))
+				return
+			}
+		}
+	}
 	id := generateID()
 	h.emitNetwork("create", id, body.Name)
 	jsonResponse(w, http.StatusCreated, map[string]string{

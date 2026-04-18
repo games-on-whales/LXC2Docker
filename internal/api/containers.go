@@ -398,6 +398,9 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		for _, m := range rec.Mounts {
 			mounts = append(mounts, h.mountJSONFrom(m))
 		}
+		sort.SliceStable(mounts, func(i, j int) bool {
+			return mounts[i].Destination < mounts[j].Destination
+		})
 		summary := ContainerSummary{
 			ID:      rec.ID,
 			Names:   []string{"/" + rec.Name},
@@ -547,6 +550,9 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 	for _, m := range rec.Mounts {
 		mounts = append(mounts, h.mountJSONFrom(m))
 	}
+	sort.SliceStable(mounts, func(i, j int) bool {
+		return mounts[i].Destination < mounts[j].Destination
+	})
 
 	// Split entrypoint[0] as Path and the rest as Args, matching what Docker
 	// does for `docker inspect`. Portainer renders these on the detail page.
@@ -806,6 +812,14 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	signal := r.URL.Query().Get("signal")
+	if signal != "" && !isValidSignal(signal) {
+		errResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid signal: %s", signal))
+		return
+	}
+	if s, _ := h.mgr.State(id); s != "running" && s != "paused" {
+		errResponse(w, http.StatusConflict, "Container is not running")
+		return
+	}
 	if err := h.mgr.KillContainer(id, signal); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1669,6 +1683,25 @@ func containerUsesVolume(rec *store.ContainerRecord, st *store.Store, names []st
 		}
 	}
 	return false
+}
+
+func isValidSignal(s string) bool {
+	if strings.ContainsAny(s, " \t\n") {
+		return false
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return n >= 0 && n <= 64
+	}
+	bare := strings.TrimPrefix(strings.ToUpper(s), "SIG")
+	if bare == "" {
+		return false
+	}
+	for _, r := range bare {
+		if !((r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '+' || r == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func isValidRestartPolicy(name string) bool {

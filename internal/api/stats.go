@@ -114,6 +114,9 @@ func (h *Handler) containerStats(w http.ResponseWriter, r *http.Request) {
 		if prev != nil {
 			s.PreCPUStats = prev.CPUStats
 			s.Preread = prev.Read
+		} else {
+			s.Preread = s.Read
+			s.PreCPUStats = s.CPUStats
 		}
 		_ = enc.Encode(&s)
 		if flusher != nil {
