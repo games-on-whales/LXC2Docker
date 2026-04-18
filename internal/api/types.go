@@ -621,6 +621,27 @@ type PluginsInfo struct {
 	Log           []string `json:"Log"`
 }
 
+// Plugin is a minimal Docker plugin summary. We currently expose no plugins,
+// but Portainer expects the route to exist and the response to be a list of
+// plugin-shaped objects rather than an arbitrary array.
+type Plugin struct {
+	ID         string   `json:"Id"`
+	Name       string   `json:"Name"`
+	Enabled    bool     `json:"Enabled"`
+	Settings   any      `json:"Settings,omitempty"`
+	PluginRef  string   `json:"PluginReference,omitempty"`
+	Config     any      `json:"Config,omitempty"`
+	Tags       []string `json:"Tags,omitempty"`
+	Privileges []any    `json:"Privileges,omitempty"`
+}
+
+// PluginPrivilege is the response element for GET /plugins/privileges.
+type PluginPrivilege struct {
+	Name        string   `json:"Name"`
+	Description string   `json:"Description"`
+	Value       []string `json:"Value"`
+}
+
 // ErrorResponse is the standard Docker API error body.
 type ErrorResponse struct {
 	Message string `json:"message"`

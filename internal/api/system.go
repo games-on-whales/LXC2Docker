@@ -152,7 +152,14 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 			AllowNondistributableArtifactsCIDRs:     []string{},
 			AllowNondistributableArtifactsHostnames: []string{},
 			InsecureRegistryCIDRs:                   []string{},
-			IndexConfigs:                            map[string]any{},
+			IndexConfigs: map[string]any{
+				"docker.io": map[string]any{
+					"Name":     "docker.io",
+					"Mirrors":  []string{},
+					"Secure":   true,
+					"Official": true,
+				},
+			},
 			Mirrors:                                 []string{},
 		},
 		Swarm: SwarmInfo{
@@ -162,7 +169,7 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 		Plugins: PluginsInfo{
 			Volume:        []string{"local"},
 			Network:       []string{"bridge", "host", "none"},
-			Authorization: nil,
+			Authorization: []string{},
 			Log:           []string{"json-file"},
 		},
 		DefaultRuntime:     "lxc",

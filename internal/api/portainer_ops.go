@@ -393,7 +393,50 @@ func (h *Handler) auth(w http.ResponseWriter, r *http.Request) {
 
 // GET /plugins
 func (h *Handler) listPlugins(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, http.StatusOK, []any{})
+	jsonResponse(w, http.StatusOK, []Plugin{})
+}
+
+// GET /plugins/privileges
+// Portainer probes this before plugin installation to discover what elevated
+// permissions a plugin would request. We don't support Docker plugins, so the
+// daemon reports an empty set rather than 404ing the route.
+func (h *Handler) pluginPrivileges(w http.ResponseWriter, r *http.Request) {
+	jsonResponse(w, http.StatusOK, []PluginPrivilege{})
+}
+
+// GET /plugins/{name}/json
+func (h *Handler) inspectPlugin(w http.ResponseWriter, r *http.Request) {
+	errResponse(w, http.StatusNotFound, "plugin not found")
+}
+
+// GET /plugins/{name}/yaml
+func (h *Handler) pluginYAML(w http.ResponseWriter, r *http.Request) {
+	errResponse(w, http.StatusNotFound, "plugin not found")
+}
+
+// POST /plugins/pull
+func (h *Handler) pullPlugin(w http.ResponseWriter, r *http.Request) {
+	errResponse(w, http.StatusNotImplemented, "plugins are not supported by docker-lxc-daemon")
+}
+
+// POST /plugins/{name}/enable
+func (h *Handler) enablePlugin(w http.ResponseWriter, r *http.Request) {
+	errResponse(w, http.StatusNotFound, "plugin not found")
+}
+
+// POST /plugins/{name}/disable
+func (h *Handler) disablePlugin(w http.ResponseWriter, r *http.Request) {
+	errResponse(w, http.StatusNotFound, "plugin not found")
+}
+
+// POST /plugins/{name}/upgrade
+func (h *Handler) upgradePlugin(w http.ResponseWriter, r *http.Request) {
+	errResponse(w, http.StatusNotImplemented, "plugins are not supported by docker-lxc-daemon")
+}
+
+// DELETE /plugins/{name}
+func (h *Handler) removePlugin(w http.ResponseWriter, r *http.Request) {
+	errResponse(w, http.StatusNotFound, "plugin not found")
 }
 
 // swarmUnavailable is shared by all swarm-mode endpoints. Docker returns 503
