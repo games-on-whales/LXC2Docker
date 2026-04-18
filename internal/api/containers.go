@@ -379,6 +379,9 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		if filt.has("network") && !containerOnNetwork(rec, filt["network"]) {
 			continue
 		}
+		if filt.has("expose") && !containerExposes(h.exposedPortsFor(rec), filt["expose"]) {
+			continue
+		}
 		// The "health" filter matches HealthStatus ("starting"/"healthy"/
 		// "unhealthy") or the special value "none" for containers without
 		// a configured healthcheck. Portainer's "Unhealthy" dashboard
@@ -631,10 +634,10 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			ExposedPorts: h.exposedPortsFor(rec),
 			Image:        rec.Image,
 			Volumes:      rec.Volumes,
-			Cmd:          rec.Cmd,
-			Entrypoint:   rec.Entrypoint,
-			Env:          rec.Env,
-			Labels:       rec.Labels,
+			Cmd:          ensureSlice(rec.Cmd),
+			Entrypoint:   ensureSlice(rec.Entrypoint),
+			Env:          ensureSlice(rec.Env),
+			Labels:       ensureMap(rec.Labels),
 			WorkingDir:   rec.WorkingDir,
 			StopSignal:   rec.StopSignal,
 			StopTimeout:  stopTimeoutPtr(rec.StopTimeout),
@@ -1673,7 +1676,35 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 			hc.Binds = append(hc.Binds, bind)
 		}
 	}
+	normalizeHostConfig(hc)
 	return hc
+}
+
+func normalizeHostConfig(hc *HostConfig) {
+	if hc.Binds == nil {
+		hc.Binds = []string{}
+	}
+	if hc.Devices == nil {
+		hc.Devices = []DeviceMapping{}
+	}
+	if hc.DeviceCgroupRules == nil {
+		hc.DeviceCgroupRules = []string{}
+	}
+	if hc.CapAdd == nil {
+		hc.CapAdd = []string{}
+	}
+	if hc.CapDrop == nil {
+		hc.CapDrop = []string{}
+	}
+	if hc.SecurityOpt == nil {
+		hc.SecurityOpt = []string{}
+	}
+	if hc.GroupAdd == nil {
+		hc.GroupAdd = []string{}
+	}
+	if hc.PortBindings == nil {
+		hc.PortBindings = map[string][]PortBinding{}
+	}
 }
 
 func (h *Handler) exposedPortsFor(rec *store.ContainerRecord) map[string]struct{} {
@@ -1693,6 +1724,40 @@ func (h *Handler) exposedPortsFor(rec *store.ContainerRecord) map[string]struct{
 		return nil
 	}
 	return out
+}
+
+func ensureSlice(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+func ensureMap(m map[string]string) map[string]string {
+	if m == nil {
+		return map[string]string{}
+	}
+	return m
+}
+
+func containerExposes(exposed map[string]struct{}, wants []string) bool {
+	if len(exposed) == 0 {
+		return false
+	}
+	for _, want := range wants {
+		if _, ok := exposed[want]; ok {
+			return true
+		}
+		if !strings.Contains(want, "/") {
+			if _, ok := exposed[want+"/tcp"]; ok {
+				return true
+			}
+			if _, ok := exposed[want+"/udp"]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func containerOnNetwork(rec *store.ContainerRecord, names []string) bool {
