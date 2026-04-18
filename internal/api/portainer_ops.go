@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -617,6 +618,25 @@ func (h *Handler) commitContainer(w http.ResponseWriter, r *http.Request) {
 	dup.OCIStopSignal = committedString(rec.StopSignal, src.OCIStopSignal)
 	dup.OCIHealthcheck = committedHealthcheck(rec, src.OCIHealthcheck)
 	dup.OCIVolumes = committedSetKeys(rec.Volumes, src.OCIVolumes)
+	if h.mgr != nil {
+		rootfs := h.mgr.RootfsPath(id)
+		if rootfs == "" {
+			errResponse(w, http.StatusConflict, "container rootfs unavailable")
+			return
+		}
+		if _, err := os.Stat(rootfs); err != nil {
+			errResponse(w, http.StatusNotFound, "container rootfs not found")
+			return
+		}
+		templateName, err := snapshotCommittedImageRootfs(h.mgr.LXCPath(), ref, rootfs)
+		if err != nil {
+			errResponse(w, http.StatusInternalServerError, "snapshot container rootfs: "+err.Error())
+			return
+		}
+		dup.TemplateName = templateName
+		dup.TemplateVMID = 0
+		dup.TemplateDataset = ""
+	}
 	if err := h.store.AddImage(&dup); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -675,4 +695,30 @@ func committedHealthcheck(rec *store.ContainerRecord, fallback *store.Healthchec
 		Retries:     fallback.Retries,
 		StartPeriod: fallback.StartPeriod,
 	}
+}
+
+func snapshotCommittedImageRootfs(lxcPath, ref, rootfs string) (string, error) {
+	targetName := safeCommitTemplateName(ref)
+	targetDir := filepath.Join(lxcPath, targetName)
+	if err := os.RemoveAll(targetDir); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return "", err
+	}
+	if err := copyTree(rootfs, filepath.Join(targetDir, "rootfs")); err != nil {
+		return "", err
+	}
+	minimalConfig := fmt.Sprintf("lxc.include = /usr/share/lxc/config/common.conf\nlxc.arch = linux64\nlxc.rootfs.path = dir:%s\nlxc.uts.name = %s\n",
+		filepath.Join(targetDir, "rootfs"), targetName)
+	if err := os.WriteFile(filepath.Join(targetDir, "config"), []byte(minimalConfig), 0o644); err != nil {
+		return "", err
+	}
+	return targetName, nil
+}
+
+func safeCommitTemplateName(ref string) string {
+	ref = normalizeImageRef(ref)
+	ref = strings.NewReplacer(":", "_", "/", "_", ".", "_", " ", "_").Replace(ref)
+	return "__template_commit_" + ref
 }
