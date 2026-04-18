@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -525,6 +526,9 @@ func (h *Handler) volumeRoot() string {
 func (h *Handler) listVolumes(w http.ResponseWriter, r *http.Request) {
 	filt := parseFilters(r)
 	records := h.store.ListVolumes()
+	sort.SliceStable(records, func(i, j int) bool {
+		return records[i].Name < records[j].Name
+	})
 	out := make([]map[string]any, 0, len(records))
 	for _, v := range records {
 		if !filt.matchLabel(v.Labels) {

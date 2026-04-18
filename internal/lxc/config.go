@@ -30,6 +30,9 @@ type ContainerConfig struct {
 	CPUShares         int64        // 0 = unlimited (relative weight)
 	CPUQuota          int64        // microseconds per 100ms period, 0 = unlimited
 	NanoCPUs          int64        // Docker's CPU limit in units of 1e-9 CPU; 1.5 CPU = 1.5e9
+	CpusetCpus        string       // Docker's --cpuset-cpus (e.g. "0-3", "0,2")
+	CpusetMems        string       // Docker's --cpuset-mems (e.g. "0")
+	PidsLimit         int64        // Maximum PIDs in the container (0 = unlimited)
 	WorkingDir        string       // container cwd; maps to lxc.init.cwd
 	// Security. Privileged grants full capabilities + unrestricted device
 	// access; equivalent to Docker's --privileged. CapAdd/CapDrop extend
@@ -426,6 +429,15 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 			"lxc.cgroup2.cpu.max",
 			fmt.Sprintf("%d 100000", quota),
 		})
+	}
+	if cfg.CpusetCpus != "" {
+		items = append(items, configItem{"lxc.cgroup2.cpuset.cpus", cfg.CpusetCpus})
+	}
+	if cfg.CpusetMems != "" {
+		items = append(items, configItem{"lxc.cgroup2.cpuset.mems", cfg.CpusetMems})
+	}
+	if cfg.PidsLimit > 0 {
+		items = append(items, configItem{"lxc.cgroup2.pids.max", fmt.Sprintf("%d", cfg.PidsLimit)})
 	}
 
 	// Privileged + capability handling. Docker's --privileged maps to two
@@ -862,6 +874,15 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 			"lxc.cgroup2.cpu.max",
 			fmt.Sprintf("%d 100000", quota),
 		})
+	}
+	if cfg.CpusetCpus != "" {
+		items = append(items, configItem{"lxc.cgroup2.cpuset.cpus", cfg.CpusetCpus})
+	}
+	if cfg.CpusetMems != "" {
+		items = append(items, configItem{"lxc.cgroup2.cpuset.mems", cfg.CpusetMems})
+	}
+	if cfg.PidsLimit > 0 {
+		items = append(items, configItem{"lxc.cgroup2.pids.max", fmt.Sprintf("%d", cfg.PidsLimit)})
 	}
 
 	// Capabilities / privileged: same rules as the legacy path.
