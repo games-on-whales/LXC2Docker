@@ -233,6 +233,54 @@ func TestBuildRoutesHitBuildHandlers(t *testing.T) {
 	}
 }
 
+func TestSwarmRoutesReturnSwarmUnavailable(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		attachPTYs: map[string]*os.File{},
+		events:     newEventBroker(),
+	}
+
+	r := h.routes()
+	tests := []struct {
+		path string
+	}{
+		{"/v1.45/swarm"},
+		{"/v1.45/swarm/init"},
+		{"/v1.45/swarm/join"},
+		{"/v1.45/swarm/leave"},
+		{"/v1.45/nodes"},
+		{"/v1.45/services"},
+		{"/v1.45/tasks"},
+		{"/v1.45/configs"},
+		{"/v1.45/secrets"},
+	}
+	want := http.HandlerFunc(h.swarmUnavailable)
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.path, func(t *testing.T) {
+			t.Parallel()
+			method := http.MethodGet
+			if tc.path == "/v1.45/swarm/init" || tc.path == "/v1.45/swarm/join" || tc.path == "/v1.45/swarm/leave" {
+				method = http.MethodPost
+			}
+			req := httptest.NewRequest(method, tc.path, nil)
+			match := &mux.RouteMatch{}
+			if !r.Match(req, match) {
+				t.Fatalf("expected %s route to match", tc.path)
+			}
+			got, ok := match.Handler.(http.HandlerFunc)
+			if !ok {
+				t.Fatalf("expected route handler to be http.HandlerFunc, got %T", match.Handler)
+			}
+			if reflect.ValueOf(got).Pointer() != reflect.ValueOf(want).Pointer() {
+				t.Fatalf("expected %s to map to swarmUnavailable handler", tc.path)
+			}
+		})
+	}
+}
+
 func TestSearchImagesFiltersLocalCatalog(t *testing.T) {
 	t.Parallel()
 

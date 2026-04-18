@@ -130,10 +130,10 @@ func (h *Handler) routes() http.Handler {
 		// Distribution (registry manifest probe used by Portainer's pull modal)
 		sub.HandleFunc("/distribution/{name:.*}/json", h.distributionInspect).Methods(http.MethodGet)
 
-		// Polite 501s for engine features that this daemon doesn't implement.
-		// Portainer surfaces these as UI tabs; a structured error beats a
-		// 404 that litters the browser console and confuses users. The
-		// messages are short because Portainer displays them verbatim.
+		// Polite errors for engine features that this daemon doesn't
+		// implement. Portainer surfaces these as UI tabs; returning a
+		// service-unavailable style response is the closest shape for
+		// uninitialized swarm.
 		ni := notImplementedFunc("not supported by docker-lxc-daemon")
 		sub.HandleFunc("/build", h.buildImage).Methods(http.MethodPost)
 		sub.HandleFunc("/build/prune", h.pruneBuildCache).Methods(http.MethodPost)
@@ -141,15 +141,15 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/commit", h.commitContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/session", ni).Methods(http.MethodPost)
 		sub.HandleFunc("/plugins", h.listPlugins).Methods(http.MethodGet)
-		sub.HandleFunc("/swarm", ni).Methods(http.MethodGet)
-		sub.HandleFunc("/swarm/init", ni).Methods(http.MethodPost)
-		sub.HandleFunc("/swarm/join", ni).Methods(http.MethodPost)
-		sub.HandleFunc("/swarm/leave", ni).Methods(http.MethodPost)
-		sub.HandleFunc("/nodes", ni).Methods(http.MethodGet)
-		sub.HandleFunc("/services", ni).Methods(http.MethodGet)
-		sub.HandleFunc("/tasks", ni).Methods(http.MethodGet)
-		sub.HandleFunc("/configs", ni).Methods(http.MethodGet)
-		sub.HandleFunc("/secrets", ni).Methods(http.MethodGet)
+		sub.HandleFunc("/swarm", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/swarm/init", h.swarmUnavailable).Methods(http.MethodPost)
+		sub.HandleFunc("/swarm/join", h.swarmUnavailable).Methods(http.MethodPost)
+		sub.HandleFunc("/swarm/leave", h.swarmUnavailable).Methods(http.MethodPost)
+		sub.HandleFunc("/nodes", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/services", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/tasks", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/configs", h.swarmUnavailable).Methods(http.MethodGet)
+		sub.HandleFunc("/secrets", h.swarmUnavailable).Methods(http.MethodGet)
 
 		// Exec
 		sub.HandleFunc("/containers/{id}/exec", h.execCreate).Methods(http.MethodPost)
