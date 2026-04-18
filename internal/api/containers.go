@@ -261,6 +261,12 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			Propagation: propagationFromBindOptions(m.BindOptions),
 		})
 		if mType == "tmpfs" {
+			if cfg.Tmpfs == nil {
+				cfg.Tmpfs = map[string]string{}
+			}
+			if _, already := cfg.Tmpfs[m.Target]; !already {
+				cfg.Tmpfs[m.Target] = tmpfsOptionsString(m.TmpfsOptions, m.ReadOnly)
+			}
 			continue
 		}
 		cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
@@ -1774,6 +1780,39 @@ func (h *Handler) exposedPortsFor(rec *store.ContainerRecord) map[string]struct{
 		}
 	}
 	return out
+}
+
+func tmpfsOptionsString(opts map[string]any, readOnly bool) string {
+	flags := []string{"nosuid", "nodev"}
+	if readOnly {
+		flags = append(flags, "ro")
+	} else {
+		flags = append([]string{"rw"}, flags...)
+	}
+	if opts != nil {
+		if v, ok := opts["SizeBytes"]; ok {
+			switch n := v.(type) {
+			case float64:
+				if n > 0 {
+					flags = append(flags, fmt.Sprintf("size=%d", int64(n)))
+				}
+			case int64:
+				if n > 0 {
+					flags = append(flags, fmt.Sprintf("size=%d", n))
+				}
+			case int:
+				if n > 0 {
+					flags = append(flags, fmt.Sprintf("size=%d", n))
+				}
+			}
+		}
+		if v, ok := opts["Mode"]; ok {
+			if mode, ok := v.(float64); ok && mode > 0 {
+				flags = append(flags, fmt.Sprintf("mode=0%o", int(mode)))
+			}
+		}
+	}
+	return strings.Join(flags, ",")
 }
 
 func propagationFromBindOptions(opts map[string]any) string {
