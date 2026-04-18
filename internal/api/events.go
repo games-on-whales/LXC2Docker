@@ -43,6 +43,8 @@ type eventBroker struct {
 	histCap int
 }
 
+const localEventDaemon = "docker-lxc-daemon"
+
 func newEventBroker() *eventBroker {
 	return &eventBroker{
 		subs:    make(map[chan Event]struct{}),
@@ -140,13 +142,19 @@ func (h *Handler) emitVolume(action, name string) {
 		Action: action,
 		Actor: EventActor{
 			ID:         name,
-			Attributes: map[string]string{"driver": "local"},
+			Attributes: map[string]string{
+				"daemon": localEventDaemon,
+				"driver": "local",
+				"name":   name,
+				"type":   "volume",
+			},
 		},
 		Scope:    "local",
 		Time:     now.Unix(),
 		TimeNano: now.UnixNano(),
 		ID:       name,
 		Status:   action,
+		From:     name,
 	})
 }
 
@@ -156,7 +164,13 @@ func (h *Handler) emitNetwork(action, id, name string) {
 
 func (h *Handler) emitNetworkFull(action, id, name, containerID string) {
 	now := time.Now()
-	attrs := map[string]string{"type": "bridge"}
+	attrs := map[string]string{
+		"daemon":  localEventDaemon,
+		"driver":  "bridge",
+		"network": name,
+		"scope":   "local",
+		"type":    "network",
+	}
 	if name != "" {
 		attrs["name"] = name
 	}
@@ -175,6 +189,7 @@ func (h *Handler) emitNetworkFull(action, id, name, containerID string) {
 		TimeNano: now.UnixNano(),
 		ID:       id,
 		Status:   action,
+		From:     name,
 	})
 }
 
@@ -185,7 +200,12 @@ func (h *Handler) emitImage(action, ref string) {
 		Action: action,
 		Actor: EventActor{
 			ID:         ref,
-			Attributes: map[string]string{"name": ref},
+			Attributes: map[string]string{
+				"daemon": localEventDaemon,
+				"image":  ref,
+				"name":   ref,
+				"type":   "image",
+			},
 		},
 		Scope:    "local",
 		Time:     now.Unix(),
@@ -206,8 +226,15 @@ func (h *Handler) emitContainerWithAttrs(action string, rec *store.ContainerReco
 	now := time.Now()
 	image := rec.Image
 	attrs := map[string]string{
-		"image": image,
-		"name":  rec.Name,
+		"container": rec.ID,
+		"daemon":    localEventDaemon,
+		"image":     image,
+		"imageID":   rec.ImageID,
+		"name":      rec.Name,
+		"type":      "container",
+	}
+	if rec.ExitCode != 0 || action == "die" || action == "stop" || action == "kill" {
+		attrs["exitCode"] = strconv.Itoa(rec.ExitCode)
 	}
 	for k, v := range rec.Labels {
 		attrs[k] = v
@@ -249,20 +276,13 @@ func (h *Handler) eventsStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse optional since/until unix timestamps. If since is in the past
-	// we have no backlog to replay (the broker is memory-only), so we just
-	// honor until as a deadline for disconnecting.
 	var until time.Time
 	if s := r.URL.Query().Get("until"); s != "" {
-		if ts, err := strconv.ParseInt(s, 10, 64); err == nil {
-			until = time.Unix(ts, 0)
-		}
+		until = parseEventTimestamp(s)
 	}
 	var since time.Time
 	if s := r.URL.Query().Get("since"); s != "" {
-		if ts, err := strconv.ParseInt(s, 10, 64); err == nil {
-			since = time.Unix(ts, 0)
-		}
+		since = parseEventTimestamp(s)
 	}
 	filt := parseFilters(r)
 
@@ -341,7 +361,9 @@ func matchEvent(f filters, ev Event) bool {
 	if f.has("container") {
 		match := false
 		for _, want := range f["container"] {
-			if want == ev.Actor.ID || want == ev.Actor.Attributes["name"] {
+			name := strings.TrimPrefix(ev.Actor.Attributes["name"], "/")
+			wantName := strings.TrimPrefix(want, "/")
+			if want == ev.Actor.ID || want == ev.Actor.Attributes["name"] || wantName == name {
 				match = true
 				break
 			}
@@ -359,9 +381,71 @@ func matchEvent(f filters, ev Event) bool {
 	}
 	if f.has("image") {
 		img := ev.Actor.Attributes["image"]
+		if img == "" {
+			img = ev.From
+		}
+		if img == "" {
+			img = ev.Actor.ID
+		}
 		if !f.matchAny("image", img) {
 			return false
 		}
 	}
+	if f.has("volume") {
+		name := ev.Actor.Attributes["name"]
+		if name == "" {
+			name = ev.Actor.ID
+		}
+		if !f.matchAny("volume", name) && !f.matchAny("volume", ev.Actor.ID) {
+			return false
+		}
+	}
+	if f.has("network") {
+		name := ev.Actor.Attributes["network"]
+		if name == "" {
+			name = ev.Actor.Attributes["name"]
+		}
+		if name == "" {
+			name = ev.Actor.ID
+		}
+		if !f.matchAny("network", name) && !f.matchAny("network", ev.Actor.ID) {
+			return false
+		}
+	}
+	if f.has("daemon") {
+		if !f.matchAny("daemon", ev.Actor.Attributes["daemon"]) {
+			return false
+		}
+	}
 	return true
+}
+
+func parseEventTimestamp(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	if ts, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		switch {
+		case len(raw) >= 19:
+			return time.Unix(0, ts)
+		case len(raw) >= 16:
+			return time.Unix(0, ts*1000)
+		case len(raw) >= 13:
+			return time.Unix(0, ts*1_000_000)
+		default:
+			return time.Unix(ts, 0)
+		}
+	}
+	if ts, err := strconv.ParseFloat(raw, 64); err == nil {
+		sec := int64(ts)
+		nsec := int64((ts - float64(sec)) * float64(time.Second))
+		return time.Unix(sec, nsec)
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if ts, err := time.Parse(layout, raw); err == nil {
+			return ts
+		}
+	}
+	return time.Time{}
 }
