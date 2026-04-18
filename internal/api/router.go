@@ -68,33 +68,33 @@ func (h *Handler) routes() http.Handler {
 	for _, sub := range []*mux.Router{r, api} {
 		// System
 		sub.HandleFunc("/_ping", h.ping).Methods(http.MethodGet, http.MethodHead)
-		sub.HandleFunc("/version", h.version).Methods(http.MethodGet)
-		sub.HandleFunc("/info", h.info).Methods(http.MethodGet)
-		sub.HandleFunc("/events", h.eventsStream).Methods(http.MethodGet)
-		sub.HandleFunc("/system/df", h.systemDF).Methods(http.MethodGet)
+		sub.HandleFunc("/version", h.version).Methods(http.MethodGet, http.MethodHead)
+		sub.HandleFunc("/info", h.info).Methods(http.MethodGet, http.MethodHead)
+		sub.HandleFunc("/events", h.eventsStream).Methods(http.MethodGet, http.MethodHead)
+		sub.HandleFunc("/system/df", h.systemDF).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/auth", h.auth).Methods(http.MethodPost)
 
 		// Networks
-		sub.HandleFunc("/networks", h.listNetworks).Methods(http.MethodGet)
+		sub.HandleFunc("/networks", h.listNetworks).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/networks/create", h.createNetwork).Methods(http.MethodPost)
 		sub.HandleFunc("/networks/prune", h.pruneNetworks).Methods(http.MethodPost)
-		sub.HandleFunc("/networks/{id}", h.inspectNetwork).Methods(http.MethodGet)
+		sub.HandleFunc("/networks/{id}", h.inspectNetwork).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/networks/{id}", h.removeNetwork).Methods(http.MethodDelete)
 		sub.HandleFunc("/networks/{id}/connect", h.connectNetwork).Methods(http.MethodPost)
 		sub.HandleFunc("/networks/{id}/disconnect", h.disconnectNetwork).Methods(http.MethodPost)
 
 		// Volumes (stubs — the daemon uses bind mounts, but Portainer polls)
-		sub.HandleFunc("/volumes", h.listVolumes).Methods(http.MethodGet)
+		sub.HandleFunc("/volumes", h.listVolumes).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/volumes/create", h.createVolume).Methods(http.MethodPost)
 		sub.HandleFunc("/volumes/prune", h.pruneVolumes).Methods(http.MethodPost)
-		sub.HandleFunc("/volumes/{name}", h.inspectVolume).Methods(http.MethodGet)
+		sub.HandleFunc("/volumes/{name}", h.inspectVolume).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/volumes/{name}", h.removeVolume).Methods(http.MethodDelete)
 
 		// Containers
-		sub.HandleFunc("/containers/json", h.listContainers).Methods(http.MethodGet)
+		sub.HandleFunc("/containers/json", h.listContainers).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/containers/create", h.createContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/prune", h.pruneContainers).Methods(http.MethodPost)
-		sub.HandleFunc("/containers/{id}/json", h.inspectContainer).Methods(http.MethodGet)
+		sub.HandleFunc("/containers/{id}/json", h.inspectContainer).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/containers/{id}/start", h.startContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/stop", h.stopContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/kill", h.killContainer).Methods(http.MethodPost)
@@ -104,31 +104,31 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/containers/{id}/update", h.updateContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/pause", h.pauseContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/unpause", h.unpauseContainer).Methods(http.MethodPost)
-		sub.HandleFunc("/containers/{id}/top", h.topContainer).Methods(http.MethodGet)
-		sub.HandleFunc("/containers/{id}/stats", h.containerStats).Methods(http.MethodGet)
-		sub.HandleFunc("/containers/{id}/changes", h.containerChanges).Methods(http.MethodGet)
+		sub.HandleFunc("/containers/{id}/top", h.topContainer).Methods(http.MethodGet, http.MethodHead)
+		sub.HandleFunc("/containers/{id}/stats", h.containerStats).Methods(http.MethodGet, http.MethodHead)
+		sub.HandleFunc("/containers/{id}/changes", h.containerChanges).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/containers/{id}/resize", h.resizeContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/attach", h.attachContainer).Methods(http.MethodPost)
-		sub.HandleFunc("/containers/{id}/logs", h.containerLogs).Methods(http.MethodGet)
+		sub.HandleFunc("/containers/{id}/logs", h.containerLogs).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/containers/{id}/archive", h.putArchive).Methods(http.MethodPut)
 		sub.HandleFunc("/containers/{id}/archive", h.getArchive).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/containers/{id}", h.removeContainer).Methods(http.MethodDelete)
 
 		// Images
-		sub.HandleFunc("/images/json", h.listImages).Methods(http.MethodGet)
+		sub.HandleFunc("/images/json", h.listImages).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/images/create", h.pullImage).Methods(http.MethodPost)
-		sub.HandleFunc("/images/search", h.searchImages).Methods(http.MethodGet)
+		sub.HandleFunc("/images/search", h.searchImages).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/images/{name:.*}/get", h.saveImage).Methods(http.MethodGet)
 		sub.HandleFunc("/images/get", h.saveImages).Methods(http.MethodGet)
 		sub.HandleFunc("/images/prune", h.pruneImages).Methods(http.MethodPost)
 		sub.HandleFunc("/images/{name:.*}/json", h.inspectImage).Methods(http.MethodGet, http.MethodHead)
-		sub.HandleFunc("/images/{name:.*}/history", h.imageHistory).Methods(http.MethodGet)
+		sub.HandleFunc("/images/{name:.*}/history", h.imageHistory).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/images/{name:.*}/tag", h.tagImage).Methods(http.MethodPost)
 		sub.HandleFunc("/images/{name:.*}", h.removeImage).Methods(http.MethodDelete)
 		sub.HandleFunc("/containers/{id}/export", h.exportContainer).Methods(http.MethodGet)
 
 		// Distribution (registry manifest probe used by Portainer's pull modal)
-		sub.HandleFunc("/distribution/{name:.*}/json", h.distributionInspect).Methods(http.MethodGet)
+		sub.HandleFunc("/distribution/{name:.*}/json", h.distributionInspect).Methods(http.MethodGet, http.MethodHead)
 
 		// Polite errors for engine features that this daemon doesn't
 		// implement. Portainer surfaces these as UI tabs; returning a
@@ -139,8 +139,8 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/build/prune", h.pruneBuildCache).Methods(http.MethodPost)
 		sub.HandleFunc("/images/load", h.loadImage).Methods(http.MethodPost)
 		sub.HandleFunc("/commit", h.commitContainer).Methods(http.MethodPost)
-		sub.HandleFunc("/session", ni).Methods(http.MethodPost)
-		sub.HandleFunc("/plugins", h.listPlugins).Methods(http.MethodGet)
+		sub.HandleFunc("/session", ni).Methods(http.MethodGet, http.MethodHead, http.MethodPost)
+		sub.HandleFunc("/plugins", h.listPlugins).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/swarm", h.swarmUnavailable).Methods(http.MethodGet)
 		sub.HandleFunc("/swarm/init", h.swarmUnavailable).Methods(http.MethodPost)
 		sub.HandleFunc("/swarm/join", h.swarmUnavailable).Methods(http.MethodPost)
@@ -155,7 +155,7 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/containers/{id}/exec", h.execCreate).Methods(http.MethodPost)
 		sub.HandleFunc("/exec/{id}/start", h.execStart).Methods(http.MethodPost)
 		sub.HandleFunc("/exec/{id}/resize", h.resizeExec).Methods(http.MethodPost)
-		sub.HandleFunc("/exec/{id}/json", h.execInspect).Methods(http.MethodGet)
+		sub.HandleFunc("/exec/{id}/json", h.execInspect).Methods(http.MethodGet, http.MethodHead)
 	}
 
 	// Log all requests for debugging.

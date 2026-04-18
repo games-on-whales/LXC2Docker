@@ -324,3 +324,84 @@ func TestSearchImagesFiltersLocalCatalog(t *testing.T) {
 		t.Fatalf("expected match name nginx, got %#v", out[0].Name)
 	}
 }
+
+func TestHeadMethodsRouteToDockerReadHandlers(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		attachPTYs: map[string]*os.File{},
+		events:     newEventBroker(),
+	}
+
+	r := h.routes()
+	tests := []struct {
+		name   string
+		path   string
+		wantFn http.HandlerFunc
+	}{
+		{name: "version", path: "/v1.45/version", wantFn: h.version},
+		{name: "info", path: "/v1.45/info", wantFn: h.info},
+		{name: "events", path: "/v1.45/events", wantFn: h.eventsStream},
+		{name: "system df", path: "/v1.45/system/df", wantFn: h.systemDF},
+		{name: "networks", path: "/v1.45/networks", wantFn: h.listNetworks},
+		{name: "inspect network", path: "/v1.45/networks/net-1", wantFn: h.inspectNetwork},
+		{name: "volumes", path: "/v1.45/volumes", wantFn: h.listVolumes},
+		{name: "inspect volume", path: "/v1.45/volumes/my-volume", wantFn: h.inspectVolume},
+		{name: "containers", path: "/v1.45/containers/json", wantFn: h.listContainers},
+		{name: "inspect container", path: "/v1.45/containers/abc/json", wantFn: h.inspectContainer},
+		{name: "images", path: "/v1.45/images/json", wantFn: h.listImages},
+		{name: "search images", path: "/v1.45/images/search?term=nginx", wantFn: h.searchImages},
+		{name: "inspect image", path: "/v1.45/images/ubuntu/json", wantFn: h.inspectImage},
+		{name: "image history", path: "/v1.45/images/ubuntu/history", wantFn: h.imageHistory},
+		{name: "distribution inspect", path: "/v1.45/distribution/ubuntu/json", wantFn: h.distributionInspect},
+		{name: "container top", path: "/v1.45/containers/abc/top", wantFn: h.topContainer},
+		{name: "container stats", path: "/v1.45/containers/abc/stats", wantFn: h.containerStats},
+		{name: "container changes", path: "/v1.45/containers/abc/changes", wantFn: h.containerChanges},
+		{name: "container logs", path: "/v1.45/containers/abc/logs", wantFn: h.containerLogs},
+		{name: "exec inspect", path: "/v1.45/exec/abc/json", wantFn: h.execInspect},
+		{name: "plugins", path: "/v1.45/plugins", wantFn: h.listPlugins},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			req := httptest.NewRequest(http.MethodHead, tc.path, nil)
+			match := &mux.RouteMatch{}
+			if !r.Match(req, match) {
+				t.Fatalf("expected %s route to match", tc.path)
+			}
+			got, ok := match.Handler.(http.HandlerFunc)
+			if !ok {
+				t.Fatalf("expected route handler to be http.HandlerFunc, got %T", match.Handler)
+			}
+			want := http.HandlerFunc(tc.wantFn)
+			if reflect.ValueOf(got).Pointer() != reflect.ValueOf(want).Pointer() {
+				t.Fatalf("expected %s to map to HEAD-compatible handler", tc.path)
+			}
+		})
+	}
+}
+
+func TestSessionRouteIsExplicitlyNotImplemented(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		attachPTYs: map[string]*os.File{},
+		events:     newEventBroker(),
+	}
+	r := h.routes()
+
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost} {
+		method := method
+		t.Run(method, func(t *testing.T) {
+			t.Parallel()
+			req := httptest.NewRequest(method, "/v1.45/session", nil)
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+			if rr.Code != http.StatusNotImplemented {
+				t.Fatalf("expected 501 for %s /session, got %d body=%s", method, rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
