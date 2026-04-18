@@ -33,6 +33,7 @@ type ContainerConfig struct {
 	CpusetCpus        string       // Docker's --cpuset-cpus (e.g. "0-3", "0,2")
 	CpusetMems        string       // Docker's --cpuset-mems (e.g. "0")
 	PidsLimit         int64        // Maximum PIDs in the container (0 = unlimited)
+	Ulimits           []Ulimit     // Docker-style ulimits (lxc.prlimit.<name>)
 	WorkingDir        string       // container cwd; maps to lxc.init.cwd
 	// Security. Privileged grants full capabilities + unrestricted device
 	// access; equivalent to Docker's --privileged. CapAdd/CapDrop extend
@@ -76,6 +77,14 @@ type ContainerConfig struct {
 	LANBridge  string // e.g. "vmbr0"
 	LANIP      string // e.g. "192.168.1.106/23"
 	LANGateway string // e.g. "192.168.1.1"
+}
+
+// Ulimit describes a single rlimit pair. Name matches Docker's convention
+// (nofile, nproc, stack, etc.).
+type Ulimit struct {
+	Name string
+	Soft int64
+	Hard int64
 }
 
 // MountSpec describes a single bind mount.
@@ -450,6 +459,7 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	// --sysctl / --tmpfs forms both map cleanly without extra runtime work.
 	items = append(items, sysctlItems(cfg)...)
 	items = append(items, tmpfsItems(cfg)...)
+	items = append(items, ulimitItems(cfg)...)
 
 	// Console log so we can serve it via the logs API
 	if cfg.LogFile != "" {
@@ -508,6 +518,40 @@ func sysctlItems(cfg *ContainerConfig) []configItem {
 		items = append(items, configItem{"lxc.sysctl." + k, v})
 	}
 	return items
+}
+
+// ulimitItems maps HostConfig.Ulimits onto lxc.prlimit.<name> directives.
+// LXC's format is `soft[:hard]`; when Hard equals Soft or is zero we emit
+// just the soft value.
+func ulimitItems(cfg *ContainerConfig) []configItem {
+	if len(cfg.Ulimits) == 0 {
+		return nil
+	}
+	items := make([]configItem, 0, len(cfg.Ulimits))
+	for _, u := range cfg.Ulimits {
+		name := strings.ToLower(strings.TrimSpace(u.Name))
+		if name == "" || strings.ContainsAny(name, "\r\n=") {
+			continue
+		}
+		val := formatUlimitValue(u.Soft, u.Hard)
+		items = append(items, configItem{"lxc.prlimit." + name, val})
+	}
+	return items
+}
+
+func formatUlimitValue(soft, hard int64) string {
+	softStr := "unlimited"
+	if soft >= 0 {
+		softStr = fmt.Sprintf("%d", soft)
+	}
+	if hard == 0 || hard == soft {
+		return softStr
+	}
+	hardStr := "unlimited"
+	if hard > 0 {
+		hardStr = fmt.Sprintf("%d", hard)
+	}
+	return softStr + ":" + hardStr
 }
 
 // tmpfsItems emits one lxc.mount.entry per requested tmpfs. Docker's
@@ -889,6 +933,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	items = append(items, capabilityItems(cfg)...)
 	items = append(items, sysctlItems(cfg)...)
 	items = append(items, tmpfsItems(cfg)...)
+	items = append(items, ulimitItems(cfg)...)
 
 	// Console log.
 	if cfg.LogFile != "" {

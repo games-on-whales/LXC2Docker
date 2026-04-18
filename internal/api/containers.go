@@ -138,6 +138,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		CpusetCpus:        req.HostConfig.CpusetCpus,
 		CpusetMems:        req.HostConfig.CpusetMems,
 		PidsLimit:         req.HostConfig.PidsLimit,
+		Ulimits:           apiToLXCUlimits(req.HostConfig.Ulimits),
 		Privileged:        req.HostConfig.Privileged,
 		CapAdd:            req.HostConfig.CapAdd,
 		CapDrop:           req.HostConfig.CapDrop,
@@ -887,11 +888,20 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
 
-	// Force: stop the container first if running.
 	if force {
 		state, _ := h.mgr.State(id)
+		if state == "paused" {
+			h.mgr.UnpauseContainer(id)
+			state, _ = h.mgr.State(id)
+		}
 		if state == "running" {
 			h.mgr.StopContainer(id, 5*time.Second)
+		}
+	} else {
+		if state, _ := h.mgr.State(id); state == "running" || state == "paused" {
+			errResponse(w, http.StatusConflict,
+				"You cannot remove a running container. Stop the container before attempting removal or use force")
+			return
 		}
 	}
 
@@ -1734,6 +1744,17 @@ func (h *Handler) exposedPortsFor(rec *store.ContainerRecord) map[string]struct{
 		for _, p := range img.OCIPorts {
 			out[p] = struct{}{}
 		}
+	}
+	return out
+}
+
+func apiToLXCUlimits(u []Ulimit) []lxc.Ulimit {
+	if len(u) == 0 {
+		return nil
+	}
+	out := make([]lxc.Ulimit, 0, len(u))
+	for _, x := range u {
+		out = append(out, lxc.Ulimit{Name: x.Name, Soft: x.Soft, Hard: x.Hard})
 	}
 	return out
 }
