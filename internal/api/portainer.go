@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/gorilla/mux"
@@ -126,6 +127,8 @@ func (h *Handler) pruneContainers(w http.ResponseWriter, r *http.Request) {
 // leave the set untouched and report no work done. Acking prevents the UI
 // from showing an error.
 func (h *Handler) pruneImages(w http.ResponseWriter, r *http.Request) {
+	filt := parseFilters(r)
+	cutoff := parsePruneUntil(filt["until"])
 	used := map[string]bool{}
 	for _, c := range h.store.ListContainers() {
 		used[normalizeImageRef(c.Image)] = true
@@ -134,6 +137,9 @@ func (h *Handler) pruneImages(w http.ResponseWriter, r *http.Request) {
 	var reclaimed int64
 	for _, img := range h.store.ListImages() {
 		if used[img.Ref] {
+			continue
+		}
+		if !cutoff.IsZero() && img.Created.After(cutoff) {
 			continue
 		}
 		reclaimed += imageSize(h.mgr.LXCPath(), img)
@@ -147,6 +153,26 @@ func (h *Handler) pruneImages(w http.ResponseWriter, r *http.Request) {
 		"ImagesDeleted":  deleted,
 		"SpaceReclaimed": reclaimed,
 	})
+}
+
+func parsePruneUntil(vals []string) time.Time {
+	for _, v := range vals {
+		if v == "" {
+			continue
+		}
+		if d, err := time.ParseDuration(v); err == nil {
+			return time.Now().Add(-d)
+		}
+		if ts, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return time.Unix(ts, 0)
+		}
+		for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+			if t, err := time.Parse(layout, v); err == nil {
+				return t
+			}
+		}
+	}
+	return time.Time{}
 }
 
 // GET /images/{name}/history

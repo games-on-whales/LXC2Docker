@@ -525,13 +525,13 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		state = "created"
 	}
 
-	startedAt := rec.Created.Format(time.RFC3339)
+	startedAt := rec.Created.Format(time.RFC3339Nano)
 	if rec.StartedAt != nil {
-		startedAt = rec.StartedAt.Format(time.RFC3339)
+		startedAt = rec.StartedAt.Format(time.RFC3339Nano)
 	}
 	finishedAt := "0001-01-01T00:00:00Z"
 	if rec.FinishedAt != nil {
-		finishedAt = rec.FinishedAt.Format(time.RFC3339)
+		finishedAt = rec.FinishedAt.Format(time.RFC3339Nano)
 	}
 
 	// Build Mounts array from stored mount specs.
@@ -573,7 +573,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 
 	resp := ContainerJSON{
 		ID:             rec.ID,
-		Created:        rec.Created.Format(time.RFC3339),
+		Created:        rec.Created.Format(time.RFC3339Nano),
 		Path:           path,
 		Args:           args,
 		Name:           "/" + rec.Name,
@@ -1126,10 +1126,19 @@ func (h *Handler) renameContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	newName = strings.TrimPrefix(newName, "/")
+	newName = strings.TrimSpace(strings.TrimPrefix(newName, "/"))
+	if !isValidContainerName(newName) {
+		errResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid container name (%s)", newName))
+		return
+	}
 	rec := h.store.GetContainer(id)
 	if rec == nil {
 		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+	if other := h.store.FindContainerByName(newName); other != nil && other.ID != id {
+		errResponse(w, http.StatusConflict,
+			fmt.Sprintf("Conflict. The container name %q is already in use.", "/"+newName))
 		return
 	}
 	oldName := rec.Name

@@ -204,7 +204,51 @@ func detectCgroupDriver() string {
 // engine as misconfigured.
 
 func (h *Handler) listNetworks(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, http.StatusOK, h.networksWithContainers())
+	filt := parseFilters(r)
+	all := h.networksWithContainers()
+	out := make([]map[string]any, 0, len(all))
+	for _, n := range all {
+		if filt.has("driver") {
+			d, _ := n["Driver"].(string)
+			if !filt.matchAny("driver", d) {
+				continue
+			}
+		}
+		if filt.has("name") {
+			name, _ := n["Name"].(string)
+			ok := false
+			for _, want := range filt["name"] {
+				if strings.Contains(name, want) {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				continue
+			}
+		}
+		if filt.has("id") {
+			id, _ := n["Id"].(string)
+			ok := false
+			for _, want := range filt["id"] {
+				if strings.HasPrefix(id, want) {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				continue
+			}
+		}
+		if filt.has("scope") {
+			s, _ := n["Scope"].(string)
+			if !filt.matchAny("scope", s) {
+				continue
+			}
+		}
+		out = append(out, n)
+	}
+	jsonResponse(w, http.StatusOK, out)
 }
 
 func (h *Handler) inspectNetwork(w http.ResponseWriter, r *http.Request) {
