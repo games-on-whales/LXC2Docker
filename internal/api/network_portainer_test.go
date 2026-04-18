@@ -266,6 +266,96 @@ func TestContainerNetworkViewsUsePersistedAttachments(t *testing.T) {
 	}
 }
 
+func TestCanonicalNetworkNameMapsDockerBridgeAliasesToGow(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{in: "", want: "gow"},
+		{in: "default", want: "gow"},
+		{in: "bridge", want: "gow"},
+		{in: "gow", want: "gow"},
+		{in: "frontend", want: "frontend"},
+	} {
+		if got := canonicalNetworkName(tc.in); got != tc.want {
+			t.Fatalf("canonicalNetworkName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestBuiltInNetworkAliasesInspectAsGow(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store init: %v", err)
+	}
+	h := &Handler{
+		store:      st,
+		attachPTYs: map[string]*os.File{},
+		execs:      newExecStore(),
+		events:     newEventBroker(),
+	}
+
+	for _, alias := range []string{"bridge", "default", "gow"} {
+		req := httptest.NewRequest(http.MethodGet, "/networks/"+alias, nil)
+		req = mux.SetURLVars(req, map[string]string{"id": alias})
+		rr := httptest.NewRecorder()
+		h.inspectNetwork(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200 inspecting %q, got %d body=%s", alias, rr.Code, rr.Body.String())
+		}
+		var got map[string]any
+		if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+			t.Fatalf("decode inspect response for %q: %v", alias, err)
+		}
+		if got["Name"] != "gow" || got["Id"] != "gow" {
+			t.Fatalf("expected %q to resolve to gow network, got %#v", alias, got)
+		}
+	}
+}
+
+func TestAttachRequestedNetworksMapsDockerBridgeAliasesToGow(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store init: %v", err)
+	}
+	rec := &store.ContainerRecord{
+		ID:        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd",
+		Name:      "web",
+		IPAddress: "10.100.0.10",
+	}
+
+	if err := attachRequestedNetworks(st, rec, NetworkingConfig{
+		EndpointsConfig: map[string]EndpointSettings{
+			"bridge": {
+				Aliases:    []string{"web"},
+				DriverOpts: map[string]string{"mode": "bridge"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("attachRequestedNetworks: %v", err)
+	}
+
+	gow, ok := rec.Networks["gow"]
+	if !ok {
+		t.Fatalf("expected gow attachment, got %#v", rec.Networks)
+	}
+	if gow.NetworkID != "gow" || gow.IPAddress != "10.100.0.10" {
+		t.Fatalf("expected gow attachment details to use default bridge values, got %#v", gow)
+	}
+	if len(gow.Aliases) != 1 || gow.Aliases[0] != "web" {
+		t.Fatalf("expected bridge alias attachment to preserve aliases, got %#v", gow)
+	}
+	if gow.DriverOpts["mode"] != "bridge" {
+		t.Fatalf("expected latest gow attachment to preserve endpoint config, got %#v", gow)
+	}
+}
+
 func mustParseTime(t *testing.T, value string) time.Time {
 	t.Helper()
 	parsed, err := time.Parse(time.RFC3339, value)

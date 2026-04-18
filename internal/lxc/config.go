@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -530,10 +531,28 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	return items
 }
 
+var dockerDefaultCaps = []string{
+	"audit_write",
+	"chown",
+	"dac_override",
+	"fowner",
+	"fsetid",
+	"kill",
+	"mknod",
+	"net_bind_service",
+	"net_raw",
+	"setfcap",
+	"setgid",
+	"setpcap",
+	"setuid",
+	"sys_chroot",
+}
+
 // capabilityItems translates Docker's Privileged / CapAdd / CapDrop into LXC
 // config lines. Privileged wins — when set we clear all drops and grant
-// full device cgroup access. Otherwise CapDrop/CapAdd produce matching
-// lxc.cap.drop / lxc.cap.keep entries, one capability per line.
+// full device cgroup access. For CapAdd / CapDrop we compute Docker's final
+// capability set and emit it as lxc.cap.keep after clearing inherited drops,
+// because LXC rejects configurations that mix keep and drop directives.
 func capabilityItems(cfg *ContainerConfig) []configItem {
 	var items []configItem
 	if cfg.Privileged {
@@ -544,11 +563,31 @@ func capabilityItems(cfg *ContainerConfig) []configItem {
 		)
 		return items
 	}
-	for _, c := range cfg.CapDrop {
-		items = append(items, configItem{"lxc.cap.drop", normalizeCap(c)})
+
+	if len(cfg.CapAdd) == 0 && len(cfg.CapDrop) == 0 {
+		return items
+	}
+
+	finalCaps := make(map[string]struct{}, len(dockerDefaultCaps)+len(cfg.CapAdd))
+	for _, c := range dockerDefaultCaps {
+		finalCaps[c] = struct{}{}
 	}
 	for _, c := range cfg.CapAdd {
-		items = append(items, configItem{"lxc.cap.keep", normalizeCap(c)})
+		finalCaps[normalizeCap(c)] = struct{}{}
+	}
+	for _, c := range cfg.CapDrop {
+		delete(finalCaps, normalizeCap(c))
+	}
+
+	// Clear inherited drops from common.conf before using lxc.cap.keep.
+	items = append(items, configItem{"lxc.cap.drop", ""})
+	keep := make([]string, 0, len(finalCaps))
+	for c := range finalCaps {
+		keep = append(keep, c)
+	}
+	slices.Sort(keep)
+	for _, c := range keep {
+		items = append(items, configItem{"lxc.cap.keep", c})
 	}
 	return items
 }
@@ -723,6 +762,20 @@ func appendSocketMount(items []configItem, cfg *ContainerConfig, source string, 
 
 	parentDir := filepath.Dir(source)
 	socketName := filepath.Base(source)
+	destParent := filepath.Dir(m.Destination)
+
+	// When a socket is mounted back into the same runtime directory path
+	// (for example /run/user/wolf/wayland-1 -> /run/user/wolf/wayland-1),
+	// mount the runtime directory itself at the real destination path.
+	//
+	// The older hidden-dir + symlink strategy keeps single control sockets
+	// alive across recreation, but it does not preserve the semantics of a
+	// full XDG runtime directory. GoW session containers expect the runtime
+	// directory itself to be the shared mount so sibling sockets, permissions,
+	// and auxiliary files all line up under XDG_RUNTIME_DIR.
+	if filepath.Clean(destParent) == filepath.Clean(parentDir) {
+		return appendSocketDirMount(items, parentDir, destParent, m.ReadOnly)
+	}
 
 	// Mount the parent directory at a hidden location in the container.
 	// Use a path derived from the parent dir name to avoid collisions.
@@ -751,6 +804,24 @@ func appendSocketMount(items []configItem, cfg *ContainerConfig, source string, 
 	cfg.SocketLinks[m.Destination] = "/" + mountDest + "/" + socketName
 
 	return items
+}
+
+func appendSocketDirMount(items []configItem, sourceDir, destDir string, readOnly bool) []configItem {
+	destRel := strings.TrimPrefix(destDir, "/")
+	escapedDest := strings.ReplaceAll(destRel, " ", `\040`)
+	for _, item := range items {
+		if item.key == "lxc.mount.entry" && strings.Contains(item.value, " "+escapedDest+" ") {
+			return items
+		}
+	}
+
+	opts := "bind,create=dir"
+	if readOnly {
+		opts += ",ro"
+	}
+	escapedSource := strings.ReplaceAll(sourceDir, " ", `\040`)
+	entry := fmt.Sprintf("%s %s none %s 0 0", escapedSource, escapedDest, opts)
+	return append(items, configItem{"lxc.mount.entry", entry})
 }
 
 // autoMountDeviceDirs inspects wildcard cgroup rules (like "c 13:* rwm") and

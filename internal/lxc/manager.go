@@ -1548,6 +1548,26 @@ func (m *Manager) RootfsPath(id string) string {
 	return filepath.Join(m.lxcPath, id, "rootfs")
 }
 
+// ImageReady reports whether the store record still points at a usable clone
+// source. This lets the API self-heal stale image metadata by triggering a
+// fresh pull instead of attempting to clone a missing legacy template.
+func (m *Manager) ImageReady(rec *store.ImageRecord) bool {
+	if rec == nil {
+		return false
+	}
+	if rec.TemplateVMID > 0 {
+		if _, err := os.Stat(pveConfigPath(rec.TemplateVMID)); err == nil {
+			return true
+		}
+	}
+	if rec.TemplateName == "" {
+		return false
+	}
+	configPath := filepath.Join(m.lxcPath, rec.TemplateName, "config")
+	_, err := os.Stat(configPath)
+	return err == nil
+}
+
 // --- helpers ---
 
 func buildResolvConf(cfg ContainerConfig) string {

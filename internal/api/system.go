@@ -314,13 +314,14 @@ func (h *Handler) listNetworks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) inspectNetwork(w http.ResponseWriter, r *http.Request) {
-	id := mux.Vars(r)["id"]
+	id := canonicalNetworkName(mux.Vars(r)["id"])
+	name, networkID, _, ok := h.resolveNetwork(id)
+	if !ok {
+		errResponse(w, http.StatusNotFound, "network not found")
+		return
+	}
 	for _, n := range h.networksWithContainers() {
-		if n["Id"] == id || n["Name"] == id {
-			jsonResponse(w, http.StatusOK, n)
-			return
-		}
-		if s, _ := n["Id"].(string); len(id) >= 4 && strings.HasPrefix(s, id) {
+		if n["Id"] == networkID || n["Name"] == name {
 			jsonResponse(w, http.StatusOK, n)
 			return
 		}
@@ -574,6 +575,7 @@ func (h *Handler) removeNetwork(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) resolveNetwork(idOrName string) (name, id, gateway string, ok bool) {
+	idOrName = canonicalNetworkName(idOrName)
 	if n := h.store.GetNetwork(idOrName); n != nil {
 		return n.Name, n.ID, orDefault(n.Gateway, "10.100.0.1"), true
 	}
@@ -591,7 +593,7 @@ func (h *Handler) resolveNetwork(idOrName string) (name, id, gateway string, ok 
 }
 
 func isBuiltInNetwork(name string) bool {
-	switch name {
+	switch canonicalNetworkName(name) {
 	case "gow", "host", "none", "bridge":
 		return true
 	}

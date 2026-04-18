@@ -406,6 +406,15 @@ func defaultContainerNetworks(rec *store.ContainerRecord) map[string]store.Netwo
 	}
 }
 
+func canonicalNetworkName(name string) string {
+	switch strings.TrimSpace(name) {
+	case "", "default", "bridge":
+		return "gow"
+	default:
+		return name
+	}
+}
+
 func attachRequestedNetworks(st *store.Store, rec *store.ContainerRecord, cfg NetworkingConfig) error {
 	if len(cfg.EndpointsConfig) == 0 {
 		return nil
@@ -414,9 +423,9 @@ func attachRequestedNetworks(st *store.Store, rec *store.ContainerRecord, cfg Ne
 		rec.Networks = defaultContainerNetworks(rec)
 	}
 	for name, ep := range cfg.EndpointsConfig {
-		networkName := name
-		networkID := name
-		if name != "gow" {
+		networkName := canonicalNetworkName(name)
+		networkID := networkName
+		if networkName != "gow" {
 			n := st.GetNetwork(name)
 			if n == nil {
 				return fmt.Errorf("network %q not found", name)
