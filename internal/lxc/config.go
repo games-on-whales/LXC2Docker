@@ -35,6 +35,7 @@ type ContainerConfig struct {
 	PidsLimit         int64        // Maximum PIDs in the container (0 = unlimited)
 	Ulimits           []Ulimit     // Docker-style ulimits (lxc.prlimit.<name>)
 	ShmSize           int64        // /dev/shm tmpfs size in bytes (0 = kernel default)
+	BlkioWeight       uint16       // Block I/O weight (10-1000, mapped to io.weight)
 	WorkingDir        string       // container cwd; maps to lxc.init.cwd
 	// Security. Privileged grants full capabilities + unrestricted device
 	// access; equivalent to Docker's --privileged. CapAdd/CapDrop extend
@@ -448,6 +449,9 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	}
 	if cfg.PidsLimit > 0 {
 		items = append(items, configItem{"lxc.cgroup2.pids.max", fmt.Sprintf("%d", cfg.PidsLimit)})
+	}
+	if cfg.BlkioWeight > 0 {
+		items = append(items, configItem{"lxc.cgroup2.io.weight", fmt.Sprintf("default %d", cfg.BlkioWeight)})
 	}
 
 	// Privileged + capability handling. Docker's --privileged maps to two
@@ -936,6 +940,9 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	}
 	if cfg.PidsLimit > 0 {
 		items = append(items, configItem{"lxc.cgroup2.pids.max", fmt.Sprintf("%d", cfg.PidsLimit)})
+	}
+	if cfg.BlkioWeight > 0 {
+		items = append(items, configItem{"lxc.cgroup2.io.weight", fmt.Sprintf("default %d", cfg.BlkioWeight)})
 	}
 
 	// Capabilities / privileged: same rules as the legacy path.

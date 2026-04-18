@@ -326,6 +326,9 @@ func applyLiveLimits(id string, hc HostConfig) string {
 	if hc.PidsLimit > 0 {
 		writes["pids.max"] = strconv.FormatInt(hc.PidsLimit, 10)
 	}
+	if hc.BlkioWeight > 0 {
+		writes["io.weight"] = "default " + strconv.FormatUint(uint64(hc.BlkioWeight), 10)
+	}
 	if hc.CPUShares > 0 {
 		// Docker shares (1–1024) → cgroup v2 weight (1–10000).
 		weight := (hc.CPUShares * 10000) / 1024

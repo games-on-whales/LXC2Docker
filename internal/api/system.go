@@ -168,7 +168,7 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 		DefaultRuntime:     "lxc",
 		Runtimes:           map[string]any{"lxc": map[string]string{"path": "lxc-start"}},
 		LiveRestoreEnabled: true,
-		Isolation:          "",
+		Isolation:          "default",
 		CgroupDriver:       detectCgroupDriver(),
 		CgroupVersion:      detectCgroupVersion(),
 		SystemTime:         time.Now().UTC().Format(time.RFC3339Nano),

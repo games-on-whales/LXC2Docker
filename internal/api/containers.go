@@ -140,6 +140,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		PidsLimit:         req.HostConfig.PidsLimit,
 		Ulimits:           apiToLXCUlimits(req.HostConfig.Ulimits),
 		ShmSize:           req.HostConfig.ShmSize,
+		BlkioWeight:       req.HostConfig.BlkioWeight,
 		Privileged:        req.HostConfig.Privileged,
 		CapAdd:            req.HostConfig.CapAdd,
 		CapDrop:           req.HostConfig.CapDrop,
@@ -277,6 +278,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		ExposedPorts:    req.ExposedPorts,
 		Volumes:         req.Volumes,
 		StopTimeout:     stopTimeoutValue(req.StopTimeout),
+		OomScoreAdj:     req.HostConfig.OomScoreAdj,
 		RawHostConfig:   rawHC,
 		Mounts:          storeMounts,
 		RestartPolicy:   req.HostConfig.RestartPolicy.Name,
@@ -707,12 +709,20 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		h.store.AddContainer(rec)
 	}
 
-	// Set up port forwarding rules after successful start.
 	if rec := h.store.GetContainer(id); rec != nil && rec.IPAddress != "" {
 		for _, pb := range rec.PortBindings {
 			if err := lxc.AddPortForward(rec.IPAddress, pb.HostPort, pb.ContainerPort, pb.Proto); err != nil {
 				log.Printf("warning: port forward %d->%s:%d/%s failed: %v",
 					pb.HostPort, rec.IPAddress, pb.ContainerPort, pb.Proto, err)
+			}
+		}
+	}
+
+	if rec := h.store.GetContainer(id); rec != nil && rec.OomScoreAdj != 0 {
+		if pid := containerPID(id); pid > 0 {
+			if err := os.WriteFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid),
+				[]byte(strconv.Itoa(rec.OomScoreAdj)), 0o644); err != nil {
+				log.Printf("warning: set oom_score_adj for %s: %v", id[:12], err)
 			}
 		}
 	}

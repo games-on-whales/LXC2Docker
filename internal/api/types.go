@@ -89,6 +89,7 @@ type HostConfig struct {
 	PidsLimit         int64  `json:"PidsLimit"`
 	OomKillDisable    bool   `json:"OomKillDisable"`
 	OomScoreAdj       int    `json:"OomScoreAdj"`
+	BlkioWeight       uint16 `json:"BlkioWeight"`
 	// Networking / DNS
 	NetworkMode     string                   `json:"NetworkMode"`
 	PortBindings    map[string][]PortBinding `json:"PortBindings"`
