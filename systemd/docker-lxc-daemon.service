@@ -1,5 +1,5 @@
 [Unit]
-Description=Docker-compatible LXC daemon for Games on Whales
+Description=Docker-compatible API daemon backed by LXC
 Documentation=https://github.com/games-on-whales/docker-lxc-daemon
 After=network.target
 Wants=network.target
