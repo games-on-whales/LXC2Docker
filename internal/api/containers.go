@@ -360,6 +360,9 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		if !filt.matchAncestor(rec.Image, rec.ImageID) {
 			continue
 		}
+		if filt.has("volume") && !containerUsesVolume(rec, h.store, filt["volume"]) {
+			continue
+		}
 		// The "health" filter matches HealthStatus ("starting"/"healthy"/
 		// "unhealthy") or the special value "none" for containers without
 		// a configured healthcheck. Portainer's "Unhealthy" dashboard
@@ -914,6 +917,11 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 	w.WriteHeader(http.StatusOK)
 
+	streamID := byte(1)
+	if !stdout && stderr {
+		streamID = 2
+	}
+
 	// When since/until are active we gate every line through the current
 	// wall clock — the console.log has no per-line timestamps, so the best
 	// we can do is accept lines when "now" is inside the window. For a
@@ -934,7 +942,7 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 			prefix := time.Now().UTC().Format(time.RFC3339Nano) + " "
 			line = append([]byte(prefix), line...)
 		}
-		writeLogFrame(w, 1, line)
+		writeLogFrame(w, streamID, line)
 	}
 
 	// Backfill phase. When tail is set we collect the last N lines into a
@@ -980,10 +988,9 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 		n, err := f.Read(buf)
 		if n > 0 && inWindow() {
 			if timestamps {
-				// Prefix each complete line; leave partials alone.
 				emit(buf[:n])
 			} else {
-				writeLogFrame(w, 1, buf[:n])
+				writeLogFrame(w, streamID, buf[:n])
 			}
 			if fl, ok := w.(http.Flusher); ok {
 				fl.Flush()
@@ -1603,6 +1610,22 @@ func (h *Handler) exposedPortsFor(rec *store.ContainerRecord) map[string]struct{
 		return nil
 	}
 	return out
+}
+
+func containerUsesVolume(rec *store.ContainerRecord, st *store.Store, names []string) bool {
+	sources := map[string]bool{}
+	for _, name := range names {
+		if v := st.GetVolume(name); v != nil {
+			sources[v.Mountpoint] = true
+		}
+		sources[name] = true
+	}
+	for _, m := range rec.Mounts {
+		if sources[m.Source] {
+			return true
+		}
+	}
+	return false
 }
 
 func isValidContainerName(s string) bool {

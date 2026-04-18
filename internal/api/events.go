@@ -37,12 +37,34 @@ type EventActor struct {
 // Each subscriber owns a buffered channel; slow consumers drop events rather
 // than blocking the emitter (the Docker daemon behaves the same way).
 type eventBroker struct {
-	mu   sync.Mutex
-	subs map[chan Event]struct{}
+	mu      sync.Mutex
+	subs    map[chan Event]struct{}
+	history []Event
+	histCap int
 }
 
 func newEventBroker() *eventBroker {
-	return &eventBroker{subs: make(map[chan Event]struct{})}
+	return &eventBroker{
+		subs:    make(map[chan Event]struct{}),
+		history: make([]Event, 0, 1024),
+		histCap: 1024,
+	}
+}
+
+func (b *eventBroker) snapshotSince(since time.Time) []Event {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if since.IsZero() {
+		return nil
+	}
+	cutoff := since.UnixNano()
+	var out []Event
+	for _, ev := range b.history {
+		if ev.TimeNano >= cutoff {
+			out = append(out, ev)
+		}
+	}
+	return out
 }
 
 func (b *eventBroker) subscribe() chan Event {
@@ -65,12 +87,14 @@ func (b *eventBroker) unsubscribe(ch chan Event) {
 func (b *eventBroker) publish(ev Event) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if len(b.history) >= b.histCap {
+		b.history = b.history[1:]
+	}
+	b.history = append(b.history, ev)
 	for ch := range b.subs {
 		select {
 		case ch <- ev:
 		default:
-			// Subscriber is slow; drop this event for them rather than stall
-			// every other subscriber and the emitting handler.
 		}
 	}
 }
@@ -189,12 +213,34 @@ func (h *Handler) eventsStream(w http.ResponseWriter, r *http.Request) {
 			until = time.Unix(ts, 0)
 		}
 	}
+	var since time.Time
+	if s := r.URL.Query().Get("since"); s != "" {
+		if ts, err := strconv.ParseInt(s, 10, 64); err == nil {
+			since = time.Unix(ts, 0)
+		}
+	}
 	filt := parseFilters(r)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+
+	enc := json.NewEncoder(w)
+	if !since.IsZero() {
+		for _, ev := range h.events.snapshotSince(since) {
+			if !matchEvent(filt, ev) {
+				continue
+			}
+			if !until.IsZero() && time.Unix(ev.Time, 0).After(until) {
+				continue
+			}
+			if err := enc.Encode(&ev); err != nil {
+				return
+			}
+		}
+		flusher.Flush()
+	}
 
 	ch := h.events.subscribe()
 	defer h.events.unsubscribe(ch)
@@ -204,8 +250,6 @@ func (h *Handler) eventsStream(w http.ResponseWriter, r *http.Request) {
 	// the JSON decoder on the client ignores.
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()
-
-	enc := json.NewEncoder(w)
 
 	var untilC <-chan time.Time
 	if !until.IsZero() {

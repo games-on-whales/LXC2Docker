@@ -22,24 +22,31 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 	filt := parseFilters(r)
 	records := h.store.ListImages()
 
-	// Build a one-shot usage index so we emit a real Containers count per
-	// image instead of -1. Portainer's Images tab uses this to enable the
-	// "Remove unused" button and to block delete-with-usage.
 	usage := map[string]int{}
 	for _, c := range h.store.ListContainers() {
 		usage[normalizeImageRef(c.Image)]++
 	}
 
-	out := make([]ImageSummary, 0, len(records))
+	grouped := map[string]*ImageSummary{}
+	ids := []string{}
 	for _, rec := range records {
 		if !filt.matchImageReference(rec.Ref) {
+			continue
+		}
+		key := rec.ID
+		if cur, ok := grouped[key]; ok {
+			cur.RepoTags = append(cur.RepoTags, rec.Ref)
+			for _, d := range digestRefs(rec) {
+				cur.RepoDigests = append(cur.RepoDigests, d)
+			}
+			cur.Containers += usage[rec.Ref]
 			continue
 		}
 		labels := rec.OCILabels
 		if labels == nil {
 			labels = map[string]string{}
 		}
-		out = append(out, ImageSummary{
+		grouped[key] = &ImageSummary{
 			ID:          "sha256:" + rec.ID,
 			RepoTags:    []string{rec.Ref},
 			RepoDigests: digestRefs(rec),
@@ -48,7 +55,12 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 			VirtualSize: imageSize(h.mgr.LXCPath(), rec),
 			Labels:      labels,
 			Containers:  usage[rec.Ref],
-		})
+		}
+		ids = append(ids, key)
+	}
+	out := make([]ImageSummary, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, *grouped[id])
 	}
 	jsonResponse(w, http.StatusOK, out)
 }
