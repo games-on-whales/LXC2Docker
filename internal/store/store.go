@@ -18,22 +18,40 @@ import (
 
 const defaultPath = "/var/lib/docker-lxc-daemon"
 
-// ContainerRecord holds Docker-layer metadata for a single container.
+// ContainerRecord holds Docker-layer metadata for a single container. Most
+// fields map 1:1 to the Docker Engine create payload. Ones prefixed "API"
+// are round-tripped through inspect for tools (Portainer's Duplicate/Edit
+// flow re-posts whatever inspect returned) but not necessarily enforced by
+// the LXC runtime.
 type ContainerRecord struct {
-	ID         string            `json:"id"`          // Docker hex ID (API-facing)
-	VMID       int               `json:"vmid"`        // Proxmox CT VMID (0 = legacy direct LXC)
-	Name       string            `json:"name"`        // Docker-style name (no leading slash)
-	Image      string            `json:"image"`       // Original image:tag as requested
-	ImageID    string            `json:"image_id"`    // Resolved image identifier
-	Created    time.Time         `json:"created"`
-	Entrypoint []string          `json:"entrypoint"`
-	Cmd        []string          `json:"cmd"`
-	Env        []string          `json:"env"`
-	Labels     map[string]string `json:"labels"`
+	ID           string            `json:"id"`       // Docker hex ID (API-facing)
+	VMID         int               `json:"vmid"`     // Proxmox CT VMID (0 = legacy direct LXC)
+	Name         string            `json:"name"`     // Docker-style name (no leading slash)
+	Image        string            `json:"image"`    // Original image:tag as requested
+	ImageID      string            `json:"image_id"` // Resolved image identifier
+	Created      time.Time         `json:"created"`
+	Entrypoint   []string          `json:"entrypoint"`
+	Cmd          []string          `json:"cmd"`
+	Env          []string          `json:"env"`
+	Labels       map[string]string `json:"labels"`
 	IPAddress    string            `json:"ip_address"`
-	PortBindings []PortBinding    `json:"port_bindings,omitempty"`
-	Mounts       []MountSpec      `json:"mounts"`
+	PortBindings []PortBinding     `json:"port_bindings,omitempty"`
+	Mounts       []MountSpec       `json:"mounts"`
 	StartedAt    *time.Time        `json:"started_at,omitempty"` // nil until first start; distinguishes "created" from "exited"
+	// Echo-back fields: persisted verbatim so `docker inspect` returns
+	// whatever the client sent on create. Not wired to the LXC runtime.
+	Hostname     string              `json:"hostname,omitempty"`
+	Domainname   string              `json:"domainname,omitempty"`
+	User         string              `json:"user,omitempty"`
+	Tty          bool                `json:"tty,omitempty"`
+	OpenStdin    bool                `json:"open_stdin,omitempty"`
+	WorkingDir   string              `json:"working_dir,omitempty"`
+	StopSignal   string              `json:"stop_signal,omitempty"`
+	ExposedPorts map[string]struct{} `json:"exposed_ports,omitempty"`
+	Volumes      map[string]struct{} `json:"volumes,omitempty"`
+	// Raw HostConfig as JSON for full round-trip. Decoding happens at the
+	// API layer; the store treats this as opaque.
+	RawHostConfig []byte `json:"raw_host_config,omitempty"`
 }
 
 // PortBinding records a single host→container port mapping.

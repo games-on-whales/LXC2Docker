@@ -132,17 +132,45 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// New-style Mounts (Portainer emits these alongside or instead of Binds).
+	// Only bind mounts map cleanly to LXC today; "volume" and "tmpfs" types
+	// are accepted and persisted but not mounted.
+	for _, m := range req.HostConfig.Mounts {
+		if m.Type != "bind" {
+			continue
+		}
+		cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
+			Source:      m.Source,
+			Destination: m.Target,
+			ReadOnly:    m.ReadOnly,
+		})
+	}
+
+	// Preserve the full HostConfig as JSON so inspect can echo exactly what
+	// the client posted, including fields the LXC runtime doesn't honor.
+	rawHC, _ := json.Marshal(req.HostConfig)
+
 	// Persist record before creating so the IP is allocated.
 	rec := &store.ContainerRecord{
-		ID:         id,
-		Name:       name,
-		Image:      req.Image,
-		ImageID:    normalizeImageRef(req.Image),
-		Created:    time.Now(),
-		Entrypoint: entrypoint,
-		Cmd:        cmd,
-		Env:        env,
-		Labels:     req.Labels,
+		ID:            id,
+		Name:          name,
+		Image:         req.Image,
+		ImageID:       normalizeImageRef(req.Image),
+		Created:       time.Now(),
+		Entrypoint:    entrypoint,
+		Cmd:           cmd,
+		Env:           env,
+		Labels:        req.Labels,
+		Hostname:      req.Hostname,
+		Domainname:    req.Domainname,
+		User:          req.User,
+		Tty:           req.Tty,
+		OpenStdin:     req.OpenStdin,
+		WorkingDir:    workingDir,
+		StopSignal:    req.StopSignal,
+		ExposedPorts:  req.ExposedPorts,
+		Volumes:       req.Volumes,
+		RawHostConfig: rawHC,
 	}
 	for _, m := range cfg.Mounts {
 		rec.Mounts = append(rec.Mounts, store.MountSpec{
@@ -200,6 +228,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 // GET /containers/json
 func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
+	filt := parseFilters(r)
 	records := h.store.ListContainers()
 
 	out := make([]ContainerSummary, 0, len(records))
@@ -209,6 +238,25 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			state = "created"
 		}
 		if !all && state != "running" {
+			continue
+		}
+		// Filter evaluation. The "status" filter accepts the same state
+		// strings returned in the list response. "label" supports both
+		// existence ("com.docker.compose.project") and equality
+		// ("com.docker.compose.project=foo") checks.
+		if !filt.matchAny("status", state) {
+			continue
+		}
+		if !filt.matchLabel(rec.Labels) {
+			continue
+		}
+		if !filt.matchNamePrefix([]string{rec.Name, "/" + rec.Name}) {
+			continue
+		}
+		if !filt.matchID(rec.ID) {
+			continue
+		}
+		if !filt.matchAncestor(rec.Image, rec.ImageID) {
 			continue
 		}
 		cmd := strings.Join(append(rec.Entrypoint, rec.Cmd...), " ")
@@ -352,6 +400,17 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	hostname := rec.Hostname
+	if hostname == "" {
+		hostname = rec.ID[:12]
+	}
+
+	// Grab the container's init PID (0 if stopped) so Portainer can display it.
+	pid := 0
+	if running {
+		pid = containerPID(id)
+	}
+
 	resp := ContainerJSON{
 		ID:             rec.ID,
 		Created:        rec.Created.Format(time.RFC3339),
@@ -371,19 +430,27 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Status:     state,
 			Running:    running,
 			Paused:     paused,
+			Pid:        pid,
 			StartedAt:  startedAt,
 			FinishedAt: "0001-01-01T00:00:00Z",
 		},
 		Image:  rec.Image,
 		Mounts: mounts,
 		Config: &ContainerConfig{
-			Hostname:   rec.ID[:12],
-			Image:      rec.Image,
-			Cmd:        rec.Cmd,
-			Entrypoint: rec.Entrypoint,
-			Env:        rec.Env,
-			Labels:     rec.Labels,
-			WorkingDir: "",
+			Hostname:     hostname,
+			Domainname:   rec.Domainname,
+			User:         rec.User,
+			Tty:          rec.Tty,
+			OpenStdin:    rec.OpenStdin,
+			ExposedPorts: rec.ExposedPorts,
+			Image:        rec.Image,
+			Volumes:      rec.Volumes,
+			Cmd:          rec.Cmd,
+			Entrypoint:   rec.Entrypoint,
+			Env:          rec.Env,
+			Labels:       rec.Labels,
+			WorkingDir:   rec.WorkingDir,
+			StopSignal:   rec.StopSignal,
 		},
 		HostConfig: buildHostConfig(rec),
 		NetworkSettings: NetworkSettings{
@@ -911,10 +978,22 @@ func (h *Handler) resolveID(idOrName string) string {
 }
 
 // buildHostConfig reconstructs a HostConfig from the stored container record.
+// If the full create-time HostConfig was persisted, we replay that verbatim
+// so Portainer's "Duplicate" flow sees the exact fields it posted; otherwise
+// we synthesize the minimum set from typed record fields.
 func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
-	hc := &HostConfig{
-		NetworkMode: networkModeFor(rec),
+	hc := &HostConfig{}
+	if len(rec.RawHostConfig) > 0 {
+		if err := json.Unmarshal(rec.RawHostConfig, hc); err != nil {
+			// Fall through to synthesized config on decode error.
+			hc = &HostConfig{}
+		}
 	}
+	if hc.NetworkMode == "" {
+		hc.NetworkMode = networkModeFor(rec)
+	}
+	// Rebuild PortBindings/Binds from the typed record so that runtime state
+	// (e.g. dynamically allocated ports) wins over the stored create body.
 	if len(rec.PortBindings) > 0 {
 		hc.PortBindings = make(map[string][]PortBinding)
 		for _, pb := range rec.PortBindings {
@@ -925,12 +1004,15 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 			})
 		}
 	}
-	for _, m := range rec.Mounts {
-		bind := m.Source + ":" + m.Destination
-		if m.ReadOnly {
-			bind += ":ro"
+	if len(rec.Mounts) > 0 {
+		hc.Binds = hc.Binds[:0]
+		for _, m := range rec.Mounts {
+			bind := m.Source + ":" + m.Destination
+			if m.ReadOnly {
+				bind += ":ro"
+			}
+			hc.Binds = append(hc.Binds, bind)
 		}
-		hc.Binds = append(hc.Binds, bind)
 	}
 	return hc
 }

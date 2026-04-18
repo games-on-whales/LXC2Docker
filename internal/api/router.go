@@ -82,6 +82,7 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/containers/{id}/wait", h.waitContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/restart", h.restartContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/rename", h.renameContainer).Methods(http.MethodPost)
+		sub.HandleFunc("/containers/{id}/update", h.updateContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/pause", h.pauseContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/unpause", h.unpauseContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/top", h.topContainer).Methods(http.MethodGet)
@@ -98,9 +99,13 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/images/json", h.listImages).Methods(http.MethodGet)
 		sub.HandleFunc("/images/create", h.pullImage).Methods(http.MethodPost)
 		sub.HandleFunc("/images/prune", h.pruneImages).Methods(http.MethodPost)
-		sub.HandleFunc("/images/{name:.*}/json", h.inspectImage).Methods(http.MethodGet)
+		sub.HandleFunc("/images/{name:.*}/json", h.inspectImage).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/images/{name:.*}/history", h.imageHistory).Methods(http.MethodGet)
+		sub.HandleFunc("/images/{name:.*}/tag", h.tagImage).Methods(http.MethodPost)
 		sub.HandleFunc("/images/{name:.*}", h.removeImage).Methods(http.MethodDelete)
+
+		// Distribution (registry manifest probe used by Portainer's pull modal)
+		sub.HandleFunc("/distribution/{name:.*}/json", h.distributionInspect).Methods(http.MethodGet)
 
 		// Exec
 		sub.HandleFunc("/containers/{id}/exec", h.execCreate).Methods(http.MethodPost)

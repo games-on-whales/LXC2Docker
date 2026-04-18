@@ -7,29 +7,134 @@ import "time"
 // --- Container Create ---
 
 // ContainerCreateRequest mirrors the relevant subset of the Docker Engine
-// POST /containers/create body.
+// POST /containers/create body. Fields the daemon doesn't act on are still
+// declared here so they round-trip through create → inspect — Portainer's
+// "Duplicate/Edit container" flow re-posts whatever inspect returned, so
+// dropping fields on the floor corrupts the resulting container.
 type ContainerCreateRequest struct {
-	Image      string            `json:"Image"`
-	Cmd        []string          `json:"Cmd"`
-	Entrypoint []string          `json:"Entrypoint"`
-	Env        []string          `json:"Env"`
-	Labels     map[string]string `json:"Labels"`
-	WorkingDir string            `json:"WorkingDir"`
-	HostConfig HostConfig        `json:"HostConfig"`
+	Hostname         string              `json:"Hostname"`
+	Domainname       string              `json:"Domainname"`
+	User             string              `json:"User"`
+	AttachStdin      bool                `json:"AttachStdin"`
+	AttachStdout     bool                `json:"AttachStdout"`
+	AttachStderr     bool                `json:"AttachStderr"`
+	Tty              bool                `json:"Tty"`
+	OpenStdin        bool                `json:"OpenStdin"`
+	StdinOnce        bool                `json:"StdinOnce"`
+	ExposedPorts     map[string]struct{} `json:"ExposedPorts"`
+	Image            string              `json:"Image"`
+	Cmd              []string            `json:"Cmd"`
+	Entrypoint       []string            `json:"Entrypoint"`
+	Env              []string            `json:"Env"`
+	Labels           map[string]string   `json:"Labels"`
+	WorkingDir       string              `json:"WorkingDir"`
+	Volumes          map[string]struct{} `json:"Volumes"`
+	StopSignal       string              `json:"StopSignal"`
+	StopTimeout      *int                `json:"StopTimeout,omitempty"`
+	Healthcheck      *Healthcheck        `json:"Healthcheck,omitempty"`
+	HostConfig       HostConfig          `json:"HostConfig"`
+	NetworkingConfig *NetworkingConfig   `json:"NetworkingConfig,omitempty"`
 }
 
-// HostConfig holds the host-level container options.
+// Healthcheck is Docker's Config.Healthcheck. LXC has no equivalent so we
+// just persist and echo it.
+type Healthcheck struct {
+	Test        []string `json:"Test"`
+	Interval    int64    `json:"Interval"`
+	Timeout     int64    `json:"Timeout"`
+	Retries     int      `json:"Retries"`
+	StartPeriod int64    `json:"StartPeriod"`
+}
+
+// NetworkingConfig is an optional top-level Create body field. Portainer uses
+// it to pre-attach a container to a named network. We accept and ignore.
+type NetworkingConfig struct {
+	EndpointsConfig map[string]EndpointSettings `json:"EndpointsConfig"`
+}
+
+// HostConfig holds the host-level container options. Most fields below are
+// accepted-and-echoed rather than enforced; the comments call out which ones
+// actually shape the LXC config. Portainer's create/edit forms POST all of
+// them, so silently dropping would surface as lost settings on "Duplicate".
 type HostConfig struct {
-	Binds             []string                 `json:"Binds"` // "host:container[:ro]"
-	Devices           []DeviceMapping          `json:"Devices"`
-	DeviceCgroupRules []string                 `json:"DeviceCgroupRules"`
-	Memory            int64                    `json:"Memory"` // bytes, 0=unlimited
-	CPUShares         int64                    `json:"CpuShares"`
-	NanoCPUs          int64                    `json:"NanoCpus"`
-	NetworkMode       string                   `json:"NetworkMode"`
-	IpcMode           string                   `json:"IpcMode"` // "host" or "" (private)
-	PortBindings      map[string][]PortBinding `json:"PortBindings"`
-	RestartPolicy     RestartPolicy            `json:"RestartPolicy"`
+	// Mounts & storage
+	Binds          []string          `json:"Binds"` // "host:container[:ro]"
+	Mounts         []MountSpec       `json:"Mounts,omitempty"`
+	Tmpfs          map[string]string `json:"Tmpfs,omitempty"`
+	Volumes        []string          `json:"VolumesFrom,omitempty"`
+	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
+	ShmSize        int64             `json:"ShmSize"`
+	// Devices & capabilities
+	Devices           []DeviceMapping   `json:"Devices"`
+	DeviceCgroupRules []string          `json:"DeviceCgroupRules"`
+	CapAdd            []string          `json:"CapAdd"`
+	CapDrop           []string          `json:"CapDrop"`
+	Privileged        bool              `json:"Privileged"`
+	SecurityOpt       []string          `json:"SecurityOpt"`
+	GroupAdd          []string          `json:"GroupAdd"`
+	Sysctls           map[string]string `json:"Sysctls,omitempty"`
+	// Resource limits
+	Memory            int64  `json:"Memory"` // bytes, 0=unlimited
+	MemoryReservation int64  `json:"MemoryReservation"`
+	MemorySwap        int64  `json:"MemorySwap"`
+	CPUShares         int64  `json:"CpuShares"`
+	CPUQuota          int64  `json:"CpuQuota"`
+	CPUPeriod         int64  `json:"CpuPeriod"`
+	CpusetCpus        string `json:"CpusetCpus"`
+	CpusetMems        string `json:"CpusetMems"`
+	NanoCPUs          int64  `json:"NanoCpus"`
+	PidsLimit         int64  `json:"PidsLimit"`
+	OomKillDisable    bool   `json:"OomKillDisable"`
+	OomScoreAdj       int    `json:"OomScoreAdj"`
+	// Networking / DNS
+	NetworkMode     string                   `json:"NetworkMode"`
+	PortBindings    map[string][]PortBinding `json:"PortBindings"`
+	DNS             []string                 `json:"Dns,omitempty"`
+	DNSOptions      []string                 `json:"DnsOptions,omitempty"`
+	DNSSearch       []string                 `json:"DnsSearch,omitempty"`
+	ExtraHosts      []string                 `json:"ExtraHosts,omitempty"`
+	PublishAllPorts bool                     `json:"PublishAllPorts"`
+	// Namespaces
+	IpcMode      string `json:"IpcMode"`
+	PidMode      string `json:"PidMode"`
+	UTSMode      string `json:"UTSMode"`
+	UsernsMode   string `json:"UsernsMode"`
+	CgroupnsMode string `json:"CgroupnsMode"`
+	// Lifecycle
+	RestartPolicy RestartPolicy `json:"RestartPolicy"`
+	AutoRemove    bool          `json:"AutoRemove"`
+	Init          *bool         `json:"Init,omitempty"`
+	Runtime       string        `json:"Runtime"`
+	// Misc
+	Ulimits     []Ulimit          `json:"Ulimits,omitempty"`
+	LogConfig   *LogConfig        `json:"LogConfig,omitempty"`
+	Annotations map[string]string `json:"Annotations,omitempty"`
+}
+
+// MountSpec is the new-style mount declaration Portainer prefers over Binds.
+type MountSpec struct {
+	Type          string         `json:"Type"` // "bind", "volume", "tmpfs"
+	Source        string         `json:"Source"`
+	Target        string         `json:"Target"`
+	ReadOnly      bool           `json:"ReadOnly"`
+	Consistency   string         `json:"Consistency,omitempty"`
+	BindOptions   map[string]any `json:"BindOptions,omitempty"`
+	VolumeOptions map[string]any `json:"VolumeOptions,omitempty"`
+	TmpfsOptions  map[string]any `json:"TmpfsOptions,omitempty"`
+}
+
+// Ulimit is an entry in HostConfig.Ulimits.
+type Ulimit struct {
+	Name string `json:"Name"`
+	Soft int64  `json:"Soft"`
+	Hard int64  `json:"Hard"`
+}
+
+// LogConfig mirrors Docker's HostConfig.LogConfig. LXC writes console output
+// to a file regardless of what's requested here; we echo it back unchanged.
+type LogConfig struct {
+	Type   string            `json:"Type"`
+	Config map[string]string `json:"Config"`
 }
 
 // DeviceMapping is a single host→container device mapping.
@@ -131,11 +236,15 @@ type ContainerConfig struct {
 	OpenStdin    bool                `json:"OpenStdin"`
 	StdinOnce    bool                `json:"StdinOnce"`
 	Image        string              `json:"Image"`
+	Volumes      map[string]struct{} `json:"Volumes,omitempty"`
 	Cmd          []string            `json:"Cmd"`
 	Entrypoint   []string            `json:"Entrypoint"`
 	Env          []string            `json:"Env"`
 	Labels       map[string]string   `json:"Labels"`
 	WorkingDir   string              `json:"WorkingDir"`
+	StopSignal   string              `json:"StopSignal,omitempty"`
+	StopTimeout  *int                `json:"StopTimeout,omitempty"`
+	Healthcheck  *Healthcheck        `json:"Healthcheck,omitempty"`
 }
 
 // NetworkSettings holds the IP and network info for a container. Portainer
@@ -229,17 +338,47 @@ type ImageSummary struct {
 	RepoDigests []string          `json:"RepoDigests"`
 	Created     int64             `json:"Created"`
 	Size        int64             `json:"Size"`
+	SharedSize  int64             `json:"SharedSize"`
+	VirtualSize int64             `json:"VirtualSize"`
 	Labels      map[string]string `json:"Labels"`
+	// Containers is the count of containers using the image. Docker returns
+	// -1 when the engine hasn't computed this (cheap); so do we.
+	Containers int `json:"Containers"`
 }
 
 // ImageInspect is the body returned by GET /images/{name}/json.
 type ImageInspect struct {
-	ID           string            `json:"Id"`
-	RepoTags     []string          `json:"RepoTags"`
-	Created      string            `json:"Created"`
-	Architecture string            `json:"Architecture"`
-	Os           string            `json:"Os"`
-	Labels       map[string]string `json:"Labels"`
+	ID              string            `json:"Id"`
+	RepoTags        []string          `json:"RepoTags"`
+	RepoDigests     []string          `json:"RepoDigests"`
+	Parent          string            `json:"Parent"`
+	Comment         string            `json:"Comment"`
+	Created         string            `json:"Created"`
+	Container       string            `json:"Container"`
+	ContainerConfig *ContainerConfig  `json:"ContainerConfig"`
+	DockerVersion   string            `json:"DockerVersion"`
+	Author          string            `json:"Author"`
+	Config          *ContainerConfig  `json:"Config"`
+	Architecture    string            `json:"Architecture"`
+	Os              string            `json:"Os"`
+	Size            int64             `json:"Size"`
+	VirtualSize     int64             `json:"VirtualSize"`
+	GraphDriver     GraphDriver       `json:"GraphDriver"`
+	RootFS          ImageRootFS       `json:"RootFS"`
+	Metadata        ImageMetadata     `json:"Metadata"`
+	Labels          map[string]string `json:"Labels"`
+}
+
+// ImageRootFS describes an image's layer chain. LXC templates are flat so we
+// report a single synthetic layer.
+type ImageRootFS struct {
+	Type   string   `json:"Type"`
+	Layers []string `json:"Layers"`
+}
+
+// ImageMetadata carries timestamps the Portainer UI shows under "Last used".
+type ImageMetadata struct {
+	LastTagTime string `json:"LastTagTime"`
 }
 
 // --- Exec ---
@@ -284,17 +423,29 @@ type ExecProcessConfig struct {
 
 // --- System ---
 
-// VersionResponse is the body of GET /version.
+// VersionResponse is the body of GET /version. Modern Docker clients
+// (including Portainer's engine info panel) read Components for a per-engine
+// breakdown; without it the panel shows just a single line.
 type VersionResponse struct {
-	Version       string `json:"Version"`
-	APIVersion    string `json:"ApiVersion"`
-	MinAPIVersion string `json:"MinAPIVersion"`
-	GitCommit     string `json:"GitCommit"`
-	GoVersion     string `json:"GoVersion"`
-	Os            string `json:"Os"`
-	Arch          string `json:"Arch"`
-	KernelVersion string `json:"KernelVersion"`
-	BuildTime     string `json:"BuildTime"`
+	Platform      map[string]string  `json:"Platform,omitempty"`
+	Components    []VersionComponent `json:"Components,omitempty"`
+	Version       string             `json:"Version"`
+	APIVersion    string             `json:"ApiVersion"`
+	MinAPIVersion string             `json:"MinAPIVersion"`
+	GitCommit     string             `json:"GitCommit"`
+	GoVersion     string             `json:"GoVersion"`
+	Os            string             `json:"Os"`
+	Arch          string             `json:"Arch"`
+	KernelVersion string             `json:"KernelVersion"`
+	Experimental  bool               `json:"Experimental"`
+	BuildTime     string             `json:"BuildTime"`
+}
+
+// VersionComponent is one engine-component entry in /version.
+type VersionComponent struct {
+	Name    string            `json:"Name"`
+	Version string            `json:"Version"`
+	Details map[string]string `json:"Details,omitempty"`
 }
 
 // InfoResponse is a trimmed body for GET /info. It includes the fields

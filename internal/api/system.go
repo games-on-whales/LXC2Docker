@@ -4,12 +4,21 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
 	"golang.org/x/sys/unix"
 )
+
+// execCommand is a thin wrapper around exec.Command+Output so tests (and the
+// lxc-start --version lookup) have a single seam. It discards stderr on
+// error since we only care about successful runs.
+func execCommand(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).Output()
+}
 
 // ping writes the headers Docker clients (including Portainer) expect when
 // probing a daemon. The empty "OK" body is legal; the headers are the useful
@@ -34,8 +43,35 @@ func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
 	var uname unix.Utsname
 	unix.Uname(&uname)
 
+	engineVersion := "24.0.0-lxc"
+	components := []VersionComponent{
+		{
+			Name:    "Engine",
+			Version: engineVersion,
+			Details: map[string]string{
+				"ApiVersion":    apiVersion,
+				"Arch":          runtime.GOARCH,
+				"BuildTime":     "N/A",
+				"Experimental":  "false",
+				"GitCommit":     "lxc",
+				"GoVersion":     runtime.Version(),
+				"KernelVersion": unameRelease(uname),
+				"MinAPIVersion": "1.12",
+				"Os":            runtime.GOOS,
+			},
+		},
+	}
+	if v := lxcToolVersion(); v != "" {
+		components = append(components, VersionComponent{
+			Name:    "LXC",
+			Version: v,
+		})
+	}
+
 	resp := VersionResponse{
-		Version:       "24.0.0",
+		Platform:      map[string]string{"Name": "docker-lxc-daemon"},
+		Components:    components,
+		Version:       engineVersion,
 		APIVersion:    apiVersion,
 		MinAPIVersion: "1.12",
 		GitCommit:     "lxc",
@@ -46,6 +82,23 @@ func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
 		BuildTime:     "N/A",
 	}
 	jsonResponse(w, http.StatusOK, resp)
+}
+
+// lxcToolVersion runs `lxc-start --version` and returns the first line. We
+// only need this for /version cosmetics, so a missing binary is silently
+// ignored (the Engine component is still reported).
+func lxcToolVersion() string {
+	out, err := execCommand("lxc-start", "--version")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 func (h *Handler) info(w http.ResponseWriter, r *http.Request) {

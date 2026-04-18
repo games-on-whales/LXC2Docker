@@ -4,6 +4,7 @@
 package api
 
 import (
+	"io"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -126,6 +127,89 @@ func (h *Handler) imageHistory(w http.ResponseWriter, r *http.Request) {
 			"Tags":      []string{rec.Ref},
 			"Size":      0,
 			"Comment":   "Flattened LXC rootfs",
+		},
+	})
+}
+
+// POST /images/{name}/tag?repo=<repo>&tag=<tag>
+//
+// Portainer's image detail "Tag" button adds an additional ref to an existing
+// image. The daemon's store keys images by ref, so we add a second entry
+// pointing at the same template. Missing source returns 404, duplicate
+// target is silently treated as idempotent.
+func (h *Handler) tagImage(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	src := h.store.GetImage(normalizeImageRef(name))
+	if src == nil {
+		errResponse(w, http.StatusNotFound, "No such image: "+name)
+		return
+	}
+	repo := r.URL.Query().Get("repo")
+	tag := r.URL.Query().Get("tag")
+	if repo == "" {
+		errResponse(w, http.StatusBadRequest, "repo is required")
+		return
+	}
+	if tag == "" {
+		tag = "latest"
+	}
+	newRef := repo + ":" + tag
+
+	// Copy the record under the new ref. The template container is shared,
+	// so subsequent container creates can use either ref interchangeably.
+	cp := *src
+	cp.Ref = newRef
+	if err := h.store.AddImage(&cp); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+// POST /containers/{id}/update
+//
+// Portainer exposes a "Resource limits" modal that POSTs updated Memory,
+// CPU, and restart policy fields. LXC can't change most of these without a
+// restart, so we accept the request, update the stored HostConfig so
+// inspect reflects the new values, and return an empty warnings list.
+func (h *Handler) updateContainer(w http.ResponseWriter, r *http.Request) {
+	id := h.resolveID(mux.Vars(r)["id"])
+	if id == "" {
+		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+	// The body shape is HostConfig plus an optional RestartPolicy override.
+	body, _ := io.ReadAll(r.Body)
+	rec := h.store.GetContainer(id)
+	if rec != nil && len(body) > 0 {
+		// Merge the posted fields into the stored HostConfig so inspect
+		// shows the new values. We deliberately don't try to enforce them
+		// on the running container — restart policy, in particular, is a
+		// daemon-level concept this codebase doesn't implement.
+		rec.RawHostConfig = body
+		_ = h.store.AddContainer(rec)
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"Warnings": []string{},
+	})
+}
+
+// GET /distribution/{name}/json
+//
+// Portainer's "Pull image" modal probes this to decide whether a pull is
+// needed and what architectures a remote manifest offers. We don't hit the
+// registry ourselves; a minimal response with a single linux/amd64 platform
+// entry is enough to pass the UI's "does this image exist remotely?" check.
+func (h *Handler) distributionInspect(w http.ResponseWriter, r *http.Request) {
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"Descriptor": map[string]any{
+			"MediaType": "application/vnd.docker.distribution.manifest.v2+json",
+			"Digest":    "",
+			"Size":      0,
+			"URLs":      []string{},
+		},
+		"Platforms": []map[string]string{
+			{"architecture": "amd64", "os": "linux"},
 		},
 	})
 }
