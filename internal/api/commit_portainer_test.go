@@ -66,6 +66,9 @@ func TestCommitContainerPreservesPortainerContainerOverrides(t *testing.T) {
 	if committed == nil {
 		t.Fatal("expected committed image record")
 	}
+	if committed.ID == src.ID {
+		t.Fatalf("expected committed image to get a distinct ID, got source ID %q", committed.ID)
+	}
 	if len(committed.OCIEntrypoint) != 1 || committed.OCIEntrypoint[0] != "/entry" {
 		t.Fatalf("expected committed entrypoint, got %#v", committed.OCIEntrypoint)
 	}
@@ -137,6 +140,9 @@ func TestCommitContainerFallsBackToSourceImageDefaults(t *testing.T) {
 	committed := st.GetImage(normalizeImageRef("example/fallback:latest"))
 	if committed == nil {
 		t.Fatal("expected committed image record")
+	}
+	if committed.ID == src.ID {
+		t.Fatalf("expected committed image to get a distinct ID, got source ID %q", committed.ID)
 	}
 	if committed.OCIWorkingDir != "/base" || committed.OCIUser != "root" || committed.OCIStopSignal != "SIGTERM" {
 		t.Fatalf("expected source defaults to survive, got %+v", committed)

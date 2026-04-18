@@ -600,6 +600,7 @@ func (h *Handler) commitContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dup := *src
+	dup.ID = "commit_" + generateID()[:12]
 	dup.Ref = ref
 	dup.Created = time.Now()
 	dup.OCIEntrypoint = committedStringSlice(rec.Entrypoint, src.OCIEntrypoint)
