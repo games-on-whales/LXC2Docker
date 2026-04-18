@@ -132,7 +132,7 @@ func RemovePortForwards(containerIP string) error {
 }
 
 // NetworkConfig returns the lxc.conf lines needed to attach a container to
-// gow0 with the given static IP.
+// gow0 with the given static IP. Includes a default gateway via the bridge.
 func NetworkConfig(ip string) []configItem {
 	return []configItem{
 		{"lxc.net.0.type", "veth"},
@@ -141,4 +141,28 @@ func NetworkConfig(ip string) []configItem {
 		{"lxc.net.0.ipv4.address", ip + "/24"},
 		{"lxc.net.0.ipv4.gateway", BridgeGW},
 	}
+}
+
+// DualNICConfig returns lxc.conf lines for a dual-NIC container: the LAN
+// bridge as net.0 (primary — so mDNS and other services advertise the LAN IP)
+// and the internal gow0 bridge as net.1 (for inter-container traffic).
+func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem {
+	// net.0 = LAN (primary): routable IP on the physical network.
+	items := []configItem{
+		{"lxc.net.0.type", "veth"},
+		{"lxc.net.0.link", lanBridge},
+		{"lxc.net.0.flags", "up"},
+		{"lxc.net.0.ipv4.address", lanIP},
+	}
+	if lanGateway != "" {
+		items = append(items, configItem{"lxc.net.0.ipv4.gateway", lanGateway})
+	}
+	// net.1 = internal gow0 bridge (no gateway — connected route only).
+	items = append(items,
+		configItem{"lxc.net.1.type", "veth"},
+		configItem{"lxc.net.1.link", BridgeName},
+		configItem{"lxc.net.1.flags", "up"},
+		configItem{"lxc.net.1.ipv4.address", internalIP + "/24"},
+	)
+	return items
 }

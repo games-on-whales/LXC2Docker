@@ -39,14 +39,22 @@ const (
 
 // Resolve parses a Docker image reference and returns a ResolvedImage.
 // arch should be "amd64" or "arm64".
-func Resolve(ref, arch string) (*ResolvedImage, error) {
+//
+// When preferOCI is true, the built-in app shortcut registry is skipped:
+// any reference that isn't a known distro becomes KindOCI and will be
+// pulled from a Docker registry. This is what callers running in
+// Proxmox-CT mode use, so that names like "nginx:alpine" carry standard
+// Docker semantics (real Docker image, suitable for permanent CTs)
+// rather than the GoW-specific app-template shortcut (always ephemeral).
+func Resolve(ref, arch string, preferOCI bool) (*ResolvedImage, error) {
 	if arch == "" {
 		arch = "amd64"
 	}
 
 	name, tag := parseRef(ref)
 
-	// 1. Try distro image.
+	// 1. Try distro image. Always honored — distro names like "alpine" are
+	// the LXC native semantics, not Docker images.
 	if isKnownDistro(name) {
 		distro, release := resolveDistro(name, tag)
 		if distro == "" {
@@ -62,24 +70,26 @@ func Resolve(ref, arch string) (*ResolvedImage, error) {
 		}, nil
 	}
 
-	// 2. Try known app image.
-	if def, ok := lookupApp(name); ok {
-		baseName, baseTag := parseRef(def.Base)
-		baseDistro, baseRelease := resolveDistro(baseName, baseTag)
-		if baseDistro == "" {
-			return nil, fmt.Errorf("image: app %q has unknown base %q", name, def.Base)
+	// 2. Try known app image. Skipped when the caller prefers OCI.
+	if !preferOCI {
+		if def, ok := lookupApp(name); ok {
+			baseName, baseTag := parseRef(def.Base)
+			baseDistro, baseRelease := resolveDistro(baseName, baseTag)
+			if baseDistro == "" {
+				return nil, fmt.Errorf("image: app %q has unknown base %q", name, def.Base)
+			}
+			appDef := def // copy
+			return &ResolvedImage{
+				Ref:                   ref,
+				Kind:                  KindApp,
+				Distro:                baseDistro,
+				Release:               baseRelease,
+				Arch:                  arch,
+				App:                   &appDef,
+				BaseRef:               def.Base,
+				TemplateContainerName: appTemplateName(name, tag),
+			}, nil
 		}
-		appDef := def // copy
-		return &ResolvedImage{
-			Ref:                   ref,
-			Kind:                  KindApp,
-			Distro:                baseDistro,
-			Release:               baseRelease,
-			Arch:                  arch,
-			App:                   &appDef,
-			BaseRef:               def.Base,
-			TemplateContainerName: appTemplateName(name, tag),
-		}, nil
 	}
 
 	// 3. Fall through to OCI image — will be pulled via skopeo + umoci.
@@ -141,6 +151,5 @@ func sanitize(s string) string {
 		":", "_",
 		"/", "_",
 		" ", "_",
-		".", "_",
 	).Replace(s)
 }
