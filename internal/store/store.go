@@ -198,6 +198,11 @@ type ImageRecord struct {
 	OCIVolumes    []string          `json:"oci_volumes,omitempty"`
 	OCIOnBuild    []string          `json:"oci_onbuild,omitempty"`
 	OCIShell      []string          `json:"oci_shell,omitempty"`
+	OCIAuthor     string            `json:"oci_author,omitempty"`
+	OCIComment    string            `json:"oci_comment,omitempty"`
+	OCIContainer  string            `json:"oci_container,omitempty"`
+	OCIDockerVersion string         `json:"oci_docker_version,omitempty"`
+	OCIVariant    string            `json:"oci_variant,omitempty"`
 	TemplateDataset string           `json:"template_dataset,omitempty"`
 	// RepoDigest holds the image manifest digest ("sha256:...") when
 	// known. Populated by skopeo inspect after pull. Used to surface a

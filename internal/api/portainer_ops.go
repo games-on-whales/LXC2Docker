@@ -613,6 +613,11 @@ func (h *Handler) commitContainer(w http.ResponseWriter, r *http.Request) {
 	dup.ID = "commit_" + generateID()[:12]
 	dup.Ref = ref
 	dup.Created = time.Now()
+	dup.OCIAuthor = committedString(q.Get("author"), src.OCIAuthor)
+	dup.OCIComment = committedString(q.Get("comment"), src.OCIComment)
+	dup.OCIContainer = committedString(id, src.OCIContainer)
+	dup.OCIDockerVersion = committedString("24.0.0-lxc", src.OCIDockerVersion)
+	dup.OCIVariant = committedString(src.OCIVariant, "")
 	dup.OCIEntrypoint = committedStringSlice(rec.Entrypoint, src.OCIEntrypoint)
 	dup.OCICmd = committedStringSlice(rec.Cmd, src.OCICmd)
 	dup.OCIEnv = committedStringSlice(rec.Env, src.OCIEnv)

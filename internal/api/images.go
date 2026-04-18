@@ -397,8 +397,11 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 		ID:              "sha256:" + rec.ID,
 		RepoTags:        []string{rec.Ref},
 		RepoDigests:     digestRefs(rec),
+		Comment:         rec.OCIComment,
 		Created:         rec.Created.Format(time.RFC3339),
+		Container:       rec.OCIContainer,
 		Architecture:    rec.Arch,
+		Variant:         rec.OCIVariant,
 		Os:              "linux",
 		OsVersion:       rec.Release,
 		Size:            imageSize(h.mgr.LXCPath(), rec),
@@ -417,8 +420,8 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 			LastTagTime: rec.Created.Format(time.RFC3339),
 		},
 		Labels:        labels,
-		Author:        "docker-lxc-daemon",
-		DockerVersion: "24.0.0-lxc",
+		Author:        orDefault(rec.OCIAuthor, "docker-lxc-daemon"),
+		DockerVersion: orDefault(rec.OCIDockerVersion, "24.0.0-lxc"),
 	}
 
 	if r.Method == http.MethodHead {

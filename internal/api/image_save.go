@@ -350,6 +350,11 @@ func synthesiseImageConfig(rec *store.ImageRecord, layerSHA string) ([]byte, str
 		"architecture": arch,
 		"os":           "linux",
 		"created":      rec.Created.UTC().Format(time.RFC3339Nano),
+		"author":       rec.OCIAuthor,
+		"comment":      rec.OCIComment,
+		"container":    rec.OCIContainer,
+		"docker_version": rec.OCIDockerVersion,
+		"variant":      rec.OCIVariant,
 		"config":       cfg,
 		"container_config": cfg,
 		"rootfs": map[string]any{
@@ -401,6 +406,11 @@ type saveManifestEntry struct {
 type saveImageConfig struct {
 	Architecture   string              `json:"architecture"`
 	Created        string              `json:"created"`
+	Author         string              `json:"author"`
+	Comment        string              `json:"comment"`
+	Container      string              `json:"container"`
+	DockerVersion  string              `json:"docker_version"`
+	Variant        string              `json:"variant"`
 	OSVersion      string              `json:"os.version"`
 	Config         saveImageConfigBody `json:"config"`
 	ContainerConfig saveImageConfigBody `json:"container_config"`
@@ -544,6 +554,11 @@ func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send 
 			TemplateDataset: dataset,
 			Created:         createdAt,
 			Release:         cfg.OSVersion,
+			OCIAuthor:       cfg.Author,
+			OCIComment:      cfg.Comment,
+			OCIContainer:    cfg.Container,
+			OCIDockerVersion: cfg.DockerVersion,
+			OCIVariant:      cfg.Variant,
 			OCIHostname:     effective.Hostname,
 			OCIDomainname:   effective.Domainname,
 			OCIMacAddress:   effective.MacAddress,
