@@ -133,6 +133,44 @@ func (h *Handler) HealthEmitter() func(id, status string) {
 // emitImage publishes an "image" event. Portainer subscribes to the events
 // stream and refreshes its Images tab whenever it sees one. The actor ID
 // is the ref (e.g. "nginx:latest") to match Docker's convention.
+func (h *Handler) emitVolume(action, name string) {
+	now := time.Now()
+	h.events.publish(Event{
+		Type:   "volume",
+		Action: action,
+		Actor: EventActor{
+			ID:         name,
+			Attributes: map[string]string{"driver": "local"},
+		},
+		Scope:    "local",
+		Time:     now.Unix(),
+		TimeNano: now.UnixNano(),
+		ID:       name,
+		Status:   action,
+	})
+}
+
+func (h *Handler) emitNetwork(action, id, name string) {
+	now := time.Now()
+	attrs := map[string]string{"type": "bridge"}
+	if name != "" {
+		attrs["name"] = name
+	}
+	h.events.publish(Event{
+		Type:   "network",
+		Action: action,
+		Actor: EventActor{
+			ID:         id,
+			Attributes: attrs,
+		},
+		Scope:    "local",
+		Time:     now.Unix(),
+		TimeNano: now.UnixNano(),
+		ID:       id,
+		Status:   action,
+	})
+}
+
 func (h *Handler) emitImage(action, ref string) {
 	now := time.Now()
 	h.events.publish(Event{

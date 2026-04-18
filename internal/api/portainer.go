@@ -252,6 +252,11 @@ func (h *Handler) updateContainer(w http.ResponseWriter, r *http.Request) {
 	if len(body) > 0 {
 		_ = json.Unmarshal(body, &posted)
 	}
+	if !isValidRestartPolicy(posted.RestartPolicy.Name) {
+		errResponse(w, http.StatusBadRequest,
+			"invalid restart policy; expected one of no, always, unless-stopped, on-failure")
+		return
+	}
 
 	rec := h.store.GetContainer(id)
 	warnings := []string{}

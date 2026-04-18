@@ -46,6 +46,11 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, "Image is required")
 		return
 	}
+	if !isValidRestartPolicy(req.HostConfig.RestartPolicy.Name) {
+		errResponse(w, http.StatusBadRequest,
+			fmt.Sprintf("invalid restart policy %q; expected one of no, always, unless-stopped, on-failure", req.HostConfig.RestartPolicy.Name))
+		return
+	}
 
 	// Name conflict: Docker returns 409 rather than silently clobbering
 	// the existing container's record. Portainer relies on this to detect
@@ -363,6 +368,9 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		if filt.has("volume") && !containerUsesVolume(rec, h.store, filt["volume"]) {
 			continue
 		}
+		if filt.has("network") && !containerOnNetwork(rec, filt["network"]) {
+			continue
+		}
 		// The "health" filter matches HealthStatus ("starting"/"healthy"/
 		// "unhealthy") or the special value "none" for containers without
 		// a configured healthcheck. Portainer's "Unhealthy" dashboard
@@ -525,7 +533,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		state = "created"
 	}
 
-	startedAt := rec.Created.Format(time.RFC3339Nano)
+	startedAt := "0001-01-01T00:00:00Z"
 	if rec.StartedAt != nil {
 		startedAt = rec.StartedAt.Format(time.RFC3339Nano)
 	}
@@ -1637,6 +1645,16 @@ func (h *Handler) exposedPortsFor(rec *store.ContainerRecord) map[string]struct{
 	return out
 }
 
+func containerOnNetwork(rec *store.ContainerRecord, names []string) bool {
+	attached := map[string]bool{networkModeFor(rec): true, "gow": true}
+	for _, want := range names {
+		if attached[want] {
+			return true
+		}
+	}
+	return false
+}
+
 func containerUsesVolume(rec *store.ContainerRecord, st *store.Store, names []string) bool {
 	sources := map[string]bool{}
 	for _, name := range names {
@@ -1649,6 +1667,14 @@ func containerUsesVolume(rec *store.ContainerRecord, st *store.Store, names []st
 		if sources[m.Source] {
 			return true
 		}
+	}
+	return false
+}
+
+func isValidRestartPolicy(name string) bool {
+	switch name {
+	case "", "no", "always", "unless-stopped", "on-failure":
+		return true
 	}
 	return false
 }

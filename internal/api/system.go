@@ -293,25 +293,35 @@ func (h *Handler) networksWithContainers() []map[string]any {
 }
 
 func (h *Handler) createNetwork(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"Name"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	id := generateID()
+	h.emitNetwork("create", id, body.Name)
 	jsonResponse(w, http.StatusCreated, map[string]string{
-		"Id":      generateID(),
+		"Id":      id,
 		"Warning": "",
 	})
 }
 
 func (h *Handler) connectNetwork(w http.ResponseWriter, r *http.Request) {
-	if !h.knownNetwork(mux.Vars(r)["id"]) {
+	id := mux.Vars(r)["id"]
+	if !h.knownNetwork(id) {
 		errResponse(w, http.StatusNotFound, "network not found")
 		return
 	}
+	h.emitNetwork("connect", id, "")
 	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) disconnectNetwork(w http.ResponseWriter, r *http.Request) {
-	if !h.knownNetwork(mux.Vars(r)["id"]) {
+	id := mux.Vars(r)["id"]
+	if !h.knownNetwork(id) {
 		errResponse(w, http.StatusNotFound, "network not found")
 		return
 	}
+	h.emitNetwork("disconnect", id, "")
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -329,12 +339,12 @@ func (h *Handler) knownNetwork(id string) bool {
 
 func (h *Handler) removeNetwork(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
-	// Refuse to delete the three built-in networks (matching Docker's behavior).
 	switch id {
 	case "gow", "host", "none", "bridge":
 		errResponse(w, http.StatusForbidden, id+" is a pre-defined network and cannot be removed")
 		return
 	}
+	h.emitNetwork("destroy", id, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -408,7 +418,7 @@ func (h *Handler) systemDF(w http.ResponseWriter, r *http.Request) {
 				"Name":       v.Name,
 				"Driver":     v.Driver,
 				"Mountpoint": v.Mountpoint,
-				"CreatedAt":  v.Created.Format(time.RFC3339),
+				"CreatedAt":  v.Created.Format(time.RFC3339Nano),
 				"Scope":      "local",
 				"Labels":     v.Labels,
 				"UsageData": map[string]int64{
@@ -592,6 +602,7 @@ func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.emitVolume("create", v.Name)
 	jsonResponse(w, http.StatusCreated, volumeJSON(v))
 }
 
@@ -617,6 +628,7 @@ func (h *Handler) removeVolume(w http.ResponseWriter, r *http.Request) {
 	}
 	os.RemoveAll(v.Mountpoint)
 	h.store.RemoveVolume(name)
+	h.emitVolume("destroy", name)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -635,6 +647,7 @@ func (h *Handler) pruneVolumes(w http.ResponseWriter, r *http.Request) {
 		}
 		os.RemoveAll(v.Mountpoint)
 		h.store.RemoveVolume(v.Name)
+		h.emitVolume("destroy", v.Name)
 		deleted = append(deleted, v.Name)
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
@@ -675,7 +688,7 @@ func volumeJSON(v *store.VolumeRecord) map[string]any {
 		"Name":       v.Name,
 		"Driver":     v.Driver,
 		"Mountpoint": v.Mountpoint,
-		"CreatedAt":  v.Created.Format(time.RFC3339),
+		"CreatedAt":  v.Created.Format(time.RFC3339Nano),
 		"Scope":      "local",
 		"Options":    opts,
 		"Labels":     labels,
