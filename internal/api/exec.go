@@ -65,6 +65,10 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
+	if state, _ := h.mgr.State(containerID); state != "running" && state != "paused" {
+		errResponse(w, http.StatusConflict, "Container is not running")
+		return
+	}
 
 	var req ExecCreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

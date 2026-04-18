@@ -258,6 +258,10 @@ func (h *Handler) inspectNetwork(w http.ResponseWriter, r *http.Request) {
 			jsonResponse(w, http.StatusOK, n)
 			return
 		}
+		if s, _ := n["Id"].(string); len(id) >= 4 && strings.HasPrefix(s, id) {
+			jsonResponse(w, http.StatusOK, n)
+			return
+		}
 	}
 	errResponse(w, http.StatusNotFound, "network not found")
 }
@@ -314,6 +318,9 @@ func (h *Handler) disconnectNetwork(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) knownNetwork(id string) bool {
 	for _, n := range defaultNetworks() {
 		if n["Id"] == id || n["Name"] == id {
+			return true
+		}
+		if s, _ := n["Id"].(string); len(id) >= 4 && strings.HasPrefix(s, id) {
 			return true
 		}
 	}

@@ -398,7 +398,7 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			Command: cmd,
 			Created: rec.Created.Unix(),
 			State:   state,
-			Status:  stateToStatus(state, rec.Created),
+			Status:  stateToStatusWithHealth(state, rec.Created, rec.HealthStatus),
 			Ports:   ports,
 			Labels:  rec.Labels,
 			Mounts:  mounts,
@@ -1533,9 +1533,16 @@ func writeLogFrame(w io.Writer, streamType byte, data []byte) {
 
 // stateToStatus returns a human-readable status string like Docker's "Up 2 hours".
 func stateToStatus(state string, created time.Time) string {
+	return stateToStatusWithHealth(state, created, "")
+}
+
+func stateToStatusWithHealth(state string, created time.Time, health string) string {
+	base := ""
 	switch state {
 	case "running":
-		return "Up " + humanDuration(time.Since(created))
+		base = "Up " + humanDuration(time.Since(created))
+	case "paused":
+		base = "Up " + humanDuration(time.Since(created)) + " (Paused)"
 	case "created":
 		return "Created"
 	case "exited":
@@ -1543,6 +1550,15 @@ func stateToStatus(state string, created time.Time) string {
 	default:
 		return state
 	}
+	switch health {
+	case "healthy":
+		return base + " (healthy)"
+	case "unhealthy":
+		return base + " (unhealthy)"
+	case "starting":
+		return base + " (health: starting)"
+	}
+	return base
 }
 
 func humanDuration(d time.Duration) string {
@@ -1753,6 +1769,7 @@ func (h *Handler) mountJSONFrom(m store.MountSpec) MountJSON {
 		Destination: m.Destination,
 		Mode:        mode,
 		RW:          !m.ReadOnly,
+		Propagation: "rprivate",
 	}
 	if t == "volume" {
 		if v := h.volumeByMountpoint(m.Source); v != nil {
