@@ -298,13 +298,16 @@ func (h *Handler) createNetwork(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"Name"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	if body.Name != "" {
-		for _, n := range defaultNetworks() {
-			if n["Name"] == body.Name {
-				errResponse(w, http.StatusConflict,
-					fmt.Sprintf("network with name %s already exists", body.Name))
-				return
-			}
+	body.Name = strings.TrimSpace(body.Name)
+	if body.Name == "" {
+		errResponse(w, http.StatusBadRequest, "network name cannot be empty")
+		return
+	}
+	for _, n := range defaultNetworks() {
+		if n["Name"] == body.Name {
+			errResponse(w, http.StatusConflict,
+				fmt.Sprintf("network with name %s already exists", body.Name))
+			return
 		}
 	}
 	id := generateID()

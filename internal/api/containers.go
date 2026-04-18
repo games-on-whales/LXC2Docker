@@ -271,6 +271,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		StopSignal:      req.StopSignal,
 		ExposedPorts:    req.ExposedPorts,
 		Volumes:         req.Volumes,
+		StopTimeout:     stopTimeoutValue(req.StopTimeout),
 		RawHostConfig:   rawHC,
 		Mounts:          storeMounts,
 		RestartPolicy:   req.HostConfig.RestartPolicy.Name,
@@ -636,6 +637,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Labels:       rec.Labels,
 			WorkingDir:   rec.WorkingDir,
 			StopSignal:   rec.StopSignal,
+			StopTimeout:  stopTimeoutPtr(rec.StopTimeout),
 			Healthcheck:  healthcheckFrom(rec),
 		},
 		HostConfig: buildHostConfig(rec),
@@ -723,10 +725,12 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stopSig := ""
+	defaultTO := 0
 	if rec := h.store.GetContainer(id); rec != nil {
 		stopSig = rec.StopSignal
+		defaultTO = rec.StopTimeout
 	}
-	if err := h.mgr.StopContainerWithSignal(id, stopTimeout(r), stopSig); err != nil {
+	if err := h.mgr.StopContainerWithSignal(id, stopTimeoutWithDefault(r, defaultTO), stopSig); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -750,8 +754,15 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 // default. Negative values disable the timeout — we translate that to an
 // effectively unbounded wait (1 hour) rather than block forever.
 func stopTimeout(r *http.Request) time.Duration {
+	return stopTimeoutWithDefault(r, 0)
+}
+
+func stopTimeoutWithDefault(r *http.Request, defaultSec int) time.Duration {
 	v := r.URL.Query().Get("t")
 	if v == "" {
+		if defaultSec > 0 {
+			return time.Duration(defaultSec) * time.Second
+		}
 		return 10 * time.Second
 	}
 	n, err := strconv.Atoi(v)
@@ -762,6 +773,20 @@ func stopTimeout(r *http.Request) time.Duration {
 		return time.Hour
 	}
 	return time.Duration(n) * time.Second
+}
+
+func stopTimeoutValue(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+func stopTimeoutPtr(v int) *int {
+	if v <= 0 {
+		return nil
+	}
+	return &v
 }
 
 // POST /containers/{id}/wait
@@ -1130,7 +1155,11 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	state, _ := h.mgr.State(id)
 	if state == "running" {
-		if err := h.mgr.StopContainer(id, stopTimeout(r)); err != nil {
+		defaultTO := 0
+		if rec := h.store.GetContainer(id); rec != nil {
+			defaultTO = rec.StopTimeout
+		}
+		if err := h.mgr.StopContainer(id, stopTimeoutWithDefault(r, defaultTO)); err != nil {
 			errResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}

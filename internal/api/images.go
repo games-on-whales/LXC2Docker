@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -62,6 +63,9 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 	for _, id := range ids {
 		out = append(out, *grouped[id])
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Created > out[j].Created
+	})
 	jsonResponse(w, http.StatusOK, out)
 }
 

@@ -51,6 +51,7 @@ type ContainerRecord struct {
 	StopSignal   string              `json:"stop_signal,omitempty"`
 	ExposedPorts map[string]struct{} `json:"exposed_ports,omitempty"`
 	Volumes      map[string]struct{} `json:"volumes,omitempty"`
+	StopTimeout  int                 `json:"stop_timeout,omitempty"`
 	// Lifecycle policy. Hoisted out of RawHostConfig so the restart watcher
 	// doesn't have to re-decode the full JSON blob every 5 seconds.
 	RestartPolicy   string `json:"restart_policy,omitempty"`    // "always"|"on-failure"|"unless-stopped"|""
