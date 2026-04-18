@@ -363,13 +363,7 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 	if labels == nil {
 		labels = map[string]string{}
 	}
-	cfg := normalizeContainerConfig(&ContainerConfig{
-		Env:        rec.OCIEnv,
-		Cmd:        rec.OCICmd,
-		Entrypoint: rec.OCIEntrypoint,
-		WorkingDir: rec.OCIWorkingDir,
-		Labels:     labels,
-	})
+	cfg := imageConfigFromRecord(rec)
 
 	resp := ImageInspect{
 		ID:              "sha256:" + rec.ID,
@@ -407,6 +401,50 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusOK, resp)
+}
+
+func imageConfigFromRecord(rec *store.ImageRecord) *ContainerConfig {
+	if rec == nil {
+		return normalizeContainerConfig(&ContainerConfig{})
+	}
+	volumes := map[string]struct{}{}
+	for _, v := range rec.OCIVolumes {
+		if v != "" {
+			volumes[v] = struct{}{}
+		}
+	}
+	exposed := map[string]struct{}{}
+	for _, p := range rec.OCIPorts {
+		if p != "" {
+			exposed[p] = struct{}{}
+		}
+	}
+	return normalizeContainerConfig(&ContainerConfig{
+		User:         rec.OCIUser,
+		ExposedPorts: exposed,
+		Volumes:      volumes,
+		Cmd:          rec.OCICmd,
+		Entrypoint:   rec.OCIEntrypoint,
+		Env:          rec.OCIEnv,
+		Labels:       ensureMap(rec.OCILabels),
+		WorkingDir:   rec.OCIWorkingDir,
+		StopSignal:   rec.OCIStopSignal,
+		Healthcheck:  healthcheckFromImage(rec),
+	})
+}
+
+func healthcheckFromImage(rec *store.ImageRecord) *Healthcheck {
+	if rec == nil || rec.OCIHealthcheck == nil {
+		return nil
+	}
+	hc := rec.OCIHealthcheck
+	return &Healthcheck{
+		Test:        append([]string{}, hc.Test...),
+		Interval:    hc.Interval,
+		Timeout:     hc.Timeout,
+		Retries:     hc.Retries,
+		StartPeriod: hc.StartPeriod,
+	}
 }
 
 // DELETE /images/{name}  (docker rmi)
