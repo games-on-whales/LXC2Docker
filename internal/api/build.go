@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/oci"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/lxc"
+	"github.com/games-on-whales/LXC2Docker/internal/oci"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 )
 
 type buildState struct {
@@ -279,16 +279,16 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 					fail(inst.op + ": " + err.Error())
 					return
 				}
-		case "RUN":
-			script := inst.args
-			if state.workdir != "" {
-				script = fmt.Sprintf("mkdir -p %q && cd %q && %s", state.workdir, state.workdir, inst.args)
-			}
-			shellArgs := runShell(state.shell)
-			args := buildRunArgs(rootfs, shellArgs, state.user, script)
-			cmd := exec.Command("chroot", args...)
-			cmd.Env = append(os.Environ(), state.env...)
-			out, err := cmd.CombinedOutput()
+			case "RUN":
+				script := inst.args
+				if state.workdir != "" {
+					script = fmt.Sprintf("mkdir -p %q && cd %q && %s", state.workdir, state.workdir, inst.args)
+				}
+				shellArgs := runShell(state.shell)
+				args := buildRunArgs(rootfs, shellArgs, state.user, script)
+				cmd := exec.Command("chroot", args...)
+				cmd.Env = append(os.Environ(), state.env...)
+				out, err := cmd.CombinedOutput()
 				if len(out) > 0 {
 					send(map[string]string{"stream": string(out)})
 				}

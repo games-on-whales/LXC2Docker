@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
 

@@ -17,9 +17,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/image"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/image"
+	"github.com/games-on-whales/LXC2Docker/internal/lxc"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
 

@@ -2,14 +2,14 @@ package api
 
 import (
 	"encoding/json"
-	"os"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/lxc"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
 
@@ -17,11 +17,11 @@ import (
 // and the metadata store, owns the in-memory exec instance table, and fans
 // out lifecycle events to /events subscribers.
 type Handler struct {
-	mgr    *lxc.Manager
-	store  *store.Store
-	execs  *execStore
-	events *eventBroker
-	attachMu  sync.Mutex
+	mgr        *lxc.Manager
+	store      *store.Store
+	execs      *execStore
+	events     *eventBroker
+	attachMu   sync.Mutex
 	attachPTYs map[string]*os.File
 }
 
@@ -41,10 +41,10 @@ func NewHandlerWithHooks(mgr *lxc.Manager, st *store.Store) (http.Handler, func(
 
 func newHandler(mgr *lxc.Manager, st *store.Store) *Handler {
 	h := &Handler{
-		mgr:    mgr,
-		store:  st,
-		execs:  newExecStore(),
-		events: newEventBroker(),
+		mgr:        mgr,
+		store:      st,
+		execs:      newExecStore(),
+		events:     newEventBroker(),
 		attachPTYs: make(map[string]*os.File),
 	}
 	// Periodically prune completed exec records to prevent memory leaks.

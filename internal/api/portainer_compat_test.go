@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
 
@@ -256,8 +256,8 @@ type fakeFileInfo struct {
 	dir  bool
 }
 
-func (f fakeFileInfo) Name() string  { return f.name }
-func (f fakeFileInfo) Size() int64   { return 0 }
+func (f fakeFileInfo) Name() string { return f.name }
+func (f fakeFileInfo) Size() int64  { return 0 }
 func (f fakeFileInfo) Mode() os.FileMode {
 	if f.dir {
 		return os.ModeDir | 0o755

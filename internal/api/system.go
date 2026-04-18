@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 	"golang.org/x/sys/unix"
 )
@@ -161,7 +161,7 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 					"Official": true,
 				},
 			},
-			Mirrors:                                 []string{},
+			Mirrors: []string{},
 		},
 		Swarm: SwarmInfo{
 			LocalNodeState: "inactive",

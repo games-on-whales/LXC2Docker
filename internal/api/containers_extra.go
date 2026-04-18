@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 	"golang.org/x/sys/unix"
 )
@@ -180,8 +180,8 @@ func readMemoryEventsOOM(path string) uint64 {
 		if err != nil {
 			return 0
 		}
-	return n
-}
+		return n
+	}
 	return 0
 }
 
@@ -255,6 +255,9 @@ func dirSize(root string) (int64, error) {
 }
 
 func (h *Handler) publishEvent(kind, action, id string, attrs map[string]string) {
+	if h == nil || h.events == nil {
+		return
+	}
 	if attrs == nil {
 		attrs = map[string]string{}
 	}

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 )
 
 func TestImageConfigFromRecordForPortainer(t *testing.T) {

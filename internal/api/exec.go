@@ -92,18 +92,18 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rec := &execRecord{
-		ID:          generateID(),
-		ContainerID: containerID,
-		Cmd:         req.Cmd,
-		Tty:         req.Tty,
-		DetachKeys:  req.DetachKeys,
-		AttachStdin: req.AttachStdin,
+		ID:           generateID(),
+		ContainerID:  containerID,
+		Cmd:          req.Cmd,
+		Tty:          req.Tty,
+		DetachKeys:   req.DetachKeys,
+		AttachStdin:  req.AttachStdin,
 		AttachStdout: req.AttachStdout,
 		AttachStderr: req.AttachStderr,
-		Env:         mergedEnv,
-		WorkingDir:  req.WorkingDir,
-		User:        req.User,
-		Privileged:  req.Privileged,
+		Env:          mergedEnv,
+		WorkingDir:   req.WorkingDir,
+		User:         req.User,
+		Privileged:   req.Privileged,
 	}
 	h.execs.add(rec)
 
@@ -209,6 +209,13 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) startDetachedExec(execID string, cmd *exec.Cmd) {
+	startedAt := time.Now()
+	h.execs.update(execID, func(r *execRecord) {
+		r.Running = true
+		r.StartedAt = startedAt
+		r.ExitCode = 0
+		r.Pid = 0
+	})
 	go func() {
 		if err := cmd.Start(); err != nil {
 			h.execs.update(execID, func(r *execRecord) {
@@ -219,8 +226,6 @@ func (h *Handler) startDetachedExec(execID string, cmd *exec.Cmd) {
 			return
 		}
 		h.execs.update(execID, func(r *execRecord) {
-			r.Running = true
-			r.StartedAt = time.Now()
 			if cmd.Process != nil {
 				r.Pid = cmd.Process.Pid
 			}

@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/oci"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/oci"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
 
@@ -309,29 +309,29 @@ func synthesiseImageConfig(rec *store.ImageRecord, layerSHA string) ([]byte, str
 		}
 	}
 	cfg := map[string]any{
-		"Hostname":     rec.OCIHostname,
-		"Domainname":   rec.OCIDomainname,
-		"MacAddress":   rec.OCIMacAddress,
-		"Env":          append([]string{}, rec.OCIEnv...),
-		"Cmd":          append([]string{}, rec.OCICmd...),
-		"Entrypoint":   append([]string{}, rec.OCIEntrypoint...),
-		"WorkingDir":   rec.OCIWorkingDir,
-		"User":         rec.OCIUser,
-		"AttachStdin":  rec.OCIAttachStdin,
-		"AttachStdout": rec.OCIAttachStdout,
-		"AttachStderr": rec.OCIAttachStderr,
-		"StopSignal":   rec.OCIStopSignal,
-		"StopTimeout":  rec.OCIStopTimeout,
-		"Labels":       copyLabels(rec.OCILabels),
-		"ExposedPorts": ports,
-		"Tty":          rec.OCITty,
-		"OpenStdin":    rec.OCIOpenStdin,
-		"StdinOnce":    rec.OCIStdinOnce,
+		"Hostname":        rec.OCIHostname,
+		"Domainname":      rec.OCIDomainname,
+		"MacAddress":      rec.OCIMacAddress,
+		"Env":             append([]string{}, rec.OCIEnv...),
+		"Cmd":             append([]string{}, rec.OCICmd...),
+		"Entrypoint":      append([]string{}, rec.OCIEntrypoint...),
+		"WorkingDir":      rec.OCIWorkingDir,
+		"User":            rec.OCIUser,
+		"AttachStdin":     rec.OCIAttachStdin,
+		"AttachStdout":    rec.OCIAttachStdout,
+		"AttachStderr":    rec.OCIAttachStderr,
+		"StopSignal":      rec.OCIStopSignal,
+		"StopTimeout":     rec.OCIStopTimeout,
+		"Labels":          copyLabels(rec.OCILabels),
+		"ExposedPorts":    ports,
+		"Tty":             rec.OCITty,
+		"OpenStdin":       rec.OCIOpenStdin,
+		"StdinOnce":       rec.OCIStdinOnce,
 		"NetworkDisabled": rec.OCINetworkDisabled,
-		"ArgsEscaped":  rec.OCIArgsEscaped,
-		"Volumes":      volumes,
-		"OnBuild":      append([]string{}, rec.OCIOnBuild...),
-		"Shell":        append([]string{}, rec.OCIShell...),
+		"ArgsEscaped":     rec.OCIArgsEscaped,
+		"Volumes":         volumes,
+		"OnBuild":         append([]string{}, rec.OCIOnBuild...),
+		"Shell":           append([]string{}, rec.OCIShell...),
 	}
 	if hc := rec.OCIHealthcheck; hc != nil {
 		cfg["Healthcheck"] = map[string]any{
@@ -347,15 +347,15 @@ func synthesiseImageConfig(rec *store.ImageRecord, layerSHA string) ([]byte, str
 		arch = "amd64"
 	}
 	img := map[string]any{
-		"architecture": arch,
-		"os":           "linux",
-		"created":      rec.Created.UTC().Format(time.RFC3339Nano),
-		"author":       rec.OCIAuthor,
-		"comment":      rec.OCIComment,
-		"container":    rec.OCIContainer,
-		"docker_version": rec.OCIDockerVersion,
-		"variant":      rec.OCIVariant,
-		"config":       cfg,
+		"architecture":     arch,
+		"os":               "linux",
+		"created":          rec.Created.UTC().Format(time.RFC3339Nano),
+		"author":           rec.OCIAuthor,
+		"comment":          rec.OCIComment,
+		"container":        rec.OCIContainer,
+		"docker_version":   rec.OCIDockerVersion,
+		"variant":          rec.OCIVariant,
+		"config":           cfg,
 		"container_config": cfg,
 		"rootfs": map[string]any{
 			"type":     "layers",
@@ -404,43 +404,43 @@ type saveManifestEntry struct {
 // back during load. Fields line up with the saveImage synthesis so a save →
 // load round-trip preserves the OCI metadata we track.
 type saveImageConfig struct {
-	Architecture   string              `json:"architecture"`
-	Created        string              `json:"created"`
-	Author         string              `json:"author"`
-	Comment        string              `json:"comment"`
-	Container      string              `json:"container"`
-	DockerVersion  string              `json:"docker_version"`
-	Variant        string              `json:"variant"`
-	OSVersion      string              `json:"os.version"`
-	Config         saveImageConfigBody `json:"config"`
+	Architecture    string              `json:"architecture"`
+	Created         string              `json:"created"`
+	Author          string              `json:"author"`
+	Comment         string              `json:"comment"`
+	Container       string              `json:"container"`
+	DockerVersion   string              `json:"docker_version"`
+	Variant         string              `json:"variant"`
+	OSVersion       string              `json:"os.version"`
+	Config          saveImageConfigBody `json:"config"`
 	ContainerConfig saveImageConfigBody `json:"container_config"`
 }
 
 type saveImageConfigBody struct {
-	Hostname     string              `json:"Hostname"`
-	Domainname   string              `json:"Domainname"`
-	MacAddress   string              `json:"MacAddress"`
-	Env          []string            `json:"Env"`
-	Cmd          []string            `json:"Cmd"`
-	Entrypoint   []string            `json:"Entrypoint"`
-	WorkingDir   string              `json:"WorkingDir"`
-	User         string              `json:"User"`
-	AttachStdin  bool                `json:"AttachStdin"`
-	AttachStdout bool                `json:"AttachStdout"`
-	AttachStderr bool                `json:"AttachStderr"`
-	StopSignal   string              `json:"StopSignal"`
-	StopTimeout  *int                `json:"StopTimeout"`
-	Labels       map[string]string   `json:"Labels"`
-	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
-	Tty          bool                `json:"Tty"`
-	OpenStdin    bool                `json:"OpenStdin"`
-	StdinOnce    bool                `json:"StdinOnce"`
-	NetworkDisabled bool             `json:"NetworkDisabled"`
-	ArgsEscaped  bool                `json:"ArgsEscaped"`
-	Volumes      map[string]struct{} `json:"Volumes"`
-	OnBuild      []string            `json:"OnBuild"`
-	Shell        []string            `json:"Shell"`
-	Healthcheck  *struct {
+	Hostname        string              `json:"Hostname"`
+	Domainname      string              `json:"Domainname"`
+	MacAddress      string              `json:"MacAddress"`
+	Env             []string            `json:"Env"`
+	Cmd             []string            `json:"Cmd"`
+	Entrypoint      []string            `json:"Entrypoint"`
+	WorkingDir      string              `json:"WorkingDir"`
+	User            string              `json:"User"`
+	AttachStdin     bool                `json:"AttachStdin"`
+	AttachStdout    bool                `json:"AttachStdout"`
+	AttachStderr    bool                `json:"AttachStderr"`
+	StopSignal      string              `json:"StopSignal"`
+	StopTimeout     *int                `json:"StopTimeout"`
+	Labels          map[string]string   `json:"Labels"`
+	ExposedPorts    map[string]struct{} `json:"ExposedPorts"`
+	Tty             bool                `json:"Tty"`
+	OpenStdin       bool                `json:"OpenStdin"`
+	StdinOnce       bool                `json:"StdinOnce"`
+	NetworkDisabled bool                `json:"NetworkDisabled"`
+	ArgsEscaped     bool                `json:"ArgsEscaped"`
+	Volumes         map[string]struct{} `json:"Volumes"`
+	OnBuild         []string            `json:"OnBuild"`
+	Shell           []string            `json:"Shell"`
+	Healthcheck     *struct {
 		Test        []string `json:"Test"`
 		Interval    int64    `json:"Interval"`
 		Timeout     int64    `json:"Timeout"`
@@ -548,40 +548,40 @@ func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send 
 			return fmt.Errorf("create dataset for %s: %w", normRef, err)
 		}
 		rec := &store.ImageRecord{
-			ID:              "loaded_" + oci.SafeDirName(normRef),
-			Ref:             normRef,
-			Arch:            orDefault(cfg.Architecture, "amd64"),
-			TemplateDataset: dataset,
-			Created:         createdAt,
-			Release:         cfg.OSVersion,
-			OCIAuthor:       cfg.Author,
-			OCIComment:      cfg.Comment,
-			OCIContainer:    cfg.Container,
-			OCIDockerVersion: cfg.DockerVersion,
-			OCIVariant:      cfg.Variant,
-			OCIHostname:     effective.Hostname,
-			OCIDomainname:   effective.Domainname,
-			OCIMacAddress:   effective.MacAddress,
-			OCIEntrypoint:   append([]string{}, effective.Entrypoint...),
-			OCICmd:          append([]string{}, effective.Cmd...),
-			OCIEnv:          append([]string{}, effective.Env...),
-			OCIWorkingDir:   effective.WorkingDir,
-			OCIPorts:        mapKeys(effective.ExposedPorts),
-			OCILabels:       copyLabels(effective.Labels),
-			OCIUser:         effective.User,
-			OCIAttachStdin:  effective.AttachStdin,
-			OCIAttachStdout: effective.AttachStdout,
-			OCIAttachStderr: effective.AttachStderr,
-			OCITty:          effective.Tty,
-			OCIOpenStdin:    effective.OpenStdin,
-			OCIStdinOnce:    effective.StdinOnce,
-			OCIArgsEscaped:  effective.ArgsEscaped,
+			ID:                 "loaded_" + oci.SafeDirName(normRef),
+			Ref:                normRef,
+			Arch:               orDefault(cfg.Architecture, "amd64"),
+			TemplateDataset:    dataset,
+			Created:            createdAt,
+			Release:            cfg.OSVersion,
+			OCIAuthor:          cfg.Author,
+			OCIComment:         cfg.Comment,
+			OCIContainer:       cfg.Container,
+			OCIDockerVersion:   cfg.DockerVersion,
+			OCIVariant:         cfg.Variant,
+			OCIHostname:        effective.Hostname,
+			OCIDomainname:      effective.Domainname,
+			OCIMacAddress:      effective.MacAddress,
+			OCIEntrypoint:      append([]string{}, effective.Entrypoint...),
+			OCICmd:             append([]string{}, effective.Cmd...),
+			OCIEnv:             append([]string{}, effective.Env...),
+			OCIWorkingDir:      effective.WorkingDir,
+			OCIPorts:           mapKeys(effective.ExposedPorts),
+			OCILabels:          copyLabels(effective.Labels),
+			OCIUser:            effective.User,
+			OCIAttachStdin:     effective.AttachStdin,
+			OCIAttachStdout:    effective.AttachStdout,
+			OCIAttachStderr:    effective.AttachStderr,
+			OCITty:             effective.Tty,
+			OCIOpenStdin:       effective.OpenStdin,
+			OCIStdinOnce:       effective.StdinOnce,
+			OCIArgsEscaped:     effective.ArgsEscaped,
 			OCINetworkDisabled: effective.NetworkDisabled,
-			OCIStopSignal:   effective.StopSignal,
-			OCIStopTimeout:  stopTimeoutValue(effective.StopTimeout),
-			OCIVolumes:      mapKeys(effective.Volumes),
-			OCIOnBuild:      append([]string{}, effective.OnBuild...),
-			OCIShell:        append([]string{}, effective.Shell...),
+			OCIStopSignal:      effective.StopSignal,
+			OCIStopTimeout:     stopTimeoutValue(effective.StopTimeout),
+			OCIVolumes:         mapKeys(effective.Volumes),
+			OCIOnBuild:         append([]string{}, effective.OnBuild...),
+			OCIShell:           append([]string{}, effective.Shell...),
 		}
 		if hc := effective.Healthcheck; hc != nil && len(hc.Test) > 0 {
 			rec.OCIHealthcheck = &store.HealthcheckConfig{

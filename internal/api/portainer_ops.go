@@ -707,10 +707,14 @@ func committedSetKeys(values map[string]struct{}, fallback []string) []string {
 }
 
 func committedLabels(values, fallback map[string]string) map[string]string {
-	if len(values) == 0 {
-		return copyLabels(fallback)
+	if len(values) == 0 && len(fallback) == 0 {
+		return map[string]string{}
 	}
-	return copyLabels(values)
+	out := copyLabels(fallback)
+	for k, v := range values {
+		out[k] = v
+	}
+	return out
 }
 
 func committedHealthcheck(rec *store.ContainerRecord, fallback *store.HealthcheckConfig) *store.HealthcheckConfig {
@@ -762,31 +766,30 @@ func safeCommitTemplateName(ref string) string {
 }
 
 type commitConfig struct {
-	Cmd          []string            `json:"Cmd"`
-	Entrypoint   []string            `json:"Entrypoint"`
-	Env          []string            `json:"Env"`
-	Labels       map[string]string   `json:"Labels"`
-	Hostname     *string             `json:"Hostname"`
-	Domainname   *string             `json:"Domainname"`
-	MacAddress   *string             `json:"MacAddress"`
-	User         *string             `json:"User"`
-	AttachStdin  *bool               `json:"AttachStdin"`
-	AttachStdout *bool               `json:"AttachStdout"`
-	AttachStderr *bool               `json:"AttachStderr"`
-	Tty          *bool               `json:"Tty"`
-	OpenStdin    *bool               `json:"OpenStdin"`
-	StdinOnce    *bool               `json:"StdinOnce"`
-	NetworkDisabled *bool            `json:"NetworkDisabled"`
-	ArgsEscaped  *bool               `json:"ArgsEscaped"`
-	WorkingDir   *string             `json:"WorkingDir"`
-	OnBuild      []string            `json:"OnBuild"`
-	Shell        []string            `json:"Shell"`
-	StopSignal   *string             `json:"StopSignal"`
-	StopTimeout  *int                `json:"StopTimeout"`
-	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
-	Volumes      map[string]struct{} `json:"Volumes"`
-	Healthcheck  *Healthcheck        `json:"Healthcheck"`
-	Shell        []string            `json:"Shell"`
+	Cmd             []string            `json:"Cmd"`
+	Entrypoint      []string            `json:"Entrypoint"`
+	Env             []string            `json:"Env"`
+	Labels          map[string]string   `json:"Labels"`
+	Hostname        *string             `json:"Hostname"`
+	Domainname      *string             `json:"Domainname"`
+	MacAddress      *string             `json:"MacAddress"`
+	User            *string             `json:"User"`
+	AttachStdin     *bool               `json:"AttachStdin"`
+	AttachStdout    *bool               `json:"AttachStdout"`
+	AttachStderr    *bool               `json:"AttachStderr"`
+	Tty             *bool               `json:"Tty"`
+	OpenStdin       *bool               `json:"OpenStdin"`
+	StdinOnce       *bool               `json:"StdinOnce"`
+	NetworkDisabled *bool               `json:"NetworkDisabled"`
+	ArgsEscaped     *bool               `json:"ArgsEscaped"`
+	WorkingDir      *string             `json:"WorkingDir"`
+	OnBuild         []string            `json:"OnBuild"`
+	Shell           []string            `json:"Shell"`
+	StopSignal      *string             `json:"StopSignal"`
+	StopTimeout     *int                `json:"StopTimeout"`
+	ExposedPorts    map[string]struct{} `json:"ExposedPorts"`
+	Volumes         map[string]struct{} `json:"Volumes"`
+	Healthcheck     *Healthcheck        `json:"Healthcheck"`
 }
 
 func decodeCommitConfig(r *http.Request) (*commitConfig, error) {

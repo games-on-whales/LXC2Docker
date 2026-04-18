@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 )
 
 // Event mirrors the Docker Engine event envelope (/events stream).
@@ -136,12 +136,15 @@ func (h *Handler) HealthEmitter() func(id, status string) {
 // stream and refreshes its Images tab whenever it sees one. The actor ID
 // is the ref (e.g. "nginx:latest") to match Docker's convention.
 func (h *Handler) emitVolume(action, name string) {
+	if h == nil || h.events == nil {
+		return
+	}
 	now := time.Now()
 	h.events.publish(Event{
 		Type:   "volume",
 		Action: action,
 		Actor: EventActor{
-			ID:         name,
+			ID: name,
 			Attributes: map[string]string{
 				"daemon": localEventDaemon,
 				"driver": "local",
@@ -163,6 +166,9 @@ func (h *Handler) emitNetwork(action, id, name string) {
 }
 
 func (h *Handler) emitNetworkFull(action, id, name, containerID string) {
+	if h == nil || h.events == nil {
+		return
+	}
 	now := time.Now()
 	attrs := map[string]string{
 		"daemon":  localEventDaemon,
@@ -194,12 +200,15 @@ func (h *Handler) emitNetworkFull(action, id, name, containerID string) {
 }
 
 func (h *Handler) emitImage(action, ref string) {
+	if h == nil || h.events == nil {
+		return
+	}
 	now := time.Now()
 	h.events.publish(Event{
 		Type:   "image",
 		Action: action,
 		Actor: EventActor{
-			ID:         ref,
+			ID: ref,
 			Attributes: map[string]string{
 				"daemon": localEventDaemon,
 				"image":  ref,
@@ -221,6 +230,9 @@ func (h *Handler) emitImage(action, ref string) {
 // Portainer's event feed can render "foo renamed to bar".
 func (h *Handler) emitContainerWithAttrs(action string, rec *store.ContainerRecord, extra map[string]string) {
 	if rec == nil {
+		return
+	}
+	if h == nil || h.events == nil {
 		return
 	}
 	now := time.Now()

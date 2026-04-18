@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/oci"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/lxc"
+	"github.com/games-on-whales/LXC2Docker/internal/oci"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
 
@@ -370,7 +370,7 @@ func decodeRegistryAuth(header string) string {
 // image present?" check. We skip body writes when the request is HEAD but
 // otherwise return the identical payload.
 func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
-	name := mux.Vars(r)["name"]
+	name := imageNameFromRequest(r)
 	rec := h.store.GetImage(normalizeImageRef(name))
 	if rec == nil {
 		rec = h.findImageByID(name)
@@ -434,6 +434,27 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, resp)
 }
 
+func imageNameFromRequest(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if name := mux.Vars(r)["name"]; name != "" {
+		return name
+	}
+	path := strings.Trim(strings.TrimSpace(r.URL.Path), "/")
+	if path == "" {
+		return ""
+	}
+	parts := strings.Split(path, "/")
+	for idx := 0; idx < len(parts); idx++ {
+		if parts[idx] != "images" || idx+2 >= len(parts) || parts[len(parts)-1] != "json" {
+			continue
+		}
+		return strings.Join(parts[idx+1:len(parts)-1], "/")
+	}
+	return ""
+}
+
 func imageConfigFromRecord(rec *store.ImageRecord) *ContainerConfig {
 	if rec == nil {
 		return normalizeContainerConfig(&ContainerConfig{})
@@ -451,30 +472,30 @@ func imageConfigFromRecord(rec *store.ImageRecord) *ContainerConfig {
 		}
 	}
 	return normalizeContainerConfig(&ContainerConfig{
-		Hostname:     rec.OCIHostname,
-		Domainname:   rec.OCIDomainname,
-		MacAddress:   rec.OCIMacAddress,
-		User:         rec.OCIUser,
-		AttachStdin:  rec.OCIAttachStdin,
-		AttachStdout: rec.OCIAttachStdout,
-		AttachStderr: rec.OCIAttachStderr,
-		ExposedPorts: exposed,
-		Tty:          rec.OCITty,
-		OpenStdin:    rec.OCIOpenStdin,
-		StdinOnce:    rec.OCIStdinOnce,
+		Hostname:        rec.OCIHostname,
+		Domainname:      rec.OCIDomainname,
+		MacAddress:      rec.OCIMacAddress,
+		User:            rec.OCIUser,
+		AttachStdin:     rec.OCIAttachStdin,
+		AttachStdout:    rec.OCIAttachStdout,
+		AttachStderr:    rec.OCIAttachStderr,
+		ExposedPorts:    exposed,
+		Tty:             rec.OCITty,
+		OpenStdin:       rec.OCIOpenStdin,
+		StdinOnce:       rec.OCIStdinOnce,
 		NetworkDisabled: rec.OCINetworkDisabled,
-		ArgsEscaped:  rec.OCIArgsEscaped,
-		Volumes:      volumes,
-		Cmd:          rec.OCICmd,
-		Entrypoint:   rec.OCIEntrypoint,
-		Env:          rec.OCIEnv,
-		Labels:       ensureMap(rec.OCILabels),
-		WorkingDir:   rec.OCIWorkingDir,
-		OnBuild:      append([]string{}, rec.OCIOnBuild...),
-		Shell:        append([]string{}, rec.OCIShell...),
-		StopSignal:   rec.OCIStopSignal,
-		StopTimeout:  stopTimeoutPtr(rec.OCIStopTimeout),
-		Healthcheck:  healthcheckFromImage(rec),
+		ArgsEscaped:     rec.OCIArgsEscaped,
+		Volumes:         volumes,
+		Cmd:             rec.OCICmd,
+		Entrypoint:      rec.OCIEntrypoint,
+		Env:             rec.OCIEnv,
+		Labels:          ensureMap(rec.OCILabels),
+		WorkingDir:      rec.OCIWorkingDir,
+		OnBuild:         append([]string{}, rec.OCIOnBuild...),
+		Shell:           append([]string{}, rec.OCIShell...),
+		StopSignal:      rec.OCIStopSignal,
+		StopTimeout:     stopTimeoutPtr(rec.OCIStopTimeout),
+		Healthcheck:     healthcheckFromImage(rec),
 	})
 }
 
