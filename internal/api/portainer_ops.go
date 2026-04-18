@@ -103,19 +103,129 @@ func (h *Handler) unpauseContainer(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /containers/{id}/update
-// Docker's update endpoint mutates cgroup-level resource limits (CPU, memory,
-// ...). We accept the request and acknowledge it so Portainer's resource
-// editor completes, but we do not propagate the change — resource limits live
-// in the LXC config and require a separate workflow to apply.
+// Docker's update endpoint accepts a partial HostConfig body. Portainer uses
+// it to edit resource limits and restart policy in-place, so we merge the
+// provided keys into the stored HostConfig, persist the typed lifecycle
+// fields the daemon actively enforces, and best-effort apply live cgroup
+// changes when the container is currently running.
 func (h *Handler) updateContainer(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
 	if id == "" {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	var body map[string]any
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	jsonResponse(w, http.StatusOK, map[string]any{"Warnings": []string{}})
+	rec := h.store.GetContainer(id)
+	if rec == nil {
+		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+
+	patch := map[string]json.RawMessage{}
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil && err != io.EOF {
+		errResponse(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	hc := buildHostConfig(rec)
+	if err := mergeContainerUpdate(hc, patch); err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	normalizeHostConfig(hc)
+
+	rawHC, err := json.Marshal(hc)
+	if err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	rec.RawHostConfig = rawHC
+	rec.RestartPolicy = hc.RestartPolicy.Name
+	rec.RestartMaxRetry = hc.RestartPolicy.MaximumRetryCount
+	rec.AutoRemove = hc.AutoRemove
+	rec.OomScoreAdj = hc.OomScoreAdj
+	if err := h.store.AddContainer(rec); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	warnings := []string{}
+	if pid := containerPID(id); pid > 0 {
+		if warning := applyLiveLimits(id, *hc); warning != "" {
+			warnings = append(warnings, warning)
+		}
+		if _, ok := patch["OomScoreAdj"]; ok {
+			if err := os.WriteFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid),
+				[]byte(strconv.Itoa(hc.OomScoreAdj)), 0o644); err != nil {
+				warnings = append(warnings, "failed to apply oom_score_adj live: "+err.Error())
+			}
+		}
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{"Warnings": warnings})
+}
+
+func mergeContainerUpdate(hc *HostConfig, patch map[string]json.RawMessage) error {
+	for key, raw := range patch {
+		switch key {
+		case "Memory":
+			if err := json.Unmarshal(raw, &hc.Memory); err != nil {
+				return fmt.Errorf("invalid Memory: %w", err)
+			}
+		case "MemoryReservation":
+			if err := json.Unmarshal(raw, &hc.MemoryReservation); err != nil {
+				return fmt.Errorf("invalid MemoryReservation: %w", err)
+			}
+		case "MemorySwap":
+			if err := json.Unmarshal(raw, &hc.MemorySwap); err != nil {
+				return fmt.Errorf("invalid MemorySwap: %w", err)
+			}
+		case "CpuShares":
+			if err := json.Unmarshal(raw, &hc.CPUShares); err != nil {
+				return fmt.Errorf("invalid CpuShares: %w", err)
+			}
+		case "CpuQuota":
+			if err := json.Unmarshal(raw, &hc.CPUQuota); err != nil {
+				return fmt.Errorf("invalid CpuQuota: %w", err)
+			}
+		case "CpuPeriod":
+			if err := json.Unmarshal(raw, &hc.CPUPeriod); err != nil {
+				return fmt.Errorf("invalid CpuPeriod: %w", err)
+			}
+		case "NanoCpus":
+			if err := json.Unmarshal(raw, &hc.NanoCPUs); err != nil {
+				return fmt.Errorf("invalid NanoCpus: %w", err)
+			}
+		case "CpusetCpus":
+			if err := json.Unmarshal(raw, &hc.CpusetCpus); err != nil {
+				return fmt.Errorf("invalid CpusetCpus: %w", err)
+			}
+		case "CpusetMems":
+			if err := json.Unmarshal(raw, &hc.CpusetMems); err != nil {
+				return fmt.Errorf("invalid CpusetMems: %w", err)
+			}
+		case "PidsLimit":
+			if err := json.Unmarshal(raw, &hc.PidsLimit); err != nil {
+				return fmt.Errorf("invalid PidsLimit: %w", err)
+			}
+		case "BlkioWeight":
+			if err := json.Unmarshal(raw, &hc.BlkioWeight); err != nil {
+				return fmt.Errorf("invalid BlkioWeight: %w", err)
+			}
+		case "OomScoreAdj":
+			if err := json.Unmarshal(raw, &hc.OomScoreAdj); err != nil {
+				return fmt.Errorf("invalid OomScoreAdj: %w", err)
+			}
+		case "RestartPolicy":
+			if err := json.Unmarshal(raw, &hc.RestartPolicy); err != nil {
+				return fmt.Errorf("invalid RestartPolicy: %w", err)
+			}
+		case "Ulimits":
+			if err := json.Unmarshal(raw, &hc.Ulimits); err != nil {
+				return fmt.Errorf("invalid Ulimits: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 // POST /containers/prune

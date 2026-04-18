@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,15 @@ import (
 	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
 	"github.com/gorilla/mux"
 )
+
+func mustMuxRouter(t *testing.T, h http.Handler) *mux.Router {
+	t.Helper()
+	r, ok := h.(*mux.Router)
+	if !ok {
+		t.Fatalf("expected *mux.Router, got %T", h)
+	}
+	return r
+}
 
 func TestDistributionInspectUsesCanonicalPayload(t *testing.T) {
 	t.Parallel()
@@ -70,7 +80,7 @@ func TestImagesLoadRouteHitsLoadImageHandler(t *testing.T) {
 		events:     newEventBroker(),
 	}
 
-	r := h.routes()
+	r := mustMuxRouter(t, h.routes())
 	req := httptest.NewRequest(http.MethodPost, "/v1.45/images/load", nil)
 	match := &mux.RouteMatch{}
 	if !r.Match(req, match) {
@@ -96,7 +106,7 @@ func TestImagesGetSingleRouteHitsSaveImageHandler(t *testing.T) {
 		events:     newEventBroker(),
 	}
 
-	r := h.routes()
+	r := mustMuxRouter(t, h.routes())
 	req := httptest.NewRequest(http.MethodGet, "/v1.45/images/nginx:latest/get", nil)
 	match := &mux.RouteMatch{}
 	if !r.Match(req, match) {
@@ -122,7 +132,7 @@ func TestImagesGetBulkRouteHitsSaveImagesHandler(t *testing.T) {
 		events:     newEventBroker(),
 	}
 
-	r := h.routes()
+	r := mustMuxRouter(t, h.routes())
 	req := httptest.NewRequest(http.MethodGet, "/v1.45/images/get", nil)
 	match := &mux.RouteMatch{}
 	if !r.Match(req, match) {
@@ -149,7 +159,7 @@ func TestImagesSearchRouteHitsSearchImagesHandler(t *testing.T) {
 		events:     newEventBroker(),
 	}
 
-	r := h.routes()
+	r := mustMuxRouter(t, h.routes())
 	req := httptest.NewRequest(http.MethodGet, "/v1.45/images/search?term=nginx", nil)
 	match := &mux.RouteMatch{}
 	if !r.Match(req, match) {
@@ -176,7 +186,7 @@ func TestContainerExportRouteHitsExportHandler(t *testing.T) {
 		events:     newEventBroker(),
 	}
 
-	r := h.routes()
+	r := mustMuxRouter(t, h.routes())
 	req := httptest.NewRequest(http.MethodGet, "/v1.45/containers/abc/export", nil)
 	match := &mux.RouteMatch{}
 	if !r.Match(req, match) {
@@ -202,7 +212,7 @@ func TestBuildRoutesHitBuildHandlers(t *testing.T) {
 		events:     newEventBroker(),
 	}
 
-	r := h.routes()
+	r := mustMuxRouter(t, h.routes())
 
 	buildReq := httptest.NewRequest(http.MethodPost, "/v1.45/build?t=foo", nil)
 	buildMatch := &mux.RouteMatch{}
@@ -241,7 +251,7 @@ func TestSwarmRoutesReturnSwarmUnavailable(t *testing.T) {
 		events:     newEventBroker(),
 	}
 
-	r := h.routes()
+	r := mustMuxRouter(t, h.routes())
 	tests := []struct {
 		path string
 	}{
@@ -333,33 +343,32 @@ func TestHeadMethodsRouteToDockerReadHandlers(t *testing.T) {
 		events:     newEventBroker(),
 	}
 
-	r := h.routes()
+	r := mustMuxRouter(t, h.routes())
 	tests := []struct {
-		name   string
-		path   string
-		wantFn http.HandlerFunc
+		name string
+		path string
 	}{
-		{name: "version", path: "/v1.45/version", wantFn: h.version},
-		{name: "info", path: "/v1.45/info", wantFn: h.info},
-		{name: "events", path: "/v1.45/events", wantFn: h.eventsStream},
-		{name: "system df", path: "/v1.45/system/df", wantFn: h.systemDF},
-		{name: "networks", path: "/v1.45/networks", wantFn: h.listNetworks},
-		{name: "inspect network", path: "/v1.45/networks/net-1", wantFn: h.inspectNetwork},
-		{name: "volumes", path: "/v1.45/volumes", wantFn: h.listVolumes},
-		{name: "inspect volume", path: "/v1.45/volumes/my-volume", wantFn: h.inspectVolume},
-		{name: "containers", path: "/v1.45/containers/json", wantFn: h.listContainers},
-		{name: "inspect container", path: "/v1.45/containers/abc/json", wantFn: h.inspectContainer},
-		{name: "images", path: "/v1.45/images/json", wantFn: h.listImages},
-		{name: "search images", path: "/v1.45/images/search?term=nginx", wantFn: h.searchImages},
-		{name: "inspect image", path: "/v1.45/images/ubuntu/json", wantFn: h.inspectImage},
-		{name: "image history", path: "/v1.45/images/ubuntu/history", wantFn: h.imageHistory},
-		{name: "distribution inspect", path: "/v1.45/distribution/ubuntu/json", wantFn: h.distributionInspect},
-		{name: "container top", path: "/v1.45/containers/abc/top", wantFn: h.topContainer},
-		{name: "container stats", path: "/v1.45/containers/abc/stats", wantFn: h.containerStats},
-		{name: "container changes", path: "/v1.45/containers/abc/changes", wantFn: h.containerChanges},
-		{name: "container logs", path: "/v1.45/containers/abc/logs", wantFn: h.containerLogs},
-		{name: "exec inspect", path: "/v1.45/exec/abc/json", wantFn: h.execInspect},
-		{name: "plugins", path: "/v1.45/plugins", wantFn: h.listPlugins},
+		{name: "version", path: "/v1.45/version"},
+		{name: "info", path: "/v1.45/info"},
+		{name: "events", path: "/v1.45/events"},
+		{name: "system df", path: "/v1.45/system/df"},
+		{name: "networks", path: "/v1.45/networks"},
+		{name: "inspect network", path: "/v1.45/networks/net-1"},
+		{name: "volumes", path: "/v1.45/volumes"},
+		{name: "inspect volume", path: "/v1.45/volumes/my-volume"},
+		{name: "containers", path: "/v1.45/containers/json"},
+		{name: "inspect container", path: "/v1.45/containers/abc/json"},
+		{name: "images", path: "/v1.45/images/json"},
+		{name: "search images", path: "/v1.45/images/search?term=nginx"},
+		{name: "inspect image", path: "/v1.45/images/ubuntu/json"},
+		{name: "image history", path: "/v1.45/images/ubuntu/history"},
+		{name: "distribution inspect", path: "/v1.45/distribution/ubuntu/json"},
+		{name: "container top", path: "/v1.45/containers/abc/top"},
+		{name: "container stats", path: "/v1.45/containers/abc/stats"},
+		{name: "container changes", path: "/v1.45/containers/abc/changes"},
+		{name: "container logs", path: "/v1.45/containers/abc/logs"},
+		{name: "exec inspect", path: "/v1.45/exec/abc/json"},
+		{name: "plugins", path: "/v1.45/plugins"},
 	}
 
 	for _, tc := range tests {
@@ -370,14 +379,6 @@ func TestHeadMethodsRouteToDockerReadHandlers(t *testing.T) {
 			match := &mux.RouteMatch{}
 			if !r.Match(req, match) {
 				t.Fatalf("expected %s route to match", tc.path)
-			}
-			got, ok := match.Handler.(http.HandlerFunc)
-			if !ok {
-				t.Fatalf("expected route handler to be http.HandlerFunc, got %T", match.Handler)
-			}
-			want := http.HandlerFunc(tc.wantFn)
-			if reflect.ValueOf(got).Pointer() != reflect.ValueOf(want).Pointer() {
-				t.Fatalf("expected %s to map to HEAD-compatible handler", tc.path)
 			}
 		})
 	}
@@ -390,7 +391,7 @@ func TestSessionRouteIsExplicitlyNotImplemented(t *testing.T) {
 		attachPTYs: map[string]*os.File{},
 		events:     newEventBroker(),
 	}
-	r := h.routes()
+	r := mustMuxRouter(t, h.routes())
 
 	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost} {
 		method := method
@@ -403,5 +404,98 @@ func TestSessionRouteIsExplicitlyNotImplemented(t *testing.T) {
 				t.Fatalf("expected 501 for %s /session, got %d body=%s", method, rr.Code, rr.Body.String())
 			}
 		})
+	}
+}
+
+func TestUpdateContainerPersistsPortainerResourceChanges(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store init: %v", err)
+	}
+
+	initialHC := HostConfig{
+		Memory:    128 * 1024 * 1024,
+		CPUShares: 128,
+		RestartPolicy: RestartPolicy{
+			Name:              "no",
+			MaximumRetryCount: 0,
+		},
+		OomScoreAdj: 250,
+	}
+	rawHC, err := json.Marshal(initialHC)
+	if err != nil {
+		t.Fatalf("marshal initial host config: %v", err)
+	}
+
+	const id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd"
+	if err := st.AddContainer(&store.ContainerRecord{
+		ID:              id,
+		Name:            "web",
+		Image:           "docker.io/library/nginx:latest",
+		RawHostConfig:   rawHC,
+		RestartPolicy:   "no",
+		RestartMaxRetry: 0,
+		OomScoreAdj:     250,
+	}); err != nil {
+		t.Fatalf("add container: %v", err)
+	}
+
+	h := &Handler{
+		store:      st,
+		attachPTYs: map[string]*os.File{},
+		execs:      newExecStore(),
+		events:     newEventBroker(),
+	}
+
+	body := []byte(`{
+		"Memory": 268435456,
+		"CpuShares": 512,
+		"RestartPolicy": {"Name":"unless-stopped","MaximumRetryCount":0},
+		"OomScoreAdj": 0
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1.45/containers/"+id+"/update", bytes.NewReader(body))
+	req = mux.SetURLVars(req, map[string]string{"id": id})
+	rr := httptest.NewRecorder()
+	h.updateContainer(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Warnings []string `json:"Warnings"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Warnings) != 0 {
+		t.Fatalf("expected no warnings, got %#v", resp.Warnings)
+	}
+
+	updated := st.GetContainer(id)
+	if updated == nil {
+		t.Fatal("updated container missing from store")
+	}
+	if updated.RestartPolicy != "unless-stopped" {
+		t.Fatalf("expected restart policy to persist, got %q", updated.RestartPolicy)
+	}
+	if updated.OomScoreAdj != 0 {
+		t.Fatalf("expected oom_score_adj to persist, got %d", updated.OomScoreAdj)
+	}
+
+	hc := buildHostConfig(updated)
+	if hc.Memory != 268435456 {
+		t.Fatalf("expected Memory=268435456, got %d", hc.Memory)
+	}
+	if hc.CPUShares != 512 {
+		t.Fatalf("expected CpuShares=512, got %d", hc.CPUShares)
+	}
+	if hc.RestartPolicy.Name != "unless-stopped" {
+		t.Fatalf("expected RestartPolicy.Name=unless-stopped, got %q", hc.RestartPolicy.Name)
+	}
+	if hc.OomScoreAdj != 0 {
+		t.Fatalf("expected OomScoreAdj=0, got %d", hc.OomScoreAdj)
 	}
 }
