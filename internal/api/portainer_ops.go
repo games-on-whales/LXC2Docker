@@ -618,6 +618,10 @@ func (h *Handler) commitContainer(w http.ResponseWriter, r *http.Request) {
 	dup.OCIStopSignal = committedString(rec.StopSignal, src.OCIStopSignal)
 	dup.OCIHealthcheck = committedHealthcheck(rec, src.OCIHealthcheck)
 	dup.OCIVolumes = committedSetKeys(rec.Volumes, src.OCIVolumes)
+	if err := applyCommitChanges(&dup, r.URL.Query()["changes"]); err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid commit change: "+err.Error())
+		return
+	}
 	if h.mgr != nil {
 		rootfs := h.mgr.RootfsPath(id)
 		if rootfs == "" {
@@ -721,4 +725,77 @@ func safeCommitTemplateName(ref string) string {
 	ref = normalizeImageRef(ref)
 	ref = strings.NewReplacer(":", "_", "/", "_", ".", "_", " ", "_").Replace(ref)
 	return "__template_commit_" + ref
+}
+
+func applyCommitChanges(rec *store.ImageRecord, changes []string) error {
+	instrs, err := parseCommitChangeInstructions(changes)
+	if err != nil {
+		return err
+	}
+	for _, inst := range instrs {
+		switch inst.op {
+		case "ENV":
+			rec.OCIEnv = mergeEnv(rec.OCIEnv, parseEnvInstruction(inst.args))
+		case "LABEL":
+			rec.OCILabels = committedLabels(parseLabelInstruction(inst.args), rec.OCILabels)
+		case "USER":
+			rec.OCIUser = strings.TrimSpace(inst.args)
+		case "WORKDIR":
+			rec.OCIWorkingDir = resolveContainerPath(rec.OCIWorkingDir, inst.args)
+		case "CMD":
+			rec.OCICmd = parseCommandInstruction(inst.args)
+		case "ENTRYPOINT":
+			rec.OCIEntrypoint = parseCommandInstruction(inst.args)
+		case "EXPOSE":
+			rec.OCIPorts = mergeCommittedStrings(rec.OCIPorts, strings.Fields(inst.args))
+		case "VOLUME":
+			rec.OCIVolumes = mergeCommittedStrings(rec.OCIVolumes, parseVolumeInstruction(inst.args))
+		case "STOPSIGNAL":
+			rec.OCIStopSignal = strings.TrimSpace(inst.args)
+		case "HEALTHCHECK":
+			hc, err := parseHealthcheckInstruction(inst.args)
+			if err != nil {
+				return err
+			}
+			rec.OCIHealthcheck = hc
+		case "SHELL":
+			rec.OCIShell = parseCommandInstruction(inst.args)
+		case "":
+			continue
+		default:
+			return fmt.Errorf("unsupported instruction %q", inst.op)
+		}
+	}
+	return nil
+}
+
+func parseCommitChangeInstructions(changes []string) ([]dockerfileInstruction, error) {
+	if len(changes) == 0 {
+		return nil, nil
+	}
+	joined := strings.Join(changes, "\n")
+	return parseDockerfile(joined)
+}
+
+func mergeCommittedStrings(current, incoming []string) []string {
+	if len(incoming) == 0 {
+		return append([]string{}, current...)
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(current)+len(incoming))
+	for _, v := range current {
+		if strings.TrimSpace(v) == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	for _, v := range incoming {
+		if strings.TrimSpace(v) == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
