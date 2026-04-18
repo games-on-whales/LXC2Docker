@@ -255,6 +255,9 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 	rec := h.store.GetImage(normalizeImageRef(name))
 	if rec == nil {
+		rec = h.findImageByID(name)
+	}
+	if rec == nil {
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -325,12 +328,16 @@ func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 	ref := normalizeImageRef(name)
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
 	if h.store.GetImage(ref) == nil {
-		if force {
-			jsonResponse(w, http.StatusOK, []map[string]string{})
+		if byID := h.findImageByID(name); byID != nil {
+			ref = byID.Ref
+		} else {
+			if force {
+				jsonResponse(w, http.StatusOK, []map[string]string{})
+				return
+			}
+			errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
 			return
 		}
-		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
-		return
 	}
 	img := h.store.GetImage(ref)
 	if err := h.mgr.RemoveImage(ref); err != nil {
@@ -347,6 +354,22 @@ func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]string{"Deleted": "sha256:" + img.ID})
 	}
 	jsonResponse(w, http.StatusOK, out)
+}
+
+func (h *Handler) findImageByID(id string) *store.ImageRecord {
+	id = strings.TrimPrefix(id, "sha256:")
+	if id == "" {
+		return nil
+	}
+	for _, rec := range h.store.ListImages() {
+		if rec.ID == id {
+			return rec
+		}
+		if len(id) >= 4 && strings.HasPrefix(rec.ID, id) {
+			return rec
+		}
+	}
+	return nil
 }
 
 func normalizeImageRef(name string) string {

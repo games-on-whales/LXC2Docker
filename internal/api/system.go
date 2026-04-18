@@ -586,6 +586,10 @@ func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.Name == "" {
 		req.Name = generateVolumeName()
+	} else if !isValidContainerName(req.Name) {
+		errResponse(w, http.StatusBadRequest,
+			fmt.Sprintf("Invalid volume name (%s), only [a-zA-Z0-9][a-zA-Z0-9_.-]+ are allowed", req.Name))
+		return
 	}
 	if req.Driver == "" {
 		req.Driver = "local"

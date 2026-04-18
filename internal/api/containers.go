@@ -51,6 +51,13 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("invalid restart policy %q; expected one of no, always, unless-stopped, on-failure", req.HostConfig.RestartPolicy.Name))
 		return
 	}
+	if req.HostConfig.AutoRemove &&
+		req.HostConfig.RestartPolicy.Name != "" &&
+		req.HostConfig.RestartPolicy.Name != "no" {
+		errResponse(w, http.StatusBadRequest,
+			"can't create 'AutoRemove' container with restart policy")
+		return
+	}
 
 	// Name conflict: Docker returns 409 rather than silently clobbering
 	// the existing container's record. Portainer relies on this to detect
