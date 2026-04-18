@@ -26,7 +26,7 @@ test-build:
 	CGO_ENABLED=1 \
 	CGO_CFLAGS="$(CGO_CFLAGS)" \
 	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-	$(GO_TEST) -run '^$' ./...
+	$(GO_TEST) -run '^$$' ./...
 
 ## Run all available unit tests.
 test-unit:
