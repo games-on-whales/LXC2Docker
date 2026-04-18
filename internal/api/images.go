@@ -141,10 +141,14 @@ func zfsDatasetSize(rec *store.ImageRecord) int64 {
 // Headers: X-Registry-Auth — base64-encoded JSON credentials (Portainer
 // sets this when the user has a registry configured for the image ref).
 func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
-	fromImage := r.URL.Query().Get("fromImage")
+	fromImage := strings.TrimSpace(r.URL.Query().Get("fromImage"))
 	tag := r.URL.Query().Get("tag")
 	if tag == "" {
 		tag = "latest"
+	}
+	if fromImage == "" {
+		errResponse(w, http.StatusBadRequest, "fromImage query parameter is required")
+		return
 	}
 
 	ref := fromImage

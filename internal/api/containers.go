@@ -258,10 +258,9 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			Source:      source,
 			Destination: m.Target,
 			ReadOnly:    m.ReadOnly,
+			Propagation: propagationFromBindOptions(m.BindOptions),
 		})
 		if mType == "tmpfs" {
-			// Tmpfs uses the lxc.mount.entry tmpfs path via HostConfig.Tmpfs
-			// — not a bind mount. Skip adding to cfg.Mounts.
 			continue
 		}
 		cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
@@ -1777,6 +1776,22 @@ func (h *Handler) exposedPortsFor(rec *store.ContainerRecord) map[string]struct{
 	return out
 }
 
+func propagationFromBindOptions(opts map[string]any) string {
+	if opts == nil {
+		return ""
+	}
+	v, ok := opts["Propagation"]
+	if !ok {
+		return ""
+	}
+	s, _ := v.(string)
+	switch s {
+	case "rprivate", "private", "rshared", "shared", "rslave", "slave":
+		return s
+	}
+	return ""
+}
+
 func apiToLXCUlimits(u []Ulimit) []lxc.Ulimit {
 	if len(u) == 0 {
 		return nil
@@ -1992,13 +2007,17 @@ func (h *Handler) mountJSONFrom(m store.MountSpec) MountJSON {
 	if t == "" {
 		t = "bind"
 	}
+	propagation := m.Propagation
+	if propagation == "" {
+		propagation = "rprivate"
+	}
 	out := MountJSON{
 		Type:        t,
 		Source:      m.Source,
 		Destination: m.Destination,
 		Mode:        mode,
 		RW:          !m.ReadOnly,
-		Propagation: "rprivate",
+		Propagation: propagation,
 	}
 	if t == "volume" {
 		if v := h.volumeByMountpoint(m.Source); v != nil {

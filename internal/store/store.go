@@ -103,6 +103,7 @@ type MountSpec struct {
 	Source      string `json:"source"`
 	Destination string `json:"destination"`
 	ReadOnly    bool   `json:"read_only"`
+	Propagation string `json:"propagation,omitempty"`
 }
 
 // ImageRecord holds metadata for a pulled image (backed by a Proxmox CT
