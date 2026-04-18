@@ -64,14 +64,16 @@ type ContainerRecord struct {
 	// Healthcheck configuration and live health state. The API layer
 	// populates Healthcheck* at create time; the health watcher writes
 	// Health* as it runs probes.
-	HealthcheckTest     []string       `json:"hc_test,omitempty"`
-	HealthcheckInterval int64          `json:"hc_interval,omitempty"` // nanoseconds
-	HealthcheckTimeout  int64          `json:"hc_timeout,omitempty"`  // nanoseconds
-	HealthcheckRetries  int            `json:"hc_retries,omitempty"`
-	HealthStatus        string         `json:"health_status,omitempty"` // "starting"|"healthy"|"unhealthy"
-	HealthFailingStreak int            `json:"health_fail_streak,omitempty"`
-	HealthLastCheck     *time.Time     `json:"health_last_check,omitempty"`
-	HealthLog           []HealthResult `json:"health_log,omitempty"`
+	HealthcheckTest        []string       `json:"hc_test,omitempty"`
+	HealthcheckInterval    int64          `json:"hc_interval,omitempty"` // nanoseconds
+	HealthcheckTimeout     int64          `json:"hc_timeout,omitempty"`  // nanoseconds
+	HealthcheckRetries     int            `json:"hc_retries,omitempty"`
+	HealthcheckStartPeriod int64          `json:"hc_start_period,omitempty"` // nanoseconds; grace window from start
+	StartError             string         `json:"start_error,omitempty"`     // last StartContainer failure message
+	HealthStatus           string         `json:"health_status,omitempty"`   // "starting"|"healthy"|"unhealthy"
+	HealthFailingStreak    int            `json:"health_fail_streak,omitempty"`
+	HealthLastCheck        *time.Time     `json:"health_last_check,omitempty"`
+	HealthLog              []HealthResult `json:"health_log,omitempty"`
 }
 
 // HealthResult captures a single healthcheck probe outcome, echoed in

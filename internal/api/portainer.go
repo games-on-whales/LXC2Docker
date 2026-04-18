@@ -263,6 +263,13 @@ func applyLiveLimits(id string, hc HostConfig) string {
 			period = 100000
 		}
 		writes["cpu.max"] = strconv.FormatInt(hc.CPUQuota, 10) + " " + strconv.FormatInt(period, 10)
+	} else if hc.NanoCPUs > 0 {
+		// 1 CPU = 1e9 NanoCPUs → quota µs at 100 ms period.
+		quota := hc.NanoCPUs * 100000 / 1_000_000_000
+		if quota < 1000 {
+			quota = 1000
+		}
+		writes["cpu.max"] = strconv.FormatInt(quota, 10) + " 100000"
 	}
 	for file, val := range writes {
 		if err := os.WriteFile(cg+"/"+file, []byte(val), 0o644); err != nil {

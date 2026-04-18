@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -96,6 +97,7 @@ func (m *Manager) StartGC(ctx context.Context) {
 	go func() {
 		// Run immediately on startup to clean leftovers, then periodically.
 		m.gc()
+		m.rotateLogs()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -104,9 +106,64 @@ func (m *Manager) StartGC(ctx context.Context) {
 				return
 			case <-ticker.C:
 				m.gc()
+				m.rotateLogs()
 			}
 		}
 	}()
+}
+
+// consoleLogMax caps each container's console.log at this size. LXC opens
+// the file with O_APPEND, so truncating in place works correctly — the next
+// write seeks to the new end-of-file (0) without corruption. 10 MB keeps
+// the log viewer responsive without losing more than a few minutes of
+// output for chatty containers.
+const consoleLogMax = 10 * 1024 * 1024
+
+// rotateLogs enforces consoleLogMax on every container's console log. Over
+// the cap, we copy the tail to <log>.1 and truncate the live file. This
+// keeps the log viewer snappy and bounds disk usage without disrupting the
+// running LXC process.
+func (m *Manager) rotateLogs() {
+	for _, rec := range m.store.ListContainers() {
+		logPath := LogFilePath(m.lxcPath, rec.ID)
+		fi, err := os.Stat(logPath)
+		if err != nil || fi.Size() <= consoleLogMax {
+			continue
+		}
+		// Preserve the last half of the cap as .1 so the log viewer can
+		// still show the most recent backlog after rotation.
+		if err := copyTail(logPath, logPath+".1", consoleLogMax/2); err != nil {
+			log.Printf("rotateLogs: copyTail %s: %v", rec.ID[:12], err)
+		}
+		if err := os.Truncate(logPath, 0); err != nil {
+			log.Printf("rotateLogs: truncate %s: %v", rec.ID[:12], err)
+		}
+	}
+}
+
+// copyTail copies the last n bytes of src to dst. Used by log rotation.
+func copyTail(src, dst string, n int64) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	fi, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if fi.Size() > n {
+		if _, err := in.Seek(fi.Size()-n, 0); err != nil {
+			return err
+		}
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
 }
 
 // HealthEmitter reports each probe outcome so the API layer can publish a
@@ -233,9 +290,21 @@ func (m *Manager) runOneHealthcheck(rec *store.ContainerRecord, start time.Time,
 		rec.HealthFailingStreak = 0
 		rec.HealthStatus = "healthy"
 	} else {
-		rec.HealthFailingStreak++
-		if rec.HealthFailingStreak >= retries {
-			rec.HealthStatus = "unhealthy"
+		// During the start period (default 0), failures don't count against
+		// the streak — they're recorded but don't flip the status. Once
+		// past the grace window, normal Retries-based logic applies. This
+		// matches Docker's --health-start-period semantics.
+		inStartPeriod := false
+		if rec.StartedAt != nil && rec.HealthcheckStartPeriod > 0 {
+			if end.Sub(*rec.StartedAt) < time.Duration(rec.HealthcheckStartPeriod) {
+				inStartPeriod = true
+			}
+		}
+		if !inStartPeriod {
+			rec.HealthFailingStreak++
+			if rec.HealthFailingStreak >= retries {
+				rec.HealthStatus = "unhealthy"
+			}
 		}
 	}
 	if err := m.store.AddContainer(rec); err != nil {

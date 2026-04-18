@@ -29,6 +29,7 @@ type ContainerConfig struct {
 	MemoryBytes       int64        // 0 = unlimited
 	CPUShares         int64        // 0 = unlimited (relative weight)
 	CPUQuota          int64        // microseconds per 100ms period, 0 = unlimited
+	NanoCPUs          int64        // Docker's CPU limit in units of 1e-9 CPU; 1.5 CPU = 1.5e9
 	WorkingDir        string       // container cwd; maps to lxc.init.cwd
 	// Security. Privileged grants full capabilities + unrestricted device
 	// access; equivalent to Docker's --privileged. CapAdd/CapDrop extend
@@ -409,6 +410,18 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 		items = append(items, configItem{
 			"lxc.cgroup2.cpu.max",
 			fmt.Sprintf("%d 100000", cfg.CPUQuota),
+		})
+	} else if cfg.NanoCPUs > 0 {
+		// NanoCPUs (Docker's --cpus flag) — 1 CPU = 1e9 NanoCPUs. Convert
+		// to cgroup v2 quota µs at the default 100 ms period. Used only
+		// when an explicit CPUQuota hasn't already pinned the value.
+		quota := cfg.NanoCPUs * 100000 / 1_000_000_000
+		if quota < 1000 {
+			quota = 1000
+		}
+		items = append(items, configItem{
+			"lxc.cgroup2.cpu.max",
+			fmt.Sprintf("%d 100000", quota),
 		})
 	}
 
@@ -836,6 +849,15 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 		items = append(items, configItem{
 			"lxc.cgroup2.cpu.max",
 			fmt.Sprintf("%d 100000", cfg.CPUQuota),
+		})
+	} else if cfg.NanoCPUs > 0 {
+		quota := cfg.NanoCPUs * 100000 / 1_000_000_000
+		if quota < 1000 {
+			quota = 1000
+		}
+		items = append(items, configItem{
+			"lxc.cgroup2.cpu.max",
+			fmt.Sprintf("%d 100000", quota),
 		})
 	}
 

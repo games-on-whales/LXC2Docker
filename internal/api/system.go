@@ -279,15 +279,112 @@ func (h *Handler) pruneNetworks(w http.ResponseWriter, r *http.Request) {
 // --- system / volumes / auth stubs ---
 
 // systemDF is the engine disk-usage summary Portainer's dashboard renders as
-// "Storage used". Empty arrays are fine as long as the top-level keys exist.
+// "Storage used". The body structure mirrors `docker system df --format
+// json` — Portainer totals the per-entity Size fields to compute the cards.
+//
+// Walking many rootfs directories is slow, so we short-circuit to 0 for any
+// PVE-backed templates/containers (their size lives on ZFS and is cheaper to
+// fetch from `zfs get used`, but that would add a shell-out per entry).
 func (h *Handler) systemDF(w http.ResponseWriter, r *http.Request) {
+	lxcPath := h.mgr.LXCPath()
+
+	var layersSize int64
+	images := make([]map[string]any, 0)
+	for _, img := range h.store.ListImages() {
+		size := imageSize(lxcPath, img)
+		layersSize += size
+		images = append(images, map[string]any{
+			"Id":          "sha256:" + img.ID,
+			"RepoTags":    []string{img.Ref},
+			"RepoDigests": []string{},
+			"Created":     img.Created.Unix(),
+			"Size":        size,
+			"VirtualSize": size,
+			"SharedSize":  0,
+			"Containers":  -1,
+		})
+	}
+
+	containers := make([]map[string]any, 0)
+	for _, c := range h.store.ListContainers() {
+		size := rootfsSize(h.mgr.RootfsPath(c.ID))
+		containers = append(containers, map[string]any{
+			"Id":         c.ID,
+			"Names":      []string{"/" + c.Name},
+			"Image":      c.Image,
+			"ImageID":    c.ImageID,
+			"Created":    c.Created.Unix(),
+			"SizeRw":     size,
+			"SizeRootFs": size,
+			"State":      "", // Portainer doesn't read this on df
+			"Labels":     c.Labels,
+		})
+	}
+
+	volumes := make([]map[string]any, 0)
+	for _, v := range h.store.ListVolumes() {
+		volumes = append(volumes, map[string]any{
+			"Name":       v.Name,
+			"Driver":     v.Driver,
+			"Mountpoint": v.Mountpoint,
+			"CreatedAt":  v.Created.Format(time.RFC3339),
+			"Scope":      "local",
+			"Labels":     v.Labels,
+			"UsageData": map[string]int64{
+				"Size":     rootfsSize(v.Mountpoint),
+				"RefCount": int64(volumeRefCount(h.store, v.Name)),
+			},
+		})
+	}
+
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"LayersSize": 0,
-		"Images":     []any{},
-		"Containers": []any{},
-		"Volumes":    []any{},
+		"LayersSize": layersSize,
+		"Images":     images,
+		"Containers": containers,
+		"Volumes":    volumes,
 		"BuildCache": []any{},
 	})
+}
+
+// rootfsSize is a best-effort disk-usage walker for a directory. Errors on
+// individual files are swallowed; the aggregate is what Portainer shows.
+// Symlinks are followed for files only (we don't descend into symlinked
+// directories to avoid cycles).
+func rootfsSize(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	var total int64
+	filepath.WalkDir(path, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// volumeRefCount returns how many stored containers mount the given volume.
+// Docker exposes this on df so the UI can gate "Remove" on zero refs.
+func volumeRefCount(st *store.Store, name string) int {
+	v := st.GetVolume(name)
+	if v == nil {
+		return 0
+	}
+	refs := 0
+	for _, c := range st.ListContainers() {
+		for _, m := range c.Mounts {
+			if m.Source == v.Mountpoint {
+				refs++
+				break
+			}
+		}
+	}
+	return refs
 }
 
 // volumeRoot returns the directory holding all named volume backing

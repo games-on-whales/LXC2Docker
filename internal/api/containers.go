@@ -101,6 +101,8 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		IpcMode:           req.HostConfig.IpcMode,
 		MemoryBytes:       req.HostConfig.Memory,
 		CPUShares:         req.HostConfig.CPUShares,
+		CPUQuota:          req.HostConfig.CPUQuota,
+		NanoCPUs:          req.HostConfig.NanoCPUs,
 		Privileged:        req.HostConfig.Privileged,
 		CapAdd:            req.HostConfig.CapAdd,
 		CapDrop:           req.HostConfig.CapDrop,
@@ -219,6 +221,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		rec.HealthcheckInterval = hc.Interval
 		rec.HealthcheckTimeout = hc.Timeout
 		rec.HealthcheckRetries = hc.Retries
+		rec.HealthcheckStartPeriod = hc.StartPeriod
 		rec.HealthStatus = "starting"
 	}
 	// Parse port bindings from HostConfig (e.g. "80/tcp" -> [{HostPort:8080, ContainerPort:80, Proto:"tcp"}])
@@ -300,6 +303,19 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		}
 		if !filt.matchAncestor(rec.Image, rec.ImageID) {
 			continue
+		}
+		// The "health" filter matches HealthStatus ("starting"/"healthy"/
+		// "unhealthy") or the special value "none" for containers without
+		// a configured healthcheck. Portainer's "Unhealthy" dashboard
+		// widget relies on this.
+		if filt.has("health") {
+			hs := rec.HealthStatus
+			if hs == "" {
+				hs = "none"
+			}
+			if !filt.matchAny("health", hs) {
+				continue
+			}
 		}
 		cmd := strings.Join(append(rec.Entrypoint, rec.Cmd...), " ")
 		ports := make([]Port, 0, len(rec.PortBindings))
@@ -458,6 +474,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Paused:     paused,
 			Pid:        pid,
 			ExitCode:   rec.ExitCode,
+			Error:      rec.StartError,
 			StartedAt:  startedAt,
 			FinishedAt: finishedAt,
 			Health:     healthStateFrom(rec),
@@ -501,8 +518,21 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.mgr.StartContainer(id); err != nil {
+		// Persist the failure on the record so inspect shows it in
+		// State.Error. Portainer's detail page renders this alongside
+		// the red "failed to start" toast, and the user can see the
+		// underlying reason without chasing daemon logs.
+		if rec := h.store.GetContainer(id); rec != nil {
+			rec.StartError = err.Error()
+			h.store.AddContainer(rec)
+		}
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// Clear any stale error from a previous failed start.
+	if rec := h.store.GetContainer(id); rec != nil && rec.StartError != "" {
+		rec.StartError = ""
+		h.store.AddContainer(rec)
 	}
 
 	// Record first-start timestamp so inspect can distinguish "created" from
