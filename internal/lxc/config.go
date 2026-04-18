@@ -26,6 +26,8 @@ type ContainerConfig struct {
 	DeviceCgroupRules []string     // e.g. ["c 13:* rwm"]
 	NetworkMode       string       // "host" or "" (bridge)
 	IpcMode           string       // "host" or "" (private)
+	UTSMode           string       // "host" or "" (private)
+	PidMode           string       // "host" or "" (private)
 	MemoryBytes       int64        // 0 = unlimited
 	CPUShares         int64        // 0 = unlimited (relative weight)
 	CPUQuota          int64        // microseconds per 100ms period, 0 = unlimited
@@ -274,14 +276,20 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	// Namespace sharing: lxc.namespace.clone lists which namespaces to
 	// CREATE (clone). Omitting a namespace means the container shares the
 	// host's instance. We only set this when at least one namespace should
-	// be shared (Docker's NetworkMode:"host" or IpcMode:"host").
-	if cfg.NetworkMode == "host" || cfg.IpcMode == "host" {
-		ns := []string{"mnt", "pid", "uts"}
+	// be shared (Docker's NetworkMode/IpcMode/UTSMode/PidMode "host").
+	if cfg.NetworkMode == "host" || cfg.IpcMode == "host" || cfg.UTSMode == "host" || cfg.PidMode == "host" {
+		ns := []string{"mnt"}
 		if cfg.NetworkMode != "host" {
 			ns = append(ns, "net")
 		}
 		if cfg.IpcMode != "host" {
 			ns = append(ns, "ipc")
+		}
+		if cfg.UTSMode != "host" {
+			ns = append(ns, "uts")
+		}
+		if cfg.PidMode != "host" {
+			ns = append(ns, "pid")
 		}
 		items = append(items, configItem{"lxc.namespace.clone", strings.Join(ns, " ")})
 	}

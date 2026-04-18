@@ -148,6 +148,8 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		DeviceCgroupRules: req.HostConfig.DeviceCgroupRules,
 		NetworkMode:       req.HostConfig.NetworkMode,
 		IpcMode:           req.HostConfig.IpcMode,
+		UTSMode:           req.HostConfig.UTSMode,
+		PidMode:           req.HostConfig.PidMode,
 		MemoryBytes:       req.HostConfig.Memory,
 		CPUShares:         req.HostConfig.CPUShares,
 		CPUQuota:          req.HostConfig.CPUQuota,
@@ -777,12 +779,14 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	rec := h.store.GetContainer(id)
 	if rec != nil {
-		// Mark as user-stopped so the restart watcher doesn't bring it
-		// back when the policy is unless-stopped / always, and record
-		// the finish time so inspect shows "Stopped X ago".
 		rec.StoppedByUser = true
 		now := time.Now()
 		rec.FinishedAt = &now
+		sig := stopSig
+		if sig == "" {
+			sig = "SIGTERM"
+		}
+		rec.ExitCode = exitCodeForSignal(sig)
 		h.store.AddContainer(rec)
 	}
 	h.emitContainer("stop", rec)
@@ -902,6 +906,11 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 		rec.StoppedByUser = true
 		now := time.Now()
 		rec.FinishedAt = &now
+		sig := signal
+		if sig == "" {
+			sig = "SIGKILL"
+		}
+		rec.ExitCode = exitCodeForSignal(sig)
 		h.store.AddContainer(rec)
 	}
 	h.emitContainer("kill", rec)
@@ -1907,6 +1916,29 @@ func containerUsesVolume(rec *store.ContainerRecord, st *store.Store, names []st
 		}
 	}
 	return false
+}
+
+func exitCodeForSignal(s string) int {
+	if s == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return 128 + n
+	}
+	name := strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(s)), "SIG")
+	numeric := map[string]int{
+		"HUP": 1, "INT": 2, "QUIT": 3, "ILL": 4, "TRAP": 5,
+		"ABRT": 6, "BUS": 7, "FPE": 8, "KILL": 9, "USR1": 10,
+		"SEGV": 11, "USR2": 12, "PIPE": 13, "ALRM": 14, "TERM": 15,
+		"STKFLT": 16, "CHLD": 17, "CONT": 18, "STOP": 19, "TSTP": 20,
+		"TTIN": 21, "TTOU": 22, "URG": 23, "XCPU": 24, "XFSZ": 25,
+		"VTALRM": 26, "PROF": 27, "WINCH": 28, "IO": 29, "PWR": 30,
+		"SYS": 31,
+	}
+	if n, ok := numeric[name]; ok {
+		return 128 + n
+	}
+	return 0
 }
 
 func isValidSignal(s string) bool {
