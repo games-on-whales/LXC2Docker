@@ -61,7 +61,7 @@ type HostConfig struct {
 	Binds          []string          `json:"Binds"` // "host:container[:ro]"
 	Mounts         []MountSpec       `json:"Mounts,omitempty"`
 	Tmpfs          map[string]string `json:"Tmpfs,omitempty"`
-	Volumes        []string          `json:"VolumesFrom,omitempty"`
+	VolumesFrom    []string          `json:"VolumesFrom,omitempty"`
 	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
 	ShmSize        int64             `json:"ShmSize"`
 	// Devices & capabilities

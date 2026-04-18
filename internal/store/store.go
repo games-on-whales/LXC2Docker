@@ -61,8 +61,12 @@ type PortBinding struct {
 	Proto         string `json:"proto"` // "tcp" or "udp"
 }
 
-// MountSpec mirrors the relevant fields of a Docker bind mount.
+// MountSpec mirrors the relevant fields of a Docker mount. Type carries the
+// semantic from the create body ("bind", "volume", "tmpfs") so inspect can
+// echo it back instead of hardcoding "bind". Defaults to "bind" for records
+// written before this field existed.
 type MountSpec struct {
+	Type        string `json:"type,omitempty"`
 	Source      string `json:"source"`
 	Destination string `json:"destination"`
 	ReadOnly    bool   `json:"read_only"`

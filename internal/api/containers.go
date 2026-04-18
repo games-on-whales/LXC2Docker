@@ -101,6 +101,9 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		IpcMode:           req.HostConfig.IpcMode,
 		MemoryBytes:       req.HostConfig.Memory,
 		CPUShares:         req.HostConfig.CPUShares,
+		Privileged:        req.HostConfig.Privileged,
+		CapAdd:            req.HostConfig.CapAdd,
+		CapDrop:           req.HostConfig.CapDrop,
 		ProxmoxCT:         req.Labels["gow.pve"] == "true",
 		LAN:               req.Labels["gow.lan"] == "true",
 	}
@@ -110,7 +113,11 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		cfg.NetworkMode = ""
 	}
 
-	// Parse bind mounts ("host:container[:ro]")
+	// Mount collection. We assemble one list keyed by type so the store
+	// record can echo the original semantic back on inspect (Portainer's
+	// Mounts tab distinguishes bind/volume/tmpfs by a colored badge).
+	var storeMounts []store.MountSpec
+	// Parse legacy Binds ("host:container[:ro]").
 	for _, bind := range req.HostConfig.Binds {
 		parts := strings.SplitN(bind, ":", 3)
 		if len(parts) < 2 {
@@ -122,6 +129,12 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			ReadOnly:    len(parts) == 3 && parts[2] == "ro",
 		}
 		cfg.Mounts = append(cfg.Mounts, m)
+		storeMounts = append(storeMounts, store.MountSpec{
+			Type:        "bind",
+			Source:      m.Source,
+			Destination: m.Destination,
+			ReadOnly:    m.ReadOnly,
+		})
 	}
 
 	// Device mappings
@@ -134,9 +147,20 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 
 	// New-style Mounts (Portainer emits these alongside or instead of Binds).
 	// Only bind mounts map cleanly to LXC today; "volume" and "tmpfs" types
-	// are accepted and persisted but not mounted.
+	// are persisted on the record but not mounted. Portainer still wants to
+	// see them with their declared type on inspect.
 	for _, m := range req.HostConfig.Mounts {
-		if m.Type != "bind" {
+		mType := m.Type
+		if mType == "" {
+			mType = "bind"
+		}
+		storeMounts = append(storeMounts, store.MountSpec{
+			Type:        mType,
+			Source:      m.Source,
+			Destination: m.Target,
+			ReadOnly:    m.ReadOnly,
+		})
+		if mType != "bind" {
 			continue
 		}
 		cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
@@ -171,13 +195,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		ExposedPorts:  req.ExposedPorts,
 		Volumes:       req.Volumes,
 		RawHostConfig: rawHC,
-	}
-	for _, m := range cfg.Mounts {
-		rec.Mounts = append(rec.Mounts, store.MountSpec{
-			Source:      m.Source,
-			Destination: m.Destination,
-			ReadOnly:    m.ReadOnly,
-		})
+		Mounts:        storeMounts,
 	}
 	// Parse port bindings from HostConfig (e.g. "80/tcp" -> [{HostPort:8080, ContainerPort:80, Proto:"tcp"}])
 	for containerPortProto, bindings := range req.HostConfig.PortBindings {
@@ -271,17 +289,7 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		}
 		mounts := make([]MountJSON, 0, len(rec.Mounts))
 		for _, m := range rec.Mounts {
-			mode := "rw"
-			if m.ReadOnly {
-				mode = "ro"
-			}
-			mounts = append(mounts, MountJSON{
-				Type:        "bind",
-				Source:      m.Source,
-				Destination: m.Destination,
-				Mode:        mode,
-				RW:          !m.ReadOnly,
-			})
+			mounts = append(mounts, mountJSONFrom(m))
 		}
 		out = append(out, ContainerSummary{
 			ID:      rec.ID,
@@ -367,17 +375,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 	// Build Mounts array from stored mount specs.
 	mounts := make([]MountJSON, 0, len(rec.Mounts))
 	for _, m := range rec.Mounts {
-		mode := "rw"
-		if m.ReadOnly {
-			mode = "ro"
-		}
-		mounts = append(mounts, MountJSON{
-			Type:        "bind",
-			Source:      m.Source,
-			Destination: m.Destination,
-			Mode:        mode,
-			RW:          !m.ReadOnly,
-		})
+		mounts = append(mounts, mountJSONFrom(m))
 	}
 
 	// Split entrypoint[0] as Path and the rest as Args, matching what Docker
@@ -595,6 +593,19 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /containers/{id}/logs
+//
+// Query params honored (matching Docker Engine):
+//   - stdout=1 / stderr=1  — which streams to return (default both)
+//   - tail=N | tail=all    — last N lines of the pre-existing log
+//   - since=<unix-ts>      — drop lines older than the timestamp
+//   - until=<unix-ts>      — drop lines newer than the timestamp
+//   - timestamps=1         — prefix each line with RFC3339Nano
+//   - follow=1             — keep the connection open and stream new lines
+//
+// LXC writes a single interleaved console log (stdout+stderr merged), so we
+// emit every line as frame type 1 (stdout) regardless of the stderr flag.
+// Portainer accepts this gracefully; the real Docker daemon also can't
+// separate the streams for containers started with a TTY.
 func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
 	if id == "" {
@@ -602,20 +613,22 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stdout := r.URL.Query().Get("stdout") == "1" || r.URL.Query().Get("stdout") == "true"
-	stderr := r.URL.Query().Get("stderr") == "1" || r.URL.Query().Get("stderr") == "true"
-	follow := r.URL.Query().Get("follow") == "1" || r.URL.Query().Get("follow") == "true"
-
+	q := r.URL.Query()
+	stdout := q.Get("stdout") == "1" || q.Get("stdout") == "true"
+	stderr := q.Get("stderr") == "1" || q.Get("stderr") == "true"
+	follow := q.Get("follow") == "1" || q.Get("follow") == "true"
+	timestamps := q.Get("timestamps") == "1" || q.Get("timestamps") == "true"
 	if !stdout && !stderr {
-		stdout = true
-		stderr = true
+		stdout, stderr = true, true
 	}
+	tail := parseTail(q.Get("tail")) // -1 means "all"
+	since := parseUnixTS(q.Get("since"))
+	until := parseUnixTS(q.Get("until"))
 
 	logPath := h.mgr.LogPath(id)
 	f, err := os.Open(logPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// No log yet — return empty OK
 			w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 			w.WriteHeader(http.StatusOK)
 			return
@@ -628,37 +641,143 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 	w.WriteHeader(http.StatusOK)
 
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		writeLogFrame(w, 1, append(line, '\n')) // treat all console output as stdout
+	// When since/until are active we gate every line through the current
+	// wall clock — the console.log has no per-line timestamps, so the best
+	// we can do is accept lines when "now" is inside the window. For a
+	// live-tailing session (follow=1) this filters out nothing initially
+	// but correctly clips when until fires.
+	inWindow := func() bool {
+		t := time.Now()
+		if !since.IsZero() && t.Before(since) {
+			return false
+		}
+		if !until.IsZero() && t.After(until) {
+			return false
+		}
+		return true
+	}
+	emit := func(line []byte) {
+		if timestamps {
+			prefix := time.Now().UTC().Format(time.RFC3339Nano) + " "
+			line = append([]byte(prefix), line...)
+		}
+		writeLogFrame(w, 1, line)
 	}
 
-	if follow {
-		// Tail: poll for new content until client disconnects.
-		ctx := r.Context()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(200 * time.Millisecond):
-			}
-			buf := make([]byte, 32*1024)
-			n, err := f.Read(buf)
-			if n > 0 {
-				writeLogFrame(w, 1, buf[:n])
-				if fl, ok := w.(http.Flusher); ok {
-					fl.Flush()
+	// Backfill phase. When tail is set we collect the last N lines into a
+	// ring buffer instead of streaming everything — the default Portainer
+	// log view requests tail=100 and otherwise the UI would download the
+	// full console log for every open.
+	if tail == 0 {
+		// tail=0 means no backfill, only follow.
+	} else {
+		lines, err := readTail(f, tail)
+		if err == nil {
+			for _, line := range lines {
+				if !inWindow() {
+					continue
 				}
-			}
-			if err == io.EOF {
-				continue
-			}
-			if err != nil {
-				return
+				emit(line)
 			}
 		}
 	}
+
+	if !follow {
+		return
+	}
+
+	// Seek to end so the tail loop only picks up new writes.
+	f.Seek(0, io.SeekEnd)
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+		buf := make([]byte, 32*1024)
+		n, err := f.Read(buf)
+		if n > 0 && inWindow() {
+			if timestamps {
+				// Prefix each complete line; leave partials alone.
+				emit(buf[:n])
+			} else {
+				writeLogFrame(w, 1, buf[:n])
+			}
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+		}
+		if !until.IsZero() && time.Now().After(until) {
+			return
+		}
+		if err == io.EOF {
+			continue
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// parseTail interprets the Docker `tail` query value. "all" (or empty) means
+// stream the whole backlog, a positive integer caps the backfill, and 0
+// suppresses backfill entirely. Returns -1 for "all".
+func parseTail(v string) int {
+	if v == "" || v == "all" {
+		return -1
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
+// parseUnixTS parses the Docker log `since`/`until` values. Accepts integer
+// seconds; nanosecond or RFC3339 forms are uncommon from Portainer and
+// aren't worth the extra handling.
+func parseUnixTS(v string) time.Time {
+	if v == "" {
+		return time.Time{}
+	}
+	ts, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(ts, 0)
+}
+
+// readTail returns up to n trailing lines of f. n < 0 returns all lines. The
+// ring buffer keeps memory bounded to n; the file is read sequentially from
+// the beginning (reading from the tail would need os.Seek + reverse scan,
+// which bufio doesn't do well with multi-byte lines).
+func readTail(f *os.File, n int) ([][]byte, error) {
+	scanner := bufio.NewScanner(f)
+	// Console log lines are usually short, but allow up to 1 MiB per line so
+	// a long warning doesn't bufio.ErrTooLong us out.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	if n < 0 {
+		var all [][]byte
+		for scanner.Scan() {
+			line := append([]byte{}, scanner.Bytes()...)
+			all = append(all, append(line, '\n'))
+		}
+		return all, scanner.Err()
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	ring := make([][]byte, 0, n)
+	for scanner.Scan() {
+		line := append([]byte{}, scanner.Bytes()...)
+		line = append(line, '\n')
+		if len(ring) == n {
+			ring = ring[1:]
+		}
+		ring = append(ring, line)
+	}
+	return ring, scanner.Err()
 }
 
 // POST /containers/{id}/restart
@@ -701,12 +820,18 @@ func (h *Handler) renameContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
+	oldName := rec.Name
 	rec.Name = newName
 	if err := h.store.AddContainer(rec); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	h.emitContainer("rename", rec)
+	// The rename event carries an oldName attribute so Portainer's event
+	// feed can render "foo renamed to bar". Docker prefixes names with a
+	// leading slash on the wire.
+	h.emitContainerWithAttrs("rename", rec, map[string]string{
+		"oldName": "/" + oldName,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1015,6 +1140,27 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 		}
 	}
 	return hc
+}
+
+// mountJSONFrom converts a store mount record to the Docker wire format.
+// Records written before the Type field existed default to "bind" — the
+// only mount type the LXC runtime actually mounts today.
+func mountJSONFrom(m store.MountSpec) MountJSON {
+	mode := "rw"
+	if m.ReadOnly {
+		mode = "ro"
+	}
+	t := m.Type
+	if t == "" {
+		t = "bind"
+	}
+	return MountJSON{
+		Type:        t,
+		Source:      m.Source,
+		Destination: m.Destination,
+		Mode:        mode,
+		RW:          !m.ReadOnly,
+	}
 }
 
 // mergeEnv merges image-level env vars with request-level env vars.

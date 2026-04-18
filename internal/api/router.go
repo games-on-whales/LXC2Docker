@@ -107,6 +107,27 @@ func (h *Handler) routes() http.Handler {
 		// Distribution (registry manifest probe used by Portainer's pull modal)
 		sub.HandleFunc("/distribution/{name:.*}/json", h.distributionInspect).Methods(http.MethodGet)
 
+		// Polite 501s for engine features that this daemon doesn't implement.
+		// Portainer surfaces these as UI tabs; a structured error beats a
+		// 404 that litters the browser console and confuses users. The
+		// messages are short because Portainer displays them verbatim.
+		ni := notImplementedFunc("not supported by docker-lxc-daemon")
+		sub.HandleFunc("/build", ni).Methods(http.MethodPost)
+		sub.HandleFunc("/images/load", ni).Methods(http.MethodPost)
+		sub.HandleFunc("/images/search", ni).Methods(http.MethodGet)
+		sub.HandleFunc("/commit", ni).Methods(http.MethodPost)
+		sub.HandleFunc("/session", ni).Methods(http.MethodPost)
+		sub.HandleFunc("/plugins", ni).Methods(http.MethodGet)
+		sub.HandleFunc("/swarm", ni).Methods(http.MethodGet)
+		sub.HandleFunc("/swarm/init", ni).Methods(http.MethodPost)
+		sub.HandleFunc("/swarm/join", ni).Methods(http.MethodPost)
+		sub.HandleFunc("/swarm/leave", ni).Methods(http.MethodPost)
+		sub.HandleFunc("/nodes", ni).Methods(http.MethodGet)
+		sub.HandleFunc("/services", ni).Methods(http.MethodGet)
+		sub.HandleFunc("/tasks", ni).Methods(http.MethodGet)
+		sub.HandleFunc("/configs", ni).Methods(http.MethodGet)
+		sub.HandleFunc("/secrets", ni).Methods(http.MethodGet)
+
 		// Exec
 		sub.HandleFunc("/containers/{id}/exec", h.execCreate).Methods(http.MethodPost)
 		sub.HandleFunc("/exec/{id}/start", h.execStart).Methods(http.MethodPost)
@@ -130,4 +151,16 @@ func (h *Handler) routes() http.Handler {
 	})
 
 	return r
+}
+
+// notImplementedFunc returns an HTTP handler that responds 501 with a
+// structured error body. Used for Docker Engine endpoints that Portainer
+// probes but this daemon has no analog for (build, swarm, services, …).
+// 501 is the spec-correct code — it tells clients the feature is missing
+// rather than the path being wrong, which prevents retry storms and
+// surfaces a clearer message in Portainer's console.
+func notImplementedFunc(msg string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		errResponse(w, http.StatusNotImplemented, msg)
+	}
 }

@@ -30,6 +30,12 @@ type ContainerConfig struct {
 	CPUShares         int64        // 0 = unlimited (relative weight)
 	CPUQuota          int64        // microseconds per 100ms period, 0 = unlimited
 	WorkingDir        string       // container cwd; maps to lxc.init.cwd
+	// Security. Privileged grants full capabilities + unrestricted device
+	// access; equivalent to Docker's --privileged. CapAdd/CapDrop extend
+	// or restrict the default set when not privileged.
+	Privileged bool
+	CapAdd     []string // Docker-style names e.g. "NET_ADMIN"; CAP_ prefix optional
+	CapDrop    []string
 	// LogFile is where the container console output is written.
 	// Set automatically by the manager.
 	LogFile string
@@ -395,12 +401,49 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 		})
 	}
 
+	// Privileged + capability handling. Docker's --privileged maps to two
+	// LXC side-effects: all capabilities are kept (we clear lxc.cap.drop)
+	// and unrestricted device access is allowed. Non-privileged CapAdd /
+	// CapDrop translate to lxc.cap.keep / lxc.cap.drop entries.
+	items = append(items, capabilityItems(cfg)...)
+
 	// Console log so we can serve it via the logs API
 	if cfg.LogFile != "" {
 		items = append(items, configItem{"lxc.console.logfile", cfg.LogFile})
 	}
 
 	return items
+}
+
+// capabilityItems translates Docker's Privileged / CapAdd / CapDrop into LXC
+// config lines. Privileged wins — when set we clear all drops and grant
+// full device cgroup access. Otherwise CapDrop/CapAdd produce matching
+// lxc.cap.drop / lxc.cap.keep entries, one capability per line.
+func capabilityItems(cfg *ContainerConfig) []configItem {
+	var items []configItem
+	if cfg.Privileged {
+		// Clear any inherited drops from common.conf and allow all devices.
+		items = append(items,
+			configItem{"lxc.cap.drop", ""},
+			configItem{"lxc.cgroup2.devices.allow", "a"},
+		)
+		return items
+	}
+	for _, c := range cfg.CapDrop {
+		items = append(items, configItem{"lxc.cap.drop", normalizeCap(c)})
+	}
+	for _, c := range cfg.CapAdd {
+		items = append(items, configItem{"lxc.cap.keep", normalizeCap(c)})
+	}
+	return items
+}
+
+// normalizeCap converts Docker's capability name ("NET_ADMIN", "CAP_NET_ADMIN")
+// to LXC's form (lowercase, no CAP_ prefix).
+func normalizeCap(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.TrimPrefix(name, "cap_")
+	return name
 }
 
 // combinedCmd merges entrypoint and cmd the same way Docker does.
@@ -735,6 +778,9 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 			fmt.Sprintf("%d 100000", cfg.CPUQuota),
 		})
 	}
+
+	// Capabilities / privileged: same rules as the legacy path.
+	items = append(items, capabilityItems(cfg)...)
 
 	// Console log.
 	if cfg.LogFile != "" {

@@ -77,6 +77,13 @@ func (b *eventBroker) publish(ev Event) {
 // emitContainer is a convenience wrapper for the common case: a container
 // lifecycle action on a stored record.
 func (h *Handler) emitContainer(action string, rec *store.ContainerRecord) {
+	h.emitContainerWithAttrs(action, rec, nil)
+}
+
+// emitContainerWithAttrs emits a container lifecycle event with extra actor
+// attributes merged in. Used by /rename to carry an "oldName" value so
+// Portainer's event feed can render "foo renamed to bar".
+func (h *Handler) emitContainerWithAttrs(action string, rec *store.ContainerRecord, extra map[string]string) {
 	if rec == nil {
 		return
 	}
@@ -87,6 +94,9 @@ func (h *Handler) emitContainer(action string, rec *store.ContainerRecord) {
 		"name":  rec.Name,
 	}
 	for k, v := range rec.Labels {
+		attrs[k] = v
+	}
+	for k, v := range extra {
 		attrs[k] = v
 	}
 	h.events.publish(Event{
@@ -109,6 +119,13 @@ func (h *Handler) emitContainer(action string, rec *store.ContainerRecord) {
 // newline-delimited until the client disconnects. Portainer keeps this
 // connection open indefinitely and relies on it to drive incremental
 // dashboard updates.
+//
+// Honored query params:
+//   - since / until: unix timestamps; until disconnects the stream.
+//   - filters: Docker filter map. Recognized keys are "container" (match
+//     by container ID or name), "type" (container|image|network|volume),
+//     "event" (specific action like "start"/"die"). Other keys are
+//     ignored, matching Docker's laxity.
 func (h *Handler) eventsStream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -125,6 +142,7 @@ func (h *Handler) eventsStream(w http.ResponseWriter, r *http.Request) {
 			until = time.Unix(ts, 0)
 		}
 	}
+	filt := parseFilters(r)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -155,6 +173,9 @@ func (h *Handler) eventsStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
+			if !matchEvent(filt, ev) {
+				continue
+			}
 			if err := enc.Encode(&ev); err != nil {
 				return
 			}
@@ -167,4 +188,32 @@ func (h *Handler) eventsStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// matchEvent applies the /events filter map to a single event. Returns true
+// when the event should be delivered to the subscriber.
+func matchEvent(f filters, ev Event) bool {
+	if f.has("type") && !f.matchAny("type", ev.Type) {
+		return false
+	}
+	if f.has("event") && !f.matchAny("event", ev.Action) {
+		return false
+	}
+	if f.has("container") {
+		// Container filter accepts ID or name.
+		match := false
+		for _, want := range f["container"] {
+			if want == ev.Actor.ID || want == ev.Actor.Attributes["name"] {
+				match = true
+				break
+			}
+		}
+		if !match {
+			return false
+		}
+	}
+	if f.has("label") && !f.matchLabel(ev.Actor.Attributes) {
+		return false
+	}
+	return true
 }

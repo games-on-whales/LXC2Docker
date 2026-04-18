@@ -174,6 +174,9 @@ func (h *Handler) sampleStats(id, name string) dockerStats {
 	s.MemoryStats.MaxUsage = usage
 	s.MemoryStats.Stats = memstats
 
+	// Process count (cgroup v2 pids.current, v1 pids.current or tasks).
+	s.PidsStats.Current = readPidsCurrent(cgPath)
+
 	// Network (per-interface rx/tx from /proc/<pid>/net/dev).
 	if pid > 0 {
 		s.Networks = readNetStats(pid)
@@ -390,6 +393,28 @@ func readMemoryStats(cg string) (usage, limit uint64, stats map[string]uint64) {
 		limit = physicalMemory()
 	}
 	return
+}
+
+// readPidsCurrent returns the count of processes/tasks in the container's
+// cgroup. Portainer's stats card shows "PIDs: N". cgroup v2 exposes
+// pids.current; v1 keeps it under pids.current or in a tasks file.
+func readPidsCurrent(cg string) uint64 {
+	if cg == "" {
+		return 0
+	}
+	for _, name := range []string{"pids.current"} {
+		if data, err := os.ReadFile(filepath.Join(cg, name)); err == nil {
+			n, _ := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+			if n > 0 {
+				return n
+			}
+		}
+	}
+	// cgroup v1 fallback: count the lines of tasks.
+	if data, err := os.ReadFile(filepath.Join(cg, "tasks")); err == nil {
+		return uint64(strings.Count(string(data), "\n"))
+	}
+	return 0
 }
 
 func physicalMemory() uint64 {
