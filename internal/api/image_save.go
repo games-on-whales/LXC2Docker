@@ -29,6 +29,11 @@ func (h *Handler) saveImage(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
 		return
 	}
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", "application/x-tar")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	h.writeSaveBundle(w, []*store.ImageRecord{rec})
 }
 
@@ -59,6 +64,11 @@ func (h *Handler) saveImages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		recs = append(recs, rec)
+	}
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", "application/x-tar")
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 	h.writeSaveBundle(w, recs)
 }

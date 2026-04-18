@@ -540,6 +540,10 @@ func (h *Handler) exportContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/x-tar")
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 
 	cmd := exec.CommandContext(r.Context(), "tar", "-cf", "-", "-C", rootfs, ".")
