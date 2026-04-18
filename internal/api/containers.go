@@ -540,7 +540,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			User:         rec.User,
 			Tty:          rec.Tty,
 			OpenStdin:    rec.OpenStdin,
-			ExposedPorts: rec.ExposedPorts,
+			ExposedPorts: h.exposedPortsFor(rec),
 			Image:        rec.Image,
 			Volumes:      rec.Volumes,
 			Cmd:          rec.Cmd,
@@ -1049,20 +1049,39 @@ func (h *Handler) topContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusConflict, "container is not running")
 		return
 	}
-	cmd := h.mgr.Exec(id, []string{"ps", "-eo", "pid,user,time,comm"}, nil)
+	psArgs := r.URL.Query().Get("ps_args")
+	if psArgs == "" {
+		psArgs = "-ef"
+	}
+	psCmd := append([]string{"ps"}, strings.Fields(psArgs)...)
+	cmd := h.mgr.Exec(id, psCmd, nil)
 	out, err := cmd.Output()
 	if err != nil {
 		errResponse(w, http.StatusInternalServerError, fmt.Sprintf("ps: %v", err))
 		return
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	titles := []string{"PID", "USER", "TIME", "COMMAND"}
+	if len(lines) == 0 {
+		jsonResponse(w, http.StatusOK, map[string]any{
+			"Titles":    []string{},
+			"Processes": [][]string{},
+		})
+		return
+	}
+	titles := strings.Fields(lines[0])
 	processes := make([][]string, 0, len(lines)-1)
+	cols := len(titles)
 	for _, line := range lines[1:] {
-		fields := strings.Fields(line)
-		if len(fields) >= 4 {
-			processes = append(processes, fields[:4])
+		if line == "" {
+			continue
 		}
+		fields := strings.Fields(line)
+		if len(fields) < cols {
+			continue
+		}
+		row := append([]string{}, fields[:cols-1]...)
+		row = append(row, strings.Join(fields[cols-1:], " "))
+		processes = append(processes, row)
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"Titles":    titles,
@@ -1342,6 +1361,25 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 		}
 	}
 	return hc
+}
+
+func (h *Handler) exposedPortsFor(rec *store.ContainerRecord) map[string]struct{} {
+	out := map[string]struct{}{}
+	for k := range rec.ExposedPorts {
+		out[k] = struct{}{}
+	}
+	for _, pb := range rec.PortBindings {
+		out[fmt.Sprintf("%d/%s", pb.ContainerPort, pb.Proto)] = struct{}{}
+	}
+	if img := h.store.GetImage(normalizeImageRef(rec.Image)); img != nil {
+		for _, p := range img.OCIPorts {
+			out[p] = struct{}{}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func healthcheckFrom(rec *store.ContainerRecord) *Healthcheck {

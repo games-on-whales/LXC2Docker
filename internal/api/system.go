@@ -245,10 +245,8 @@ func (h *Handler) networksWithContainers() []map[string]any {
 }
 
 func (h *Handler) createNetwork(w http.ResponseWriter, r *http.Request) {
-	// Networks are not first-class in this daemon; accept and return a
-	// synthetic ID so compose stacks and Portainer create forms succeed.
 	jsonResponse(w, http.StatusCreated, map[string]string{
-		"Id":      "stub",
+		"Id":      generateID(),
 		"Warning": "",
 	})
 }

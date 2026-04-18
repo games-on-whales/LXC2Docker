@@ -97,6 +97,9 @@ func (h *Handler) HealthEmitter() func(id, status string) {
 		if rec == nil {
 			return
 		}
+		h.emitContainerWithAttrs("health_status", rec, map[string]string{
+			"health_status": status,
+		})
 		h.emitContainerWithAttrs("health_status: "+status, rec, map[string]string{
 			"health_status": status,
 		})
