@@ -385,13 +385,21 @@ func copyStringMap(src map[string]string) map[string]string {
 }
 
 func buildContainerEndpoints(rec *store.ContainerRecord) map[string]EndpointSettings {
-	if len(rec.Networks) == 0 {
-		rec.Networks = defaultContainerNetworks(rec)
+	attachments := rec.Networks
+	if len(attachments) == 0 {
+		if rec.IPAddress == "" {
+			return map[string]EndpointSettings{}
+		}
+		attachments = defaultContainerNetworks(rec)
 	}
-	out := make(map[string]EndpointSettings, len(rec.Networks))
-	for name, attached := range rec.Networks {
+	out := make(map[string]EndpointSettings, len(attachments))
+	for name, attached := range attachments {
+		ipAddress := attached.IPAddress
+		if ipAddress == "" {
+			ipAddress = rec.IPAddress
+		}
 		out[name] = EndpointSettings{
-			IPAddress:  attached.IPAddress,
+			IPAddress:  ipAddress,
 			Gateway:    attached.Gateway,
 			MacAddress: attached.MacAddress,
 			NetworkID:  attached.NetworkID,

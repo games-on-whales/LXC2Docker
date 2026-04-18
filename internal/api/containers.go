@@ -285,6 +285,18 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	// the client posted, including fields the LXC runtime doesn't honor.
 	rawHC, _ := json.Marshal(req.HostConfig)
 
+	if req.NetworkingConfig != nil {
+		for name := range req.NetworkingConfig.EndpointsConfig {
+			if name == "gow" {
+				continue
+			}
+			if h.store.GetNetwork(name) == nil {
+				errResponse(w, http.StatusBadRequest, fmt.Sprintf("network %q not found", name))
+				return
+			}
+		}
+	}
+
 	// Persist record before creating so the IP is allocated.
 	rec := &store.ContainerRecord{
 		ID:              id,
@@ -358,6 +370,21 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("createContainer: success %s", id[:12])
+
+	if rec := h.store.GetContainer(id); rec != nil {
+		if req.NetworkingConfig != nil {
+			if err := attachRequestedNetworks(h.store, rec, *req.NetworkingConfig); err != nil {
+				errResponse(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		} else if len(rec.Networks) == 0 {
+			rec.Networks = defaultContainerNetworks(rec)
+		}
+		if err := h.store.AddContainer(rec); err != nil {
+			errResponse(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 
 	h.emitContainer("create", h.store.GetContainer(id))
 
@@ -535,25 +562,26 @@ func networkModeFor(rec *store.ContainerRecord) string {
 	if rec.Labels["gow.lan"] == "true" {
 		return "lan"
 	}
+	if len(rec.Networks) > 0 {
+		names := make([]string, 0, len(rec.Networks))
+		for name := range rec.Networks {
+			if name == "gow" {
+				continue
+			}
+			names = append(names, name)
+		}
+		if len(names) > 0 {
+			sort.Strings(names)
+			return names[0]
+		}
+	}
 	return "gow"
 }
 
 // networkSettingsFor builds the per-network endpoint map for a container.
 // One entry per attached network ("gow" is the daemon's managed bridge).
 func networkSettingsFor(rec *store.ContainerRecord) map[string]EndpointSettings {
-	if rec.IPAddress == "" {
-		return map[string]EndpointSettings{}
-	}
-	return map[string]EndpointSettings{
-		"gow": {
-			NetworkID:   "gow",
-			EndpointID:  rec.ID,
-			Gateway:     lxc.BridgeGW,
-			IPAddress:   rec.IPAddress,
-			IPPrefixLen: 24,
-			Aliases:     []string{rec.Name},
-		},
-	}
+	return buildContainerEndpoints(rec)
 }
 
 // GET /containers/{id}/json
@@ -1900,7 +1928,22 @@ func containerExposes(exposed map[string]struct{}, wants []string) bool {
 }
 
 func containerOnNetwork(rec *store.ContainerRecord, names []string) bool {
-	attached := map[string]bool{networkModeFor(rec): true, "gow": true}
+	attached := map[string]bool{}
+	for _, name := range names {
+		attached[name] = false
+	}
+	networks := rec.Networks
+	if len(networks) == 0 {
+		networks = defaultContainerNetworks(rec)
+	}
+	for name, ep := range networks {
+		attached[name] = true
+		if ep.NetworkID != "" {
+			attached[ep.NetworkID] = true
+		}
+	}
+	attached[networkModeFor(rec)] = true
+	attached["gow"] = true
 	for _, want := range names {
 		if attached[want] {
 			return true

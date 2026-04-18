@@ -123,12 +123,19 @@ type EndpointIPAMConfig struct {
 
 // NetworkRecord is a persisted user-defined network record.
 type NetworkRecord struct {
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	Driver    string            `json:"driver"`
-	Scope     string            `json:"scope"`
-	CreatedAt time.Time         `json:"created_at"`
-	Labels    map[string]string `json:"labels"`
+	ID         string            `json:"id"`
+	Name       string            `json:"name"`
+	Driver     string            `json:"driver"`
+	Scope      string            `json:"scope"`
+	CreatedAt  time.Time         `json:"created_at"`
+	Labels     map[string]string `json:"labels"`
+	Options    map[string]string `json:"options,omitempty"`
+	EnableIPv6 bool              `json:"enable_ipv6,omitempty"`
+	Internal   bool              `json:"internal,omitempty"`
+	Attachable bool              `json:"attachable,omitempty"`
+	IPAMDriver string            `json:"ipam_driver,omitempty"`
+	Subnet     string            `json:"subnet,omitempty"`
+	Gateway    string            `json:"gateway,omitempty"`
 }
 
 // PortBinding records a single host→container port mapping.

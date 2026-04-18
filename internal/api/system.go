@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -225,6 +226,30 @@ func detectCgroupDriver() string {
 // realistic snapshot rather than an empty array so the UI doesn't show the
 // engine as misconfigured.
 
+type networkCreateRequest struct {
+	Name           string            `json:"Name"`
+	Driver         string            `json:"Driver"`
+	CheckDuplicate bool              `json:"CheckDuplicate"`
+	Internal       bool              `json:"Internal"`
+	Attachable     bool              `json:"Attachable"`
+	EnableIPv6     bool              `json:"EnableIPv6"`
+	Options        map[string]string `json:"Options"`
+	Labels         map[string]string `json:"Labels"`
+	IPAM           struct {
+		Driver string `json:"Driver"`
+		Config []struct {
+			Subnet  string `json:"Subnet"`
+			Gateway string `json:"Gateway"`
+		} `json:"Config"`
+	} `json:"IPAM"`
+}
+
+type networkConnectRequest struct {
+	Container      string            `json:"Container"`
+	EndpointConfig *EndpointSettings `json:"EndpointConfig"`
+	Force          bool              `json:"Force"`
+}
+
 func (h *Handler) listNetworks(w http.ResponseWriter, r *http.Request) {
 	filt := parseFilters(r)
 	all := h.networksWithContainers()
@@ -299,45 +324,96 @@ func (h *Handler) inspectNetwork(w http.ResponseWriter, r *http.Request) {
 // Networks tab renders this as "containers attached" with links to each.
 func (h *Handler) networksWithContainers() []map[string]any {
 	nets := defaultNetworks()
-	members := map[string]any{}
+	membersByNetwork := map[string]map[string]any{}
 	for _, rec := range h.store.ListContainers() {
-		if rec.IPAddress == "" {
-			continue
+		attachments := rec.Networks
+		if len(attachments) == 0 {
+			attachments = defaultContainerNetworks(rec)
 		}
-		members[rec.ID] = map[string]string{
-			"Name":        rec.Name,
-			"EndpointID":  rec.ID,
-			"MacAddress":  "",
-			"IPv4Address": rec.IPAddress + "/24",
-			"IPv6Address": "",
+		for name, attached := range attachments {
+			networkID := attached.NetworkID
+			if networkID == "" {
+				networkID = name
+			}
+			if membersByNetwork[networkID] == nil {
+				membersByNetwork[networkID] = map[string]any{}
+			}
+			ipv4 := attached.IPAddress
+			if ipv4 == "" {
+				ipv4 = rec.IPAddress
+			}
+			if ipv4 != "" {
+				ipv4 += "/24"
+			}
+			attachedEndpointID := attached.EndpointID
+			if attachedEndpointID == "" {
+				attachedEndpointID = endpointID(rec.ID, name)
+			}
+			membersByNetwork[networkID][rec.ID] = map[string]string{
+				"Name":        rec.Name,
+				"EndpointID":  attachedEndpointID,
+				"MacAddress":  attached.MacAddress,
+				"IPv4Address": ipv4,
+				"IPv6Address": "",
+			}
 		}
 	}
 	for _, n := range nets {
-		if n["Name"] == "gow" {
-			n["Containers"] = members
+		id, _ := n["Id"].(string)
+		if membersByNetwork[id] == nil {
+			n["Containers"] = map[string]any{}
+			continue
 		}
+		n["Containers"] = membersByNetwork[id]
+	}
+	for _, n := range h.store.ListNetworks() {
+		containers := membersByNetwork[n.ID]
+		if containers == nil {
+			containers = map[string]any{}
+		}
+		nets = append(nets, userNetworkSnapshot(n, containers))
 	}
 	return nets
 }
 
 func (h *Handler) createNetwork(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Name string `json:"Name"`
+	var body networkCreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		errResponse(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
 	body.Name = strings.TrimSpace(body.Name)
 	if body.Name == "" {
 		errResponse(w, http.StatusBadRequest, "network name cannot be empty")
 		return
 	}
-	for _, n := range defaultNetworks() {
-		if n["Name"] == body.Name {
-			errResponse(w, http.StatusConflict,
-				fmt.Sprintf("network with name %s already exists", body.Name))
-			return
-		}
+	if isBuiltInNetwork(body.Name) || h.store.GetNetwork(body.Name) != nil {
+		errResponse(w, http.StatusConflict,
+			fmt.Sprintf("network with name %s already exists", body.Name))
+		return
 	}
 	id := generateID()
+	rec := &store.NetworkRecord{
+		ID:         id,
+		Name:       body.Name,
+		Driver:     orDefault(body.Driver, "bridge"),
+		Scope:      "local",
+		CreatedAt:  time.Now(),
+		Labels:     body.Labels,
+		Options:    body.Options,
+		EnableIPv6: body.EnableIPv6,
+		Internal:   body.Internal,
+		Attachable: body.Attachable,
+		IPAMDriver: orDefault(body.IPAM.Driver, "default"),
+	}
+	if len(body.IPAM.Config) > 0 {
+		rec.Subnet = body.IPAM.Config[0].Subnet
+		rec.Gateway = body.IPAM.Config[0].Gateway
+	}
+	if err := h.store.AddNetwork(rec); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	h.emitNetwork("create", id, body.Name)
 	jsonResponse(w, http.StatusCreated, map[string]string{
 		"Id":      id,
@@ -346,62 +422,218 @@ func (h *Handler) createNetwork(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) connectNetwork(w http.ResponseWriter, r *http.Request) {
-	id := mux.Vars(r)["id"]
-	if !h.knownNetwork(id) {
+	name, id, gateway, ok := h.resolveNetwork(mux.Vars(r)["id"])
+	if !ok {
 		errResponse(w, http.StatusNotFound, "network not found")
 		return
 	}
-	var body struct {
-		Container string `json:"Container"`
+	if name == "host" || name == "none" {
+		errResponse(w, http.StatusConflict, "network cannot be connected dynamically")
+		return
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	cid := ""
-	if body.Container != "" {
-		cid = h.store.ResolveID(body.Container)
+	var body networkConnectRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		errResponse(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
 	}
-	h.emitNetworkFull("connect", id, "", cid)
+	cid := h.store.ResolveID(body.Container)
+	if cid == "" {
+		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+	rec := h.store.GetContainer(cid)
+	if rec == nil {
+		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+	if len(rec.Networks) == 0 {
+		rec.Networks = defaultContainerNetworks(rec)
+	}
+	ep := EndpointSettings{}
+	if body.EndpointConfig != nil {
+		ep = *body.EndpointConfig
+	}
+	ip := ep.IPAddress
+	if ip == "" && ep.IPAMConfig != nil && ep.IPAMConfig.IPv4Address != "" {
+		ip = ep.IPAMConfig.IPv4Address
+	}
+	if ip == "" {
+		ip = rec.IPAddress
+	}
+	if ep.Gateway != "" {
+		gateway = ep.Gateway
+	}
+	aliases := append([]string{}, ep.Aliases...)
+	if len(aliases) == 0 {
+		aliases = []string{rec.Name}
+	}
+	rec.Networks[name] = store.NetworkAttachment{
+		NetworkID:  id,
+		IPAddress:  ip,
+		Gateway:    gateway,
+		MacAddress: ep.MacAddress,
+		EndpointID: endpointID(rec.ID, name),
+		Aliases:    aliases,
+		Links:      append([]string{}, ep.Links...),
+		DriverOpts: copyStringMap(ep.DriverOpts),
+		IPAMConfig: endpointIPAMToStore(ep.IPAMConfig),
+	}
+	if err := h.store.AddContainer(rec); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.emitNetworkFull("connect", id, name, cid)
 	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) disconnectNetwork(w http.ResponseWriter, r *http.Request) {
-	id := mux.Vars(r)["id"]
-	if !h.knownNetwork(id) {
+	name, id, _, ok := h.resolveNetwork(mux.Vars(r)["id"])
+	if !ok {
 		errResponse(w, http.StatusNotFound, "network not found")
 		return
 	}
-	var body struct {
-		Container string `json:"Container"`
+	if name == "gow" {
+		errResponse(w, http.StatusConflict, "primary network cannot be disconnected")
+		return
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	cid := ""
-	if body.Container != "" {
-		cid = h.store.ResolveID(body.Container)
+	var body networkConnectRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		errResponse(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
 	}
-	h.emitNetworkFull("disconnect", id, "", cid)
+	cid := h.store.ResolveID(body.Container)
+	if cid == "" {
+		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+	rec := h.store.GetContainer(cid)
+	if rec == nil {
+		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+	if len(rec.Networks) == 0 {
+		rec.Networks = defaultContainerNetworks(rec)
+	}
+	if _, attached := rec.Networks[name]; !attached {
+		errResponse(w, http.StatusNotFound, "container is not connected to the network")
+		return
+	}
+	delete(rec.Networks, name)
+	if err := h.store.AddContainer(rec); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.emitNetworkFull("disconnect", id, name, cid)
 	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) knownNetwork(id string) bool {
-	for _, n := range defaultNetworks() {
-		if n["Id"] == id || n["Name"] == id {
-			return true
-		}
-		if s, _ := n["Id"].(string); len(id) >= 4 && strings.HasPrefix(s, id) {
-			return true
-		}
-	}
-	return false
+	_, _, _, ok := h.resolveNetwork(id)
+	return ok
 }
 
 func (h *Handler) removeNetwork(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
-	switch id {
-	case "gow", "host", "none", "bridge":
+	switch {
+	case isBuiltInNetwork(id):
 		errResponse(w, http.StatusForbidden, id+" is a pre-defined network and cannot be removed")
 		return
 	}
-	h.emitNetwork("destroy", id, "")
+	n := h.store.GetNetwork(id)
+	if n == nil {
+		errResponse(w, http.StatusNotFound, "network not found")
+		return
+	}
+	for _, rec := range h.store.ListContainers() {
+		attachments := rec.Networks
+		if len(attachments) == 0 {
+			attachments = defaultContainerNetworks(rec)
+		}
+		for name, attached := range attachments {
+			if name == n.Name || attached.NetworkID == n.ID {
+				errResponse(w, http.StatusConflict, "network is in use")
+				return
+			}
+		}
+	}
+	if err := h.store.RemoveNetwork(n.ID); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.emitNetwork("destroy", n.ID, n.Name)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) resolveNetwork(idOrName string) (name, id, gateway string, ok bool) {
+	if n := h.store.GetNetwork(idOrName); n != nil {
+		return n.Name, n.ID, orDefault(n.Gateway, "10.100.0.1"), true
+	}
+	for _, n := range defaultNetworks() {
+		name, _ := n["Name"].(string)
+		id, _ := n["Id"].(string)
+		if id == idOrName || name == idOrName {
+			return name, id, networkSnapshotGateway(n), true
+		}
+		if len(idOrName) >= 4 && strings.HasPrefix(id, idOrName) {
+			return name, id, networkSnapshotGateway(n), true
+		}
+	}
+	return "", "", "", false
+}
+
+func isBuiltInNetwork(name string) bool {
+	switch name {
+	case "gow", "host", "none", "bridge":
+		return true
+	}
+	return false
+}
+
+func userNetworkSnapshot(n *store.NetworkRecord, containers map[string]any) map[string]any {
+	ipamConfig := []map[string]string{}
+	if n.Subnet != "" || n.Gateway != "" {
+		cfg := map[string]string{}
+		if n.Subnet != "" {
+			cfg["Subnet"] = n.Subnet
+		}
+		if n.Gateway != "" {
+			cfg["Gateway"] = n.Gateway
+		}
+		ipamConfig = append(ipamConfig, cfg)
+	}
+	return map[string]any{
+		"Name":       n.Name,
+		"Id":         n.ID,
+		"Driver":     orDefault(n.Driver, "bridge"),
+		"Scope":      orDefault(n.Scope, "local"),
+		"EnableIPv6": n.EnableIPv6,
+		"Internal":   n.Internal,
+		"Attachable": n.Attachable,
+		"Ingress":    false,
+		"IPAM": map[string]any{
+			"Driver": orDefault(n.IPAMDriver, "default"),
+			"Config": ipamConfig,
+		},
+		"Options":    orStringMap(n.Options),
+		"Labels":     orStringMap(n.Labels),
+		"Containers": containers,
+	}
+}
+
+func networkSnapshotGateway(n map[string]any) string {
+	ipam, _ := n["IPAM"].(map[string]any)
+	configs, _ := ipam["Config"].([]map[string]string)
+	if len(configs) > 0 && configs[0]["Gateway"] != "" {
+		return configs[0]["Gateway"]
+	}
+	return "10.100.0.1"
+}
+
+func orStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return map[string]string{}
+	}
+	return in
 }
 
 // --- system / volumes / auth stubs ---
