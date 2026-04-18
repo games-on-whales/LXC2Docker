@@ -96,6 +96,7 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 		ContainerID: containerID,
 		Cmd:         req.Cmd,
 		Tty:         req.Tty,
+		DetachKeys:  req.DetachKeys,
 		AttachStdin: req.AttachStdin,
 		AttachStdout: req.AttachStdout,
 		AttachStderr: req.AttachStderr,
@@ -247,6 +248,7 @@ func (h *Handler) execInspect(w http.ResponseWriter, r *http.Request) {
 		OpenStdout: rec.AttachStdout,
 		OpenStderr: rec.AttachStderr,
 		CanRemove:  !rec.Running,
+		DetachKeys: rec.DetachKeys,
 	})
 }
 

@@ -484,6 +484,7 @@ type ExecCreateRequest struct {
 	AttachStdout bool     `json:"AttachStdout"`
 	AttachStderr bool     `json:"AttachStderr"`
 	Tty          bool     `json:"Tty"`
+	DetachKeys   string   `json:"DetachKeys"`
 	Env          []string `json:"Env"`
 	WorkingDir   string   `json:"WorkingDir"`
 	User         string   `json:"User"`
@@ -659,6 +660,7 @@ type execRecord struct {
 	ContainerID string
 	Cmd         []string
 	Tty         bool
+	DetachKeys  string
 	AttachStdin bool
 	AttachStdout bool
 	AttachStderr bool
