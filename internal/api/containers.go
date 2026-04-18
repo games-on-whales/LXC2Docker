@@ -902,7 +902,7 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 		switch condition {
 		case "removed":
 			if h.store.GetContainer(id) == nil {
-				jsonResponse(w, http.StatusOK, map[string]any{"StatusCode": 0, "Error": nil})
+				jsonResponse(w, http.StatusOK, waitContainerResponse(nil))
 				return
 			}
 		case "next-exit":
@@ -911,16 +911,27 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 				wasRunning = true
 			}
 			if wasRunning && state != "running" {
-				jsonResponse(w, http.StatusOK, map[string]any{"StatusCode": 0, "Error": nil})
+				jsonResponse(w, http.StatusOK, waitContainerResponse(h.store.GetContainer(id)))
 				return
 			}
 		default:
 			state, _ := h.mgr.State(id)
 			if state != "running" {
-				jsonResponse(w, http.StatusOK, map[string]any{"StatusCode": 0, "Error": nil})
+				jsonResponse(w, http.StatusOK, waitContainerResponse(h.store.GetContainer(id)))
 				return
 			}
 		}
+	}
+}
+
+func waitContainerResponse(rec *store.ContainerRecord) map[string]any {
+	statusCode := 0
+	if rec != nil {
+		statusCode = rec.ExitCode
+	}
+	return map[string]any{
+		"StatusCode": statusCode,
+		"Error":      nil,
 	}
 }
 
