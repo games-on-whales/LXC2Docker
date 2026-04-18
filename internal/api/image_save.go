@@ -2,6 +2,8 @@ package api
 
 import (
 	"archive/tar"
+	"bufio"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/oci"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/oci"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
 
@@ -25,6 +27,11 @@ func (h *Handler) saveImage(w http.ResponseWriter, r *http.Request) {
 	rec := h.store.GetImage(normalizeImageRef(name))
 	if rec == nil {
 		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
+		return
+	}
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", "application/x-tar")
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	h.writeSaveBundle(w, []*store.ImageRecord{rec})
@@ -57,6 +64,11 @@ func (h *Handler) saveImages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		recs = append(recs, rec)
+	}
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", "application/x-tar")
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 	h.writeSaveBundle(w, recs)
 }
@@ -284,21 +296,42 @@ func writeLayerTar(ctx any, root, outPath string) (string, error) {
 // computed by writeLayerTar. Returns the JSON bytes and its sha256 (used as
 // the filename in the outer tar).
 func synthesiseImageConfig(rec *store.ImageRecord, layerSHA string) ([]byte, string, error) {
-	cfg := map[string]any{
-		"Env":        append([]string{}, rec.OCIEnv...),
-		"Cmd":        append([]string{}, rec.OCICmd...),
-		"Entrypoint": append([]string{}, rec.OCIEntrypoint...),
-		"WorkingDir": rec.OCIWorkingDir,
-		"User":       rec.OCIUser,
-		"StopSignal": rec.OCIStopSignal,
-		"Labels":     copyLabels(rec.OCILabels),
+	volumes := map[string]struct{}{}
+	for _, v := range rec.OCIVolumes {
+		if v != "" {
+			volumes[v] = struct{}{}
+		}
 	}
-	if ep := rec.OCIPorts; len(ep) > 0 {
-		ports := map[string]struct{}{}
-		for _, p := range ep {
+	ports := map[string]struct{}{}
+	for _, p := range rec.OCIPorts {
+		if p != "" {
 			ports[p] = struct{}{}
 		}
-		cfg["ExposedPorts"] = ports
+	}
+	cfg := map[string]any{
+		"Hostname":        rec.OCIHostname,
+		"Domainname":      rec.OCIDomainname,
+		"MacAddress":      rec.OCIMacAddress,
+		"Env":             append([]string{}, rec.OCIEnv...),
+		"Cmd":             append([]string{}, rec.OCICmd...),
+		"Entrypoint":      append([]string{}, rec.OCIEntrypoint...),
+		"WorkingDir":      rec.OCIWorkingDir,
+		"User":            rec.OCIUser,
+		"AttachStdin":     rec.OCIAttachStdin,
+		"AttachStdout":    rec.OCIAttachStdout,
+		"AttachStderr":    rec.OCIAttachStderr,
+		"StopSignal":      rec.OCIStopSignal,
+		"StopTimeout":     rec.OCIStopTimeout,
+		"Labels":          copyLabels(rec.OCILabels),
+		"ExposedPorts":    ports,
+		"Tty":             rec.OCITty,
+		"OpenStdin":       rec.OCIOpenStdin,
+		"StdinOnce":       rec.OCIStdinOnce,
+		"NetworkDisabled": rec.OCINetworkDisabled,
+		"ArgsEscaped":     rec.OCIArgsEscaped,
+		"Volumes":         volumes,
+		"OnBuild":         append([]string{}, rec.OCIOnBuild...),
+		"Shell":           append([]string{}, rec.OCIShell...),
 	}
 	if hc := rec.OCIHealthcheck; hc != nil {
 		cfg["Healthcheck"] = map[string]any{
@@ -314,10 +347,16 @@ func synthesiseImageConfig(rec *store.ImageRecord, layerSHA string) ([]byte, str
 		arch = "amd64"
 	}
 	img := map[string]any{
-		"architecture": arch,
-		"os":           "linux",
-		"created":      rec.Created.UTC().Format(time.RFC3339Nano),
-		"config":       cfg,
+		"architecture":     arch,
+		"os":               "linux",
+		"created":          rec.Created.UTC().Format(time.RFC3339Nano),
+		"author":           rec.OCIAuthor,
+		"comment":          rec.OCIComment,
+		"container":        rec.OCIContainer,
+		"docker_version":   rec.OCIDockerVersion,
+		"variant":          rec.OCIVariant,
+		"config":           cfg,
+		"container_config": cfg,
 		"rootfs": map[string]any{
 			"type":     "layers",
 			"diff_ids": []string{"sha256:" + layerSHA},
@@ -326,6 +365,9 @@ func synthesiseImageConfig(rec *store.ImageRecord, layerSHA string) ([]byte, str
 			"created":    rec.Created.UTC().Format(time.RFC3339Nano),
 			"created_by": "docker-lxc-daemon save",
 		}},
+	}
+	if rec.Release != "" {
+		img["os.version"] = rec.Release
 	}
 	body, err := json.Marshal(img)
 	if err != nil {
@@ -362,24 +404,49 @@ type saveManifestEntry struct {
 // back during load. Fields line up with the saveImage synthesis so a save →
 // load round-trip preserves the OCI metadata we track.
 type saveImageConfig struct {
-	Architecture string `json:"architecture"`
-	Config       struct {
-		Env          []string            `json:"Env"`
-		Cmd          []string            `json:"Cmd"`
-		Entrypoint   []string            `json:"Entrypoint"`
-		WorkingDir   string              `json:"WorkingDir"`
-		User         string              `json:"User"`
-		StopSignal   string              `json:"StopSignal"`
-		Labels       map[string]string   `json:"Labels"`
-		ExposedPorts map[string]struct{} `json:"ExposedPorts"`
-		Healthcheck  *struct {
-			Test        []string `json:"Test"`
-			Interval    int64    `json:"Interval"`
-			Timeout     int64    `json:"Timeout"`
-			StartPeriod int64    `json:"StartPeriod"`
-			Retries     int      `json:"Retries"`
-		} `json:"Healthcheck"`
-	} `json:"config"`
+	Architecture    string              `json:"architecture"`
+	Created         string              `json:"created"`
+	Author          string              `json:"author"`
+	Comment         string              `json:"comment"`
+	Container       string              `json:"container"`
+	DockerVersion   string              `json:"docker_version"`
+	Variant         string              `json:"variant"`
+	OSVersion       string              `json:"os.version"`
+	Config          saveImageConfigBody `json:"config"`
+	ContainerConfig saveImageConfigBody `json:"container_config"`
+}
+
+type saveImageConfigBody struct {
+	Hostname        string              `json:"Hostname"`
+	Domainname      string              `json:"Domainname"`
+	MacAddress      string              `json:"MacAddress"`
+	Env             []string            `json:"Env"`
+	Cmd             []string            `json:"Cmd"`
+	Entrypoint      []string            `json:"Entrypoint"`
+	WorkingDir      string              `json:"WorkingDir"`
+	User            string              `json:"User"`
+	AttachStdin     bool                `json:"AttachStdin"`
+	AttachStdout    bool                `json:"AttachStdout"`
+	AttachStderr    bool                `json:"AttachStderr"`
+	StopSignal      string              `json:"StopSignal"`
+	StopTimeout     *int                `json:"StopTimeout"`
+	Labels          map[string]string   `json:"Labels"`
+	ExposedPorts    map[string]struct{} `json:"ExposedPorts"`
+	Tty             bool                `json:"Tty"`
+	OpenStdin       bool                `json:"OpenStdin"`
+	StdinOnce       bool                `json:"StdinOnce"`
+	NetworkDisabled bool                `json:"NetworkDisabled"`
+	ArgsEscaped     bool                `json:"ArgsEscaped"`
+	Volumes         map[string]struct{} `json:"Volumes"`
+	OnBuild         []string            `json:"OnBuild"`
+	Shell           []string            `json:"Shell"`
+	Healthcheck     *struct {
+		Test        []string `json:"Test"`
+		Interval    int64    `json:"Interval"`
+		Timeout     int64    `json:"Timeout"`
+		StartPeriod int64    `json:"StartPeriod"`
+		Retries     int      `json:"Retries"`
+	} `json:"Healthcheck"`
 }
 
 // POST /images/load — Docker load. Accepts a tar body produced by
@@ -470,6 +537,8 @@ func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send 
 	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
 		return fmt.Errorf("parse image config: %w", err)
 	}
+	effective := effectiveSaveImageConfig(cfg)
+	createdAt := parseSavedImageCreated(cfg.Created)
 
 	for _, ref := range entry.RepoTags {
 		normRef := normalizeImageRef(ref)
@@ -479,21 +548,42 @@ func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send 
 			return fmt.Errorf("create dataset for %s: %w", normRef, err)
 		}
 		rec := &store.ImageRecord{
-			ID:              "loaded_" + oci.SafeDirName(normRef),
-			Ref:             normRef,
-			Arch:            orDefault(cfg.Architecture, "amd64"),
-			TemplateDataset: dataset,
-			Created:         time.Now(),
-			OCIEntrypoint:   append([]string{}, cfg.Config.Entrypoint...),
-			OCICmd:          append([]string{}, cfg.Config.Cmd...),
-			OCIEnv:          append([]string{}, cfg.Config.Env...),
-			OCIWorkingDir:   cfg.Config.WorkingDir,
-			OCIPorts:        mapKeys(cfg.Config.ExposedPorts),
-			OCILabels:       cfg.Config.Labels,
-			OCIUser:         cfg.Config.User,
-			OCIStopSignal:   cfg.Config.StopSignal,
+			ID:                 "loaded_" + oci.SafeDirName(normRef),
+			Ref:                normRef,
+			Arch:               orDefault(cfg.Architecture, "amd64"),
+			TemplateDataset:    dataset,
+			Created:            createdAt,
+			Release:            cfg.OSVersion,
+			OCIAuthor:          cfg.Author,
+			OCIComment:         cfg.Comment,
+			OCIContainer:       cfg.Container,
+			OCIDockerVersion:   cfg.DockerVersion,
+			OCIVariant:         cfg.Variant,
+			OCIHostname:        effective.Hostname,
+			OCIDomainname:      effective.Domainname,
+			OCIMacAddress:      effective.MacAddress,
+			OCIEntrypoint:      append([]string{}, effective.Entrypoint...),
+			OCICmd:             append([]string{}, effective.Cmd...),
+			OCIEnv:             append([]string{}, effective.Env...),
+			OCIWorkingDir:      effective.WorkingDir,
+			OCIPorts:           mapKeys(effective.ExposedPorts),
+			OCILabels:          copyLabels(effective.Labels),
+			OCIUser:            effective.User,
+			OCIAttachStdin:     effective.AttachStdin,
+			OCIAttachStdout:    effective.AttachStdout,
+			OCIAttachStderr:    effective.AttachStderr,
+			OCITty:             effective.Tty,
+			OCIOpenStdin:       effective.OpenStdin,
+			OCIStdinOnce:       effective.StdinOnce,
+			OCIArgsEscaped:     effective.ArgsEscaped,
+			OCINetworkDisabled: effective.NetworkDisabled,
+			OCIStopSignal:      effective.StopSignal,
+			OCIStopTimeout:     stopTimeoutValue(effective.StopTimeout),
+			OCIVolumes:         mapKeys(effective.Volumes),
+			OCIOnBuild:         append([]string{}, effective.OnBuild...),
+			OCIShell:           append([]string{}, effective.Shell...),
 		}
-		if hc := cfg.Config.Healthcheck; hc != nil && len(hc.Test) > 0 {
+		if hc := effective.Healthcheck; hc != nil && len(hc.Test) > 0 {
 			rec.OCIHealthcheck = &store.HealthcheckConfig{
 				Test:        append([]string{}, hc.Test...),
 				Interval:    hc.Interval,
@@ -548,7 +638,18 @@ func (h *Handler) createLoadedImageDataset(stage string, layers []string, ref st
 // loadImage before parsing the manifest — the archive/tar reader is
 // stream-only, so this materialises the bundle to disk.
 func extractBundleTar(body io.Reader, destDir string) error {
-	tr := tar.NewReader(body)
+	br := bufio.NewReader(body)
+	var tr *tar.Reader
+	if magic, err := br.Peek(2); err == nil && len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+		gz, err := gzip.NewReader(br)
+		if err != nil {
+			return err
+		}
+		defer gz.Close()
+		tr = tar.NewReader(gz)
+	} else {
+		tr = tar.NewReader(br)
+	}
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -604,4 +705,36 @@ func mapKeys(m map[string]struct{}) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func effectiveSaveImageConfig(cfg saveImageConfig) saveImageConfigBody {
+	if hasSaveImageConfigBody(cfg.Config) {
+		return cfg.Config
+	}
+	return cfg.ContainerConfig
+}
+
+func hasSaveImageConfigBody(cfg saveImageConfigBody) bool {
+	return len(cfg.Env) > 0 ||
+		len(cfg.Cmd) > 0 ||
+		len(cfg.Entrypoint) > 0 ||
+		cfg.WorkingDir != "" ||
+		cfg.User != "" ||
+		cfg.StopSignal != "" ||
+		len(cfg.Labels) > 0 ||
+		len(cfg.ExposedPorts) > 0 ||
+		len(cfg.Volumes) > 0 ||
+		cfg.Healthcheck != nil
+}
+
+func parseSavedImageCreated(raw string) time.Time {
+	if raw == "" {
+		return time.Now()
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if ts, err := time.Parse(layout, raw); err == nil {
+			return ts
+		}
+	}
+	return time.Now()
 }

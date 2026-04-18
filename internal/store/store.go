@@ -45,8 +45,12 @@ type ContainerRecord struct {
 	Hostname     string              `json:"hostname,omitempty"`
 	Domainname   string              `json:"domainname,omitempty"`
 	User         string              `json:"user,omitempty"`
+	AttachStdin  bool                `json:"attach_stdin,omitempty"`
+	AttachStdout bool                `json:"attach_stdout,omitempty"`
+	AttachStderr bool                `json:"attach_stderr,omitempty"`
 	Tty          bool                `json:"tty,omitempty"`
 	OpenStdin    bool                `json:"open_stdin,omitempty"`
+	StdinOnce    bool                `json:"stdin_once,omitempty"`
 	WorkingDir   string              `json:"working_dir,omitempty"`
 	StopSignal   string              `json:"stop_signal,omitempty"`
 	ExposedPorts map[string]struct{} `json:"exposed_ports,omitempty"`
@@ -123,12 +127,19 @@ type EndpointIPAMConfig struct {
 
 // NetworkRecord is a persisted user-defined network record.
 type NetworkRecord struct {
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	Driver    string            `json:"driver"`
-	Scope     string            `json:"scope"`
-	CreatedAt time.Time         `json:"created_at"`
-	Labels    map[string]string `json:"labels"`
+	ID         string            `json:"id"`
+	Name       string            `json:"name"`
+	Driver     string            `json:"driver"`
+	Scope      string            `json:"scope"`
+	CreatedAt  time.Time         `json:"created_at"`
+	Labels     map[string]string `json:"labels"`
+	Options    map[string]string `json:"options,omitempty"`
+	EnableIPv6 bool              `json:"enable_ipv6,omitempty"`
+	Internal   bool              `json:"internal,omitempty"`
+	Attachable bool              `json:"attachable,omitempty"`
+	IPAMDriver string            `json:"ipam_driver,omitempty"`
+	Subnet     string            `json:"subnet,omitempty"`
+	Gateway    string            `json:"gateway,omitempty"`
 }
 
 // PortBinding records a single host→container port mapping.
@@ -167,13 +178,31 @@ type ImageRecord struct {
 	OCICmd        []string          `json:"oci_cmd,omitempty"`
 	OCIEnv        []string          `json:"oci_env,omitempty"`
 	OCIWorkingDir string            `json:"oci_working_dir,omitempty"`
+	OCIHostname   string            `json:"oci_hostname,omitempty"`
+	OCIDomainname string            `json:"oci_domainname,omitempty"`
+	OCIMacAddress string            `json:"oci_mac_address,omitempty"`
 	OCIPorts      []string          `json:"oci_ports,omitempty"`
 	OCILabels     map[string]string `json:"oci_labels,omitempty"`
 	OCIUser       string            `json:"oci_user,omitempty"`
+	OCIAttachStdin bool             `json:"oci_attach_stdin,omitempty"`
+	OCIAttachStdout bool            `json:"oci_attach_stdout,omitempty"`
+	OCIAttachStderr bool            `json:"oci_attach_stderr,omitempty"`
+	OCITty        bool              `json:"oci_tty,omitempty"`
+	OCIOpenStdin  bool              `json:"oci_open_stdin,omitempty"`
+	OCIStdinOnce  bool              `json:"oci_stdin_once,omitempty"`
+	OCIArgsEscaped bool             `json:"oci_args_escaped,omitempty"`
+	OCINetworkDisabled bool         `json:"oci_network_disabled,omitempty"`
 	OCIStopSignal string            `json:"oci_stop_signal,omitempty"`
+	OCIStopTimeout int              `json:"oci_stop_timeout,omitempty"`
 	OCIHealthcheck *HealthcheckConfig `json:"oci_healthcheck,omitempty"`
 	OCIVolumes    []string          `json:"oci_volumes,omitempty"`
+	OCIOnBuild    []string          `json:"oci_onbuild,omitempty"`
 	OCIShell      []string          `json:"oci_shell,omitempty"`
+	OCIAuthor     string            `json:"oci_author,omitempty"`
+	OCIComment    string            `json:"oci_comment,omitempty"`
+	OCIContainer  string            `json:"oci_container,omitempty"`
+	OCIDockerVersion string         `json:"oci_docker_version,omitempty"`
+	OCIVariant    string            `json:"oci_variant,omitempty"`
 	TemplateDataset string           `json:"template_dataset,omitempty"`
 	// RepoDigest holds the image manifest digest ("sha256:...") when
 	// known. Populated by skopeo inspect after pull. Used to surface a

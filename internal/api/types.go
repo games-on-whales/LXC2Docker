@@ -62,9 +62,9 @@ type NetworkingConfig struct {
 type HostConfig struct {
 	// Mounts & storage
 	Binds          []string          `json:"Binds"` // "host:container[:ro]"
-	Mounts         []MountSpec       `json:"Mounts,omitempty"`
-	Tmpfs          map[string]string `json:"Tmpfs,omitempty"`
-	VolumesFrom    []string          `json:"VolumesFrom,omitempty"`
+	Mounts         []MountSpec       `json:"Mounts"`
+	Tmpfs          map[string]string `json:"Tmpfs"`
+	VolumesFrom    []string          `json:"VolumesFrom"`
 	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
 	ShmSize        int64             `json:"ShmSize"`
 	// Devices & capabilities
@@ -75,7 +75,7 @@ type HostConfig struct {
 	Privileged        bool              `json:"Privileged"`
 	SecurityOpt       []string          `json:"SecurityOpt"`
 	GroupAdd          []string          `json:"GroupAdd"`
-	Sysctls           map[string]string `json:"Sysctls,omitempty"`
+	Sysctls           map[string]string `json:"Sysctls"`
 	// Resource limits
 	Memory            int64  `json:"Memory"` // bytes, 0=unlimited
 	MemoryReservation int64  `json:"MemoryReservation"`
@@ -93,10 +93,10 @@ type HostConfig struct {
 	// Networking / DNS
 	NetworkMode     string                   `json:"NetworkMode"`
 	PortBindings    map[string][]PortBinding `json:"PortBindings"`
-	DNS             []string                 `json:"Dns,omitempty"`
-	DNSOptions      []string                 `json:"DnsOptions,omitempty"`
-	DNSSearch       []string                 `json:"DnsSearch,omitempty"`
-	ExtraHosts      []string                 `json:"ExtraHosts,omitempty"`
+	DNS             []string                 `json:"Dns"`
+	DNSOptions      []string                 `json:"DnsOptions"`
+	DNSSearch       []string                 `json:"DnsSearch"`
+	ExtraHosts      []string                 `json:"ExtraHosts"`
 	PublishAllPorts bool                     `json:"PublishAllPorts"`
 	// Namespaces
 	IpcMode      string `json:"IpcMode"`
@@ -110,9 +110,9 @@ type HostConfig struct {
 	Init          *bool         `json:"Init,omitempty"`
 	Runtime       string        `json:"Runtime"`
 	// Misc
-	Ulimits     []Ulimit          `json:"Ulimits,omitempty"`
-	LogConfig   *LogConfig        `json:"LogConfig,omitempty"`
-	Annotations map[string]string `json:"Annotations,omitempty"`
+	Ulimits     []Ulimit          `json:"Ulimits"`
+	LogConfig   *LogConfig        `json:"LogConfig"`
+	Annotations map[string]string `json:"Annotations"`
 }
 
 // MountSpec is the new-style mount declaration Portainer prefers over Binds.
@@ -260,6 +260,7 @@ type ContainerHealthEntry struct {
 type ContainerConfig struct {
 	Hostname     string              `json:"Hostname"`
 	Domainname   string              `json:"Domainname"`
+	MacAddress   string              `json:"MacAddress"`
 	User         string              `json:"User"`
 	AttachStdin  bool                `json:"AttachStdin"`
 	AttachStdout bool                `json:"AttachStdout"`
@@ -268,6 +269,8 @@ type ContainerConfig struct {
 	Tty          bool                `json:"Tty"`
 	OpenStdin    bool                `json:"OpenStdin"`
 	StdinOnce    bool                `json:"StdinOnce"`
+	NetworkDisabled bool             `json:"NetworkDisabled"`
+	ArgsEscaped  bool                `json:"ArgsEscaped"`
 	Image        string              `json:"Image"`
 	Volumes      map[string]struct{} `json:"Volumes"`
 	Cmd          []string            `json:"Cmd"`
@@ -275,6 +278,8 @@ type ContainerConfig struct {
 	Env          []string            `json:"Env"`
 	Labels       map[string]string   `json:"Labels"`
 	WorkingDir   string              `json:"WorkingDir"`
+	OnBuild      []string            `json:"OnBuild"`
+	Shell        []string            `json:"Shell"`
 	StopSignal   string              `json:"StopSignal,omitempty"`
 	StopTimeout  *int                `json:"StopTimeout,omitempty"`
 	Healthcheck  *Healthcheck        `json:"Healthcheck,omitempty"`
@@ -303,6 +308,7 @@ type VolumeCreateResponse struct {
 	CreatedAt  string            `json:"CreatedAt"`
 	Labels     map[string]string `json:"Labels"`
 	Options    map[string]string `json:"Options"`
+	Status     map[string]string `json:"Status"`
 	Scope      string            `json:"Scope"`
 }
 
@@ -314,6 +320,7 @@ type VolumeUsage struct {
 	CreatedAt  string            `json:"CreatedAt"`
 	Labels     map[string]string `json:"Labels"`
 	Options    map[string]string `json:"Options"`
+	Status     map[string]string `json:"Status"`
 	Scope      string            `json:"Scope"`
 	UsageData  VolumeUsageData   `json:"UsageData"`
 }
@@ -464,6 +471,15 @@ type ImageMetadata struct {
 	LastTagTime string `json:"LastTagTime"`
 }
 
+// ImageSearchResult is a compact entry from GET /images/search.
+type ImageSearchResult struct {
+	Description string `json:"description"`
+	IsAutomated bool   `json:"is_automated"`
+	IsOfficial  bool   `json:"is_official"`
+	Name        string `json:"name"`
+	StarCount   int    `json:"star_count"`
+}
+
 // --- Exec ---
 
 // ExecCreateRequest is the body of POST /containers/{id}/exec.
@@ -473,6 +489,7 @@ type ExecCreateRequest struct {
 	AttachStdout bool     `json:"AttachStdout"`
 	AttachStderr bool     `json:"AttachStderr"`
 	Tty          bool     `json:"Tty"`
+	DetachKeys   string   `json:"DetachKeys"`
 	Env          []string `json:"Env"`
 	WorkingDir   string   `json:"WorkingDir"`
 	User         string   `json:"User"`
@@ -510,6 +527,8 @@ type ExecProcessConfig struct {
 	Tty        bool     `json:"tty"`
 	Entrypoint string   `json:"entrypoint"`
 	Arguments  []string `json:"arguments"`
+	User       string   `json:"user"`
+	Privileged bool     `json:"privileged"`
 }
 
 // --- System ---
@@ -536,7 +555,7 @@ type VersionResponse struct {
 type VersionComponent struct {
 	Name    string            `json:"Name"`
 	Version string            `json:"Version"`
-	Details map[string]string `json:"Details,omitempty"`
+	Details map[string]string `json:"Details"`
 }
 
 // InfoResponse is a trimmed body for GET /info. It includes the fields
@@ -581,7 +600,7 @@ type InfoResponse struct {
 	SecurityOptions    []string          `json:"SecurityOptions"`
 	LoggingDriver      string            `json:"LoggingDriver"`
 	Warnings           []string          `json:"Warnings"`
-	ClientInfo         map[string]string `json:"ClientInfo,omitempty"`
+	ClientInfo         map[string]string `json:"ClientInfo"`
 }
 
 // RegistryConfig is the nested RegistryConfig object in /info.
@@ -612,6 +631,27 @@ type PluginsInfo struct {
 	Log           []string `json:"Log"`
 }
 
+// Plugin is a minimal Docker plugin summary. We currently expose no plugins,
+// but Portainer expects the route to exist and the response to be a list of
+// plugin-shaped objects rather than an arbitrary array.
+type Plugin struct {
+	ID         string   `json:"Id"`
+	Name       string   `json:"Name"`
+	Enabled    bool     `json:"Enabled"`
+	Settings   any      `json:"Settings,omitempty"`
+	PluginRef  string   `json:"PluginReference,omitempty"`
+	Config     any      `json:"Config,omitempty"`
+	Tags       []string `json:"Tags,omitempty"`
+	Privileges []any    `json:"Privileges,omitempty"`
+}
+
+// PluginPrivilege is the response element for GET /plugins/privileges.
+type PluginPrivilege struct {
+	Name        string   `json:"Name"`
+	Description string   `json:"Description"`
+	Value       []string `json:"Value"`
+}
+
 // ErrorResponse is the standard Docker API error body.
 type ErrorResponse struct {
 	Message string `json:"message"`
@@ -625,9 +665,15 @@ type execRecord struct {
 	ContainerID string
 	Cmd         []string
 	Tty         bool
+	DetachKeys  string
+	AttachStdin bool
+	AttachStdout bool
+	AttachStderr bool
 	Env         []string
 	WorkingDir  string
 	User        string
+	Privileged  bool
+	Pid         int
 	ExitCode    int
 	Running     bool
 	StartedAt   time.Time

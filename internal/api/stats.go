@@ -61,6 +61,7 @@ type memStats struct {
 	Usage    uint64            `json:"usage"`
 	MaxUsage uint64            `json:"max_usage"`
 	Limit    uint64            `json:"limit"`
+	Failcnt  uint64            `json:"failcnt"`
 	Stats    map[string]uint64 `json:"stats"`
 }
 
@@ -175,10 +176,11 @@ func (h *Handler) sampleStats(id, name string) dockerStats {
 	s.CPUStats.ThrottlingData.ThrottledTime = throttledTime
 
 	// Memory
-	usage, limit, memstats := readMemoryStats(cgPath)
+	usage, limit, maxUsage, failcnt, memstats := readMemoryStats(cgPath)
 	s.MemoryStats.Usage = usage
 	s.MemoryStats.Limit = limit
-	s.MemoryStats.MaxUsage = usage
+	s.MemoryStats.MaxUsage = maxUsage
+	s.MemoryStats.Failcnt = failcnt
 	s.MemoryStats.Stats = memstats
 
 	// Process count (cgroup v2 pids.current, v1 pids.current or tasks).
@@ -196,7 +198,112 @@ func (h *Handler) sampleStats(id, name string) dockerStats {
 	s.BlkioStats.IOServiceBytesRecursive = readBlkioServiceBytes(cgPath)
 	s.BlkioStats.IOServicedRecursive = readBlkioServiced(cgPath)
 
+	normalizeDockerStats(&s)
+
 	return s
+}
+
+func normalizeDockerStats(s *dockerStats) {
+	if s == nil {
+		return
+	}
+	if s.Networks == nil {
+		s.Networks = map[string]netStats{}
+	}
+	if s.StorageStats == nil {
+		s.StorageStats = map[string]any{}
+	}
+	if s.BlkioStats.IOServiceBytesRecursive == nil {
+		s.BlkioStats.IOServiceBytesRecursive = []any{}
+	}
+	if s.BlkioStats.IOServicedRecursive == nil {
+		s.BlkioStats.IOServicedRecursive = []any{}
+	}
+	normalizeCPUUsage(&s.CPUStats, int(s.CPUStats.OnlineCPUs))
+	normalizeCPUUsage(&s.PreCPUStats, int(s.PreCPUStats.OnlineCPUs))
+	normalizeMemoryStats(&s.MemoryStats)
+}
+
+func normalizeCPUUsage(stats *cpuStats, cpus int) {
+	if stats == nil {
+		return
+	}
+	if cpus <= 0 {
+		cpus = 1
+	}
+	if stats.OnlineCPUs == 0 {
+		stats.OnlineCPUs = uint32(cpus)
+	}
+	if stats.CPUUsage.PercpuUsage == nil {
+		stats.CPUUsage.PercpuUsage = make([]uint64, cpus)
+	}
+	if len(stats.CPUUsage.PercpuUsage) == 0 {
+		stats.CPUUsage.PercpuUsage = make([]uint64, cpus)
+	}
+	if len(stats.CPUUsage.PercpuUsage) != cpus {
+		filled := make([]uint64, cpus)
+		copy(filled, stats.CPUUsage.PercpuUsage)
+		stats.CPUUsage.PercpuUsage = filled
+	}
+	if stats.CPUUsage.TotalUsage > 0 {
+		perCPU := stats.CPUUsage.TotalUsage / uint64(cpus)
+		remainder := stats.CPUUsage.TotalUsage % uint64(cpus)
+		for i := range stats.CPUUsage.PercpuUsage {
+			if stats.CPUUsage.PercpuUsage[i] != 0 {
+				continue
+			}
+			stats.CPUUsage.PercpuUsage[i] = perCPU
+			if remainder > 0 {
+				stats.CPUUsage.PercpuUsage[i]++
+				remainder--
+			}
+		}
+	}
+}
+
+func normalizeMemoryStats(ms *memStats) {
+	if ms == nil {
+		return
+	}
+	if ms.Stats == nil {
+		ms.Stats = map[string]uint64{}
+	}
+	setStatDefault(ms.Stats, "cache", firstNonZero(ms.Stats["cache"], ms.Stats["file"]))
+	setStatDefault(ms.Stats, "total_cache", ms.Stats["cache"])
+	setStatDefault(ms.Stats, "active_file", ms.Stats["active_file"])
+	setStatDefault(ms.Stats, "total_active_file", ms.Stats["active_file"])
+	setStatDefault(ms.Stats, "inactive_file", ms.Stats["inactive_file"])
+	setStatDefault(ms.Stats, "total_inactive_file", ms.Stats["inactive_file"])
+	setStatDefault(ms.Stats, "rss", firstNonZero(ms.Stats["rss"], ms.Stats["anon"]))
+	setStatDefault(ms.Stats, "total_rss", ms.Stats["rss"])
+	setStatDefault(ms.Stats, "pgfault", ms.Stats["pgfault"])
+	setStatDefault(ms.Stats, "total_pgfault", ms.Stats["pgfault"])
+	setStatDefault(ms.Stats, "pgmajfault", ms.Stats["pgmajfault"])
+	setStatDefault(ms.Stats, "total_pgmajfault", ms.Stats["pgmajfault"])
+	setStatDefault(ms.Stats, "mapped_file", ms.Stats["mapped_file"])
+	setStatDefault(ms.Stats, "total_mapped_file", ms.Stats["mapped_file"])
+	setStatDefault(ms.Stats, "writeback", ms.Stats["writeback"])
+	setStatDefault(ms.Stats, "total_writeback", ms.Stats["writeback"])
+	setStatDefault(ms.Stats, "unevictable", ms.Stats["unevictable"])
+	setStatDefault(ms.Stats, "total_unevictable", ms.Stats["unevictable"])
+	setStatDefault(ms.Stats, "hierarchical_memory_limit", ms.Limit)
+	setStatDefault(ms.Stats, "hierarchical_memsw_limit", ms.Limit)
+}
+
+func setStatDefault(stats map[string]uint64, key string, value uint64) {
+	if _, ok := stats[key]; ok {
+		return
+	}
+	stats[key] = value
+}
+
+func firstNonZero(vals ...uint64) uint64 {
+	for _, v := range vals {
+		if v != 0 {
+			return v
+		}
+	}
+	return 0
 }
 
 // readBlkioServiceBytes parses cgroup v2's io.stat (preferred) or the
@@ -522,7 +629,7 @@ func readSystemCPUNanos() uint64 {
 }
 
 // readMemoryStats returns usage, limit, and a detail map from the cgroup.
-func readMemoryStats(cg string) (usage, limit uint64, stats map[string]uint64) {
+func readMemoryStats(cg string) (usage, limit, maxUsage, failcnt uint64, stats map[string]uint64) {
 	stats = map[string]uint64{}
 	if cg == "" {
 		return
@@ -539,6 +646,20 @@ func readMemoryStats(cg string) (usage, limit uint64, stats map[string]uint64) {
 			limit, _ = strconv.ParseUint(s, 10, 64)
 		}
 	}
+	if data, err := os.ReadFile(filepath.Join(cg, "memory.peak")); err == nil {
+		maxUsage, _ = strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	}
+	if data, err := os.ReadFile(filepath.Join(cg, "memory.events")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) != 2 {
+				continue
+			}
+			if fields[0] == "max" {
+				failcnt, _ = strconv.ParseUint(fields[1], 10, 64)
+			}
+		}
+	}
 	// v1 fallback
 	if usage == 0 {
 		if data, err := os.ReadFile(filepath.Join(cg, "memory.usage_in_bytes")); err == nil {
@@ -548,6 +669,16 @@ func readMemoryStats(cg string) (usage, limit uint64, stats map[string]uint64) {
 	if limit == 0 {
 		if data, err := os.ReadFile(filepath.Join(cg, "memory.limit_in_bytes")); err == nil {
 			limit, _ = strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+		}
+	}
+	if maxUsage == 0 {
+		if data, err := os.ReadFile(filepath.Join(cg, "memory.max_usage_in_bytes")); err == nil {
+			maxUsage, _ = strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+		}
+	}
+	if failcnt == 0 {
+		if data, err := os.ReadFile(filepath.Join(cg, "memory.failcnt")); err == nil {
+			failcnt, _ = strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 		}
 	}
 	// memory.stat is the same on v1 and v2 (k/v lines).
@@ -566,6 +697,9 @@ func readMemoryStats(cg string) (usage, limit uint64, stats map[string]uint64) {
 	// doesn't render a nonsense percentage.
 	if limit > physicalMemory()*2 || limit == 0 {
 		limit = physicalMemory()
+	}
+	if maxUsage == 0 || maxUsage < usage {
+		maxUsage = usage
 	}
 	return
 }

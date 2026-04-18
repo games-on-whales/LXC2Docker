@@ -17,9 +17,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/image"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/image"
+	"github.com/games-on-whales/LXC2Docker/internal/lxc"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
 
@@ -285,6 +285,18 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	// the client posted, including fields the LXC runtime doesn't honor.
 	rawHC, _ := json.Marshal(req.HostConfig)
 
+	if req.NetworkingConfig != nil {
+		for name := range req.NetworkingConfig.EndpointsConfig {
+			if name == "gow" {
+				continue
+			}
+			if h.store.GetNetwork(name) == nil {
+				errResponse(w, http.StatusBadRequest, fmt.Sprintf("network %q not found", name))
+				return
+			}
+		}
+	}
+
 	// Persist record before creating so the IP is allocated.
 	rec := &store.ContainerRecord{
 		ID:              id,
@@ -299,8 +311,12 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Hostname:        req.Hostname,
 		Domainname:      req.Domainname,
 		User:            req.User,
+		AttachStdin:     req.AttachStdin,
+		AttachStdout:    req.AttachStdout,
+		AttachStderr:    req.AttachStderr,
 		Tty:             req.Tty,
 		OpenStdin:       req.OpenStdin,
+		StdinOnce:       req.StdinOnce,
 		WorkingDir:      workingDir,
 		StopSignal:      req.StopSignal,
 		ExposedPorts:    req.ExposedPorts,
@@ -358,6 +374,21 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("createContainer: success %s", id[:12])
+
+	if rec := h.store.GetContainer(id); rec != nil {
+		if req.NetworkingConfig != nil {
+			if err := attachRequestedNetworks(h.store, rec, *req.NetworkingConfig); err != nil {
+				errResponse(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		} else if len(rec.Networks) == 0 {
+			rec.Networks = defaultContainerNetworks(rec)
+		}
+		if err := h.store.AddContainer(rec); err != nil {
+			errResponse(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 
 	h.emitContainer("create", h.store.GetContainer(id))
 
@@ -535,25 +566,26 @@ func networkModeFor(rec *store.ContainerRecord) string {
 	if rec.Labels["gow.lan"] == "true" {
 		return "lan"
 	}
+	if len(rec.Networks) > 0 {
+		names := make([]string, 0, len(rec.Networks))
+		for name := range rec.Networks {
+			if name == "gow" {
+				continue
+			}
+			names = append(names, name)
+		}
+		if len(names) > 0 {
+			sort.Strings(names)
+			return names[0]
+		}
+	}
 	return "gow"
 }
 
 // networkSettingsFor builds the per-network endpoint map for a container.
 // One entry per attached network ("gow" is the daemon's managed bridge).
 func networkSettingsFor(rec *store.ContainerRecord) map[string]EndpointSettings {
-	if rec.IPAddress == "" {
-		return map[string]EndpointSettings{}
-	}
-	return map[string]EndpointSettings{
-		"gow": {
-			NetworkID:   "gow",
-			EndpointID:  rec.ID,
-			Gateway:     lxc.BridgeGW,
-			IPAddress:   rec.IPAddress,
-			IPPrefixLen: 24,
-			Aliases:     []string{rec.Name},
-		},
-	}
+	return buildContainerEndpoints(rec)
 }
 
 // GET /containers/{id}/json
@@ -664,12 +696,16 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		},
 		Image:  rec.Image,
 		Mounts: mounts,
-		Config: &ContainerConfig{
+		Config: normalizeContainerConfig(&ContainerConfig{
 			Hostname:     hostname,
 			Domainname:   rec.Domainname,
 			User:         rec.User,
+			AttachStdin:  rec.AttachStdin,
+			AttachStdout: rec.AttachStdout,
+			AttachStderr: rec.AttachStderr,
 			Tty:          rec.Tty,
 			OpenStdin:    rec.OpenStdin,
+			StdinOnce:    rec.StdinOnce,
 			ExposedPorts: h.exposedPortsFor(rec),
 			Image:        rec.Image,
 			Volumes:      ensureStructMap(rec.Volumes),
@@ -681,7 +717,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			StopSignal:   rec.StopSignal,
 			StopTimeout:  stopTimeoutPtr(rec.StopTimeout),
 			Healthcheck:  healthcheckFrom(rec),
-		},
+		}),
 		HostConfig: buildHostConfig(rec),
 		NetworkSettings: NetworkSettings{
 			Bridge:      lxc.BridgeName,
@@ -866,7 +902,7 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 		switch condition {
 		case "removed":
 			if h.store.GetContainer(id) == nil {
-				jsonResponse(w, http.StatusOK, map[string]any{"StatusCode": 0, "Error": nil})
+				jsonResponse(w, http.StatusOK, waitContainerResponse(nil))
 				return
 			}
 		case "next-exit":
@@ -875,16 +911,27 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 				wasRunning = true
 			}
 			if wasRunning && state != "running" {
-				jsonResponse(w, http.StatusOK, map[string]any{"StatusCode": 0, "Error": nil})
+				jsonResponse(w, http.StatusOK, waitContainerResponse(h.store.GetContainer(id)))
 				return
 			}
 		default:
 			state, _ := h.mgr.State(id)
 			if state != "running" {
-				jsonResponse(w, http.StatusOK, map[string]any{"StatusCode": 0, "Error": nil})
+				jsonResponse(w, http.StatusOK, waitContainerResponse(h.store.GetContainer(id)))
 				return
 			}
 		}
+	}
+}
+
+func waitContainerResponse(rec *store.ContainerRecord) map[string]any {
+	statusCode := 0
+	if rec != nil {
+		statusCode = rec.ExitCode
+	}
+	return map[string]any{
+		"StatusCode": statusCode,
+		"Error":      nil,
 	}
 }
 
@@ -1592,15 +1639,11 @@ func (h *Handler) getArchive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Docker CLI requires X-Docker-Container-Path-Stat header.
-	stat := map[string]any{
-		"name":       info.Name(),
-		"size":       info.Size(),
-		"mode":       info.Mode(),
-		"mtime":      info.ModTime().Format(time.RFC3339),
-		"linkTarget": "",
+	w.Header().Set("X-Docker-Container-Path-Stat", archivePathStatHeader(info))
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
 	}
-	statJSON, _ := json.Marshal(stat)
-	w.Header().Set("X-Docker-Container-Path-Stat", base64.StdEncoding.EncodeToString(statJSON))
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.WriteHeader(http.StatusOK)
 	tw := tar.NewWriter(w)
@@ -1608,9 +1651,10 @@ func (h *Handler) getArchive(w http.ResponseWriter, r *http.Request) {
 
 	if !info.IsDir() {
 		tw.WriteHeader(&tar.Header{
-			Name: filepath.Base(srcPath),
-			Size: info.Size(),
-			Mode: int64(info.Mode()),
+			Name:    archiveBaseName(srcPath, info),
+			Size:    info.Size(),
+			Mode:    int64(info.Mode()),
+			ModTime: info.ModTime(),
 		})
 		f, err := os.Open(src)
 		if err != nil {
@@ -1635,7 +1679,11 @@ func (h *Handler) getArchive(w http.ResponseWriter, r *http.Request) {
 		}
 		rel, _ := filepath.Rel(src, path)
 		hdr, _ := tar.FileInfoHeader(fi, "")
-		hdr.Name = rel
+		if rel == "." {
+			hdr.Name = archiveBaseName(srcPath, info)
+		} else {
+			hdr.Name = filepath.Join(archiveBaseName(srcPath, info), rel)
+		}
 		tw.WriteHeader(hdr)
 		if !d.IsDir() {
 			f, err := os.Open(path)
@@ -1647,6 +1695,25 @@ func (h *Handler) getArchive(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	})
+}
+
+func archiveBaseName(srcPath string, info os.FileInfo) string {
+	clean := filepath.Clean("/" + srcPath)
+	if clean == string(os.PathSeparator) {
+		return info.Name()
+	}
+	return filepath.Base(clean)
+}
+
+func archivePathStatHeader(info os.FileInfo) string {
+	statJSON, _ := json.Marshal(map[string]any{
+		"name":       info.Name(),
+		"size":       info.Size(),
+		"mode":       uint32(info.Mode()),
+		"mtime":      info.ModTime().Format(time.RFC3339Nano),
+		"linkTarget": "",
+	})
+	return base64.StdEncoding.EncodeToString(statJSON)
 }
 
 // writeLogFrame writes a single Docker multiplexed stream frame.
@@ -1759,6 +1826,15 @@ func normalizeHostConfig(hc *HostConfig) {
 	if hc.Binds == nil {
 		hc.Binds = []string{}
 	}
+	if hc.Mounts == nil {
+		hc.Mounts = []MountSpec{}
+	}
+	if hc.Tmpfs == nil {
+		hc.Tmpfs = map[string]string{}
+	}
+	if hc.VolumesFrom == nil {
+		hc.VolumesFrom = []string{}
+	}
 	if hc.Devices == nil {
 		hc.Devices = []DeviceMapping{}
 	}
@@ -1777,9 +1853,48 @@ func normalizeHostConfig(hc *HostConfig) {
 	if hc.GroupAdd == nil {
 		hc.GroupAdd = []string{}
 	}
+	if hc.Sysctls == nil {
+		hc.Sysctls = map[string]string{}
+	}
 	if hc.PortBindings == nil {
 		hc.PortBindings = map[string][]PortBinding{}
 	}
+	if hc.DNS == nil {
+		hc.DNS = []string{}
+	}
+	if hc.DNSOptions == nil {
+		hc.DNSOptions = []string{}
+	}
+	if hc.DNSSearch == nil {
+		hc.DNSSearch = []string{}
+	}
+	if hc.ExtraHosts == nil {
+		hc.ExtraHosts = []string{}
+	}
+	if hc.Ulimits == nil {
+		hc.Ulimits = []Ulimit{}
+	}
+	if hc.LogConfig == nil {
+		hc.LogConfig = &LogConfig{Type: "json-file", Config: map[string]string{}}
+	} else if hc.LogConfig.Config == nil {
+		hc.LogConfig.Config = map[string]string{}
+	}
+	if hc.Annotations == nil {
+		hc.Annotations = map[string]string{}
+	}
+}
+
+func normalizeContainerConfig(cfg *ContainerConfig) *ContainerConfig {
+	if cfg == nil {
+		return nil
+	}
+	cfg.ExposedPorts = ensureStructMap(cfg.ExposedPorts)
+	cfg.Volumes = ensureStructMap(cfg.Volumes)
+	cfg.Cmd = ensureSlice(cfg.Cmd)
+	cfg.Entrypoint = ensureSlice(cfg.Entrypoint)
+	cfg.Env = ensureSlice(cfg.Env)
+	cfg.Labels = ensureMap(cfg.Labels)
+	return cfg
 }
 
 func (h *Handler) exposedPortsFor(rec *store.ContainerRecord) map[string]struct{} {
@@ -1900,7 +2015,22 @@ func containerExposes(exposed map[string]struct{}, wants []string) bool {
 }
 
 func containerOnNetwork(rec *store.ContainerRecord, names []string) bool {
-	attached := map[string]bool{networkModeFor(rec): true, "gow": true}
+	attached := map[string]bool{}
+	for _, name := range names {
+		attached[name] = false
+	}
+	networks := rec.Networks
+	if len(networks) == 0 {
+		networks = defaultContainerNetworks(rec)
+	}
+	for name, ep := range networks {
+		attached[name] = true
+		if ep.NetworkID != "" {
+			attached[ep.NetworkID] = true
+		}
+	}
+	attached[networkModeFor(rec)] = true
+	attached["gow"] = true
 	for _, want := range names {
 		if attached[want] {
 			return true

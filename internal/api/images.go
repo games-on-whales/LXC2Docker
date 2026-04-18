@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/oci"
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/lxc"
+	"github.com/games-on-whales/LXC2Docker/internal/oci"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
 
@@ -230,6 +230,91 @@ func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// GET /images/search
+func (h *Handler) searchImages(w http.ResponseWriter, r *http.Request) {
+	rawTerm := strings.TrimSpace(r.URL.Query().Get("term"))
+	term := strings.ToLower(rawTerm)
+	if term == "" {
+		errResponse(w, http.StatusBadRequest, "term query parameter is required")
+		return
+	}
+
+	limit := 25
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			errResponse(w, http.StatusBadRequest, "invalid limit parameter")
+			return
+		}
+		limit = n
+	}
+
+	seen := map[string]ImageSearchResult{}
+	for _, rec := range h.store.ListImages() {
+		name := shortenImageRef(normalizeImageRef(rec.Ref))
+		cname := strings.ToLower(name)
+		if !strings.Contains(cname, term) {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = ImageSearchResult{
+			Name:        name,
+			Description: "",
+			StarCount:   0,
+			IsOfficial:  false,
+			IsAutomated: false,
+		}
+	}
+
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	results := make([]ImageSearchResult, 0, len(names))
+	for _, name := range names {
+		if limit == 0 {
+			break
+		}
+		results = append(results, seen[name])
+		if limit > 0 {
+			limit--
+		}
+	}
+	if len(results) == 0 {
+		if synthetic := syntheticImageSearchName(rawTerm); synthetic != "" {
+			results = append(results, ImageSearchResult{
+				Name:        synthetic,
+				Description: "Pullable image reference",
+				StarCount:   0,
+				IsOfficial:  false,
+				IsAutomated: false,
+			})
+		}
+	}
+
+	jsonResponse(w, http.StatusOK, results)
+}
+
+func syntheticImageSearchName(term string) string {
+	name := shortenImageRef(strings.TrimSpace(strings.ToLower(term)))
+	if name == "" {
+		return ""
+	}
+	if digest := strings.IndexByte(name, '@'); digest >= 0 {
+		name = name[:digest]
+	}
+	lastSlash := strings.LastIndexByte(name, '/')
+	lastColon := strings.LastIndexByte(name, ':')
+	if lastColon > lastSlash {
+		name = name[:lastColon]
+	}
+	return strings.TrimSpace(name)
+}
+
 // decodeRegistryAuth parses Docker's X-Registry-Auth header, a base64url JSON
 // object. When the header is empty or malformed we return "" — skopeo then
 // does an anonymous pull, which matches the behavior before credentials
@@ -285,7 +370,7 @@ func decodeRegistryAuth(header string) string {
 // image present?" check. We skip body writes when the request is HEAD but
 // otherwise return the identical payload.
 func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
-	name := mux.Vars(r)["name"]
+	name := imageNameFromRequest(r)
 	rec := h.store.GetImage(normalizeImageRef(name))
 	if rec == nil {
 		rec = h.findImageByID(name)
@@ -306,23 +391,17 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 	if labels == nil {
 		labels = map[string]string{}
 	}
-	cfg := &ContainerConfig{
-		Env:        rec.OCIEnv,
-		Cmd:        rec.OCICmd,
-		Entrypoint: rec.OCIEntrypoint,
-		WorkingDir: rec.OCIWorkingDir,
-		Labels:     labels,
-	}
-	if cfg.Env == nil {
-		cfg.Env = []string{}
-	}
+	cfg := imageConfigFromRecord(rec)
 
 	resp := ImageInspect{
 		ID:              "sha256:" + rec.ID,
 		RepoTags:        []string{rec.Ref},
 		RepoDigests:     digestRefs(rec),
+		Comment:         rec.OCIComment,
 		Created:         rec.Created.Format(time.RFC3339),
+		Container:       rec.OCIContainer,
 		Architecture:    rec.Arch,
+		Variant:         rec.OCIVariant,
 		Os:              "linux",
 		OsVersion:       rec.Release,
 		Size:            imageSize(h.mgr.LXCPath(), rec),
@@ -341,8 +420,8 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 			LastTagTime: rec.Created.Format(time.RFC3339),
 		},
 		Labels:        labels,
-		Author:        "docker-lxc-daemon",
-		DockerVersion: "24.0.0-lxc",
+		Author:        orDefault(rec.OCIAuthor, "docker-lxc-daemon"),
+		DockerVersion: orDefault(rec.OCIDockerVersion, "24.0.0-lxc"),
 	}
 
 	if r.Method == http.MethodHead {
@@ -353,6 +432,85 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusOK, resp)
+}
+
+func imageNameFromRequest(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if name := mux.Vars(r)["name"]; name != "" {
+		return name
+	}
+	path := strings.Trim(strings.TrimSpace(r.URL.Path), "/")
+	if path == "" {
+		return ""
+	}
+	parts := strings.Split(path, "/")
+	for idx := 0; idx < len(parts); idx++ {
+		if parts[idx] != "images" || idx+2 >= len(parts) || parts[len(parts)-1] != "json" {
+			continue
+		}
+		return strings.Join(parts[idx+1:len(parts)-1], "/")
+	}
+	return ""
+}
+
+func imageConfigFromRecord(rec *store.ImageRecord) *ContainerConfig {
+	if rec == nil {
+		return normalizeContainerConfig(&ContainerConfig{})
+	}
+	volumes := map[string]struct{}{}
+	for _, v := range rec.OCIVolumes {
+		if v != "" {
+			volumes[v] = struct{}{}
+		}
+	}
+	exposed := map[string]struct{}{}
+	for _, p := range rec.OCIPorts {
+		if p != "" {
+			exposed[p] = struct{}{}
+		}
+	}
+	return normalizeContainerConfig(&ContainerConfig{
+		Hostname:        rec.OCIHostname,
+		Domainname:      rec.OCIDomainname,
+		MacAddress:      rec.OCIMacAddress,
+		User:            rec.OCIUser,
+		AttachStdin:     rec.OCIAttachStdin,
+		AttachStdout:    rec.OCIAttachStdout,
+		AttachStderr:    rec.OCIAttachStderr,
+		ExposedPorts:    exposed,
+		Tty:             rec.OCITty,
+		OpenStdin:       rec.OCIOpenStdin,
+		StdinOnce:       rec.OCIStdinOnce,
+		NetworkDisabled: rec.OCINetworkDisabled,
+		ArgsEscaped:     rec.OCIArgsEscaped,
+		Volumes:         volumes,
+		Cmd:             rec.OCICmd,
+		Entrypoint:      rec.OCIEntrypoint,
+		Env:             rec.OCIEnv,
+		Labels:          ensureMap(rec.OCILabels),
+		WorkingDir:      rec.OCIWorkingDir,
+		OnBuild:         append([]string{}, rec.OCIOnBuild...),
+		Shell:           append([]string{}, rec.OCIShell...),
+		StopSignal:      rec.OCIStopSignal,
+		StopTimeout:     stopTimeoutPtr(rec.OCIStopTimeout),
+		Healthcheck:     healthcheckFromImage(rec),
+	})
+}
+
+func healthcheckFromImage(rec *store.ImageRecord) *Healthcheck {
+	if rec == nil || rec.OCIHealthcheck == nil {
+		return nil
+	}
+	hc := rec.OCIHealthcheck
+	return &Healthcheck{
+		Test:        append([]string{}, hc.Test...),
+		Interval:    hc.Interval,
+		Timeout:     hc.Timeout,
+		Retries:     hc.Retries,
+		StartPeriod: hc.StartPeriod,
+	}
 }
 
 // DELETE /images/{name}  (docker rmi)

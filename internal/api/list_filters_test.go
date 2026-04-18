@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 )
 
 func TestParseListFiltersSliceAndMapForm(t *testing.T) {
@@ -116,17 +116,17 @@ func TestMatchesVolumeFilters(t *testing.T) {
 		Labels: map[string]string{"project": "demo"},
 	}
 	if !matchesVolumeFilters(volume, 1, listFilters{
-		"driver":  []string{"local"},
-		"name":    []string{"dbdata"},
-		"label":   []string{"project=demo"},
+		"driver":   []string{"local"},
+		"name":     []string{"dbdata"},
+		"label":    []string{"project=demo"},
 		"dangling": []string{"false"},
 	}) {
 		t.Fatal("expected matching non-dangling volume")
 	}
 	if matchesVolumeFilters(volume, 1, listFilters{
-		"driver":  []string{"local"},
-		"name":    []string{"dbdata"},
-		"label":   []string{"project=demo"},
+		"driver":   []string{"local"},
+		"name":     []string{"dbdata"},
+		"label":    []string{"project=demo"},
 		"dangling": []string{"true"},
 	}) {
 		t.Fatal("expected dangling filter mismatch")

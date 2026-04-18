@@ -1,4 +1,4 @@
-module github.com/games-on-whales/docker-lxc-daemon
+module github.com/games-on-whales/LXC2Docker
 
 go 1.21
 

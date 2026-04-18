@@ -2,11 +2,12 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
 
@@ -42,7 +43,7 @@ func (h *Handler) listVolumes(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
 	var req VolumeCreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
 		errResponse(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -59,8 +60,8 @@ func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v.Driver = orDefault(req.Driver, "local")
-	v.Labels = req.Labels
-	v.Options = req.DriverOpts
+	v.Labels = normalizeStringMap(req.Labels)
+	v.Options = normalizeStringMap(req.DriverOpts)
 	if err := h.store.AddVolume(v); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -156,8 +157,9 @@ func volumeCreateResponse(v *store.VolumeRecord) VolumeCreateResponse {
 		Driver:     orDefault(v.Driver, "local"),
 		Mountpoint: v.Mountpoint,
 		CreatedAt:  v.CreatedAt.Format(time.RFC3339),
-		Labels:     v.Labels,
-		Options:    v.Options,
+		Labels:     normalizeStringMap(v.Labels),
+		Options:    normalizeStringMap(v.Options),
+		Status:     map[string]string{},
 		Scope:      "local",
 	}
 }
@@ -177,12 +179,20 @@ func volumeUsage(st *store.Store, v *store.VolumeRecord, size int64) VolumeUsage
 		Driver:     orDefault(v.Driver, "local"),
 		Mountpoint: v.Mountpoint,
 		CreatedAt:  v.CreatedAt.Format(time.RFC3339),
-		Labels:     v.Labels,
-		Options:    v.Options,
+		Labels:     normalizeStringMap(v.Labels),
+		Options:    normalizeStringMap(v.Options),
+		Status:     map[string]string{},
 		Scope:      "local",
 		UsageData: VolumeUsageData{
 			RefCount: refCount,
 			Size:     size,
 		},
 	}
+}
+
+func normalizeStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return map[string]string{}
+	}
+	return in
 }
