@@ -44,11 +44,18 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Auto-pull if image not present.
+	// Auto-pull if image not present. Portainer's deploy flow POSTs
+	// /containers/create with an image that hasn't been pulled yet; when
+	// the registry is private the user's credentials arrive in
+	// X-Registry-Auth on this request (same decoder as /images/create).
 	if rec := h.store.GetImage(normalizeImageRef(req.Image)); rec == nil {
-		if err := h.mgr.PullImage(req.Image, "amd64", func(_ string) {}); err != nil {
+		creds := decodeRegistryAuth(r.Header.Get("X-Registry-Auth"))
+		pullErr := h.mgr.PullImageWith(req.Image, "amd64", lxc.PullOpts{
+			Credentials: creds,
+		})
+		if pullErr != nil {
 			errResponse(w, http.StatusNotFound,
-				fmt.Sprintf("No such image: %s — and pull failed: %s", req.Image, err))
+				fmt.Sprintf("No such image: %s — and pull failed: %s", req.Image, pullErr))
 			return
 		}
 	}
@@ -462,6 +469,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		ResolvConfPath: "",
 		HostnamePath:   "",
 		LogPath:        h.mgr.LogPath(id),
+		RestartCount:   rec.RestartCount,
 		Driver:         "lxc",
 		Platform:       "linux",
 		GraphDriver: GraphDriver{
@@ -535,28 +543,16 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		h.store.AddContainer(rec)
 	}
 
-	// Record first-start timestamp so inspect can distinguish "created" from
-	// "exited", clear the user-stopped flag so the restart watcher enforces
+	// Refresh StartedAt (Docker updates it on every start, not just the
+	// first), clear the user-stopped flag so the restart watcher enforces
 	// the policy again on subsequent exits, and clear FinishedAt now that
 	// the container is running again.
 	if rec := h.store.GetContainer(id); rec != nil {
-		changed := false
-		if rec.StartedAt == nil {
-			now := time.Now()
-			rec.StartedAt = &now
-			changed = true
-		}
-		if rec.StoppedByUser {
-			rec.StoppedByUser = false
-			changed = true
-		}
-		if rec.FinishedAt != nil {
-			rec.FinishedAt = nil
-			changed = true
-		}
-		if changed {
-			h.store.AddContainer(rec)
-		}
+		now := time.Now()
+		rec.StartedAt = &now
+		rec.StoppedByUser = false
+		rec.FinishedAt = nil
+		h.store.AddContainer(rec)
 	}
 
 	// Set up port forwarding rules after successful start.
@@ -759,18 +755,26 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	// Backfill phase. When tail is set we collect the last N lines into a
 	// ring buffer instead of streaming everything — the default Portainer
 	// log view requests tail=100 and otherwise the UI would download the
-	// full console log for every open.
-	if tail == 0 {
-		// tail=0 means no backfill, only follow.
-	} else {
-		lines, err := readTail(f, tail)
-		if err == nil {
-			for _, line := range lines {
-				if !inWindow() {
-					continue
-				}
-				emit(line)
+	// full console log for every open. If the live log was recently
+	// rotated we may need to pull older lines from <log>.1 to satisfy the
+	// request; otherwise tail=100 returns mostly-empty output right after
+	// a rotation.
+	if tail != 0 {
+		var lines [][]byte
+		liveLines, _ := readTail(f, tail)
+		// Rotation preserves the previous tail as <log>.1. Read it when
+		// the live file doesn't cover the requested window.
+		if tail < 0 || len(liveLines) < tail {
+			if older, err := readRotatedTail(logPath+".1", tail-len(liveLines)); err == nil {
+				lines = append(lines, older...)
 			}
+		}
+		lines = append(lines, liveLines...)
+		for _, line := range lines {
+			if !inWindow() {
+				continue
+			}
+			emit(line)
 		}
 	}
 
@@ -838,6 +842,21 @@ func parseUnixTS(v string) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(ts, 0)
+}
+
+// readRotatedTail opens a rotated log file (<log>.1) and returns up to n
+// trailing lines. Missing file is not an error — rotation is lazy, so the
+// rotated file is often absent. n < 0 requests all lines.
+func readRotatedTail(path string, n int) ([][]byte, error) {
+	if n == 0 {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil // missing is fine
+	}
+	defer f.Close()
+	return readTail(f, n)
 }
 
 // readTail returns up to n trailing lines of f. n < 0 returns all lines. The

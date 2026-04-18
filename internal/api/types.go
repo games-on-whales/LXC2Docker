@@ -554,6 +554,8 @@ type execRecord struct {
 	Cmd         []string
 	Tty         bool
 	Env         []string
+	WorkingDir  string
+	User        string
 	ExitCode    int
 	Running     bool
 	StartedAt   time.Time

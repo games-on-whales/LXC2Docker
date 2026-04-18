@@ -166,6 +166,10 @@ func (h *Handler) sampleStats(id, name string) dockerStats {
 	s.CPUStats.CPUUsage.UsageInUsermode = user
 	s.CPUStats.CPUUsage.UsageInKernelmode = sys
 	s.CPUStats.SystemCPUUsage = readSystemCPUNanos()
+	periods, throttled, throttledTime := readThrottling(cgPath)
+	s.CPUStats.ThrottlingData.Periods = periods
+	s.CPUStats.ThrottlingData.ThrottledPeriods = throttled
+	s.CPUStats.ThrottlingData.ThrottledTime = throttledTime
 
 	// Memory
 	usage, limit, memstats := readMemoryStats(cgPath)
@@ -397,7 +401,7 @@ func readCPUStats(cg string) (total, user, sys uint64) {
 		}
 		return
 	}
-	// v1
+	// v1 fallback.
 	if data, err := os.ReadFile(filepath.Join(cg, "cpuacct.usage")); err == nil {
 		total, _ = strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 	}
@@ -416,6 +420,39 @@ func readCPUStats(cg string) (total, user, sys uint64) {
 			case "system":
 				sys = v * 10_000_000
 			}
+		}
+	}
+	return
+}
+
+// readThrottling pulls CFS throttling numbers from cpu.stat. cgroup v2
+// reports nr_periods / nr_throttled / throttled_usec; v1 uses throttled_time
+// (ns). Docker emits them via ThrottlingData; Portainer's stats chart draws
+// a separate line for throttled-time when non-zero, which is the main signal
+// that a container's CPU quota is tight.
+func readThrottling(cg string) (periods, throttled, throttledTime uint64) {
+	if cg == "" {
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(cg, "cpu.stat"))
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		v, _ := strconv.ParseUint(fields[1], 10, 64)
+		switch fields[0] {
+		case "nr_periods":
+			periods = v
+		case "nr_throttled":
+			throttled = v
+		case "throttled_usec":
+			throttledTime = v * 1000 // to ns
+		case "throttled_time":
+			throttledTime = v // v1 is already in ns
 		}
 	}
 	return

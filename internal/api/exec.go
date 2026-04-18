@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,12 +77,23 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Merge the exec's explicit env with the container's env so PATH,
+	// HOME, and other image-level defaults are available to the session.
+	// Request vars win over container vars, matching `docker exec` behavior.
+	var mergedEnv []string
+	if c := h.store.GetContainer(containerID); c != nil {
+		mergedEnv = mergeEnv(c.Env, req.Env)
+	} else {
+		mergedEnv = req.Env
+	}
+
 	rec := &execRecord{
 		ID:          generateID(),
 		ContainerID: containerID,
 		Cmd:         req.Cmd,
 		Tty:         req.Tty,
-		Env:         req.Env,
+		Env:         mergedEnv,
+		WorkingDir:  req.WorkingDir,
 	}
 	h.execs.add(rec)
 
@@ -103,9 +115,19 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Honor WorkingDir by wrapping the user's argv in `sh -c "cd <dir>
+	// && exec <cmd>"`. Docker's exec honors -w this way when the base
+	// runtime doesn't expose chdir-before-exec directly; lxc-attach and
+	// pct exec both start at the container's default cwd, so the wrap
+	// is the simplest reliable implementation.
+	execCmd := rec.Cmd
+	if rec.WorkingDir != "" {
+		execCmd = wrapCmdWithCwd(rec.Cmd, rec.WorkingDir)
+	}
+
 	if req.Detach {
 		// Fire-and-forget: run the command, don't stream output.
-		cmd := h.mgr.Exec(rec.ContainerID, rec.Cmd, rec.Env)
+		cmd := h.mgr.Exec(rec.ContainerID, execCmd, rec.Env)
 		go func() {
 			err := cmd.Run()
 			code := 0
@@ -151,7 +173,7 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 
 	h.execs.update(rec.ID, func(r *execRecord) { r.Running = true; r.StartedAt = time.Now() })
 
-	cmd := h.mgr.Exec(rec.ContainerID, rec.Cmd, rec.Env)
+	cmd := h.mgr.Exec(rec.ContainerID, execCmd, rec.Env)
 
 	if rec.Tty {
 		closeConn = false // runExecTTY closes conn itself
@@ -295,6 +317,27 @@ func runExecMux(cmd *exec.Cmd, conn io.ReadWriter) {
 	stdoutW.Close()
 	stderrW.Close()
 	wg.Wait()
+}
+
+// wrapCmdWithCwd turns argv into `sh -c "cd <dir> && exec <argv>"` so the
+// command runs in the requested directory. Arguments are single-quoted for
+// POSIX safety; embedded single quotes are escaped by closing the quote,
+// inserting a backslash-quoted quote, and re-opening.
+func wrapCmdWithCwd(argv []string, dir string) []string {
+	var b strings.Builder
+	b.WriteString("cd ")
+	b.WriteString(shellQuote(dir))
+	b.WriteString(" && exec")
+	for _, a := range argv {
+		b.WriteByte(' ')
+		b.WriteString(shellQuote(a))
+	}
+	return []string{"sh", "-c", b.String()}
+}
+
+// shellQuote wraps s in single quotes with embedded quotes escaped.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // generateID returns a 64-character hex ID matching Docker's container ID length.

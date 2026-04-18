@@ -40,6 +40,11 @@ type Manager struct {
 // UsePVE returns true when Proxmox CT mode is active.
 func (m *Manager) UsePVE() bool { return m.pveStorage != "" }
 
+// PVEStorage returns the configured Proxmox storage name, or "" when the
+// daemon isn't in PVE mode. Used by the API layer's size-of-image logic to
+// build the ZFS dataset name for `zfs get used`.
+func (m *Manager) PVEStorage() string { return m.pveStorage }
+
 // NewManager creates a Manager that stores containers under lxcPath.
 // If pveStorage is non-empty, containers are created as Proxmox CTs on
 // the named storage (e.g. "large" ZFS pool) and are visible in the
