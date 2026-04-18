@@ -156,3 +156,105 @@ func TestMatchEventSupportsPortainerFilters(t *testing.T) {
 		t.Fatal("expected network filter to match network event")
 	}
 }
+
+func TestPublishEventNormalizesDockerMetadataForPortainer(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		store:  mustTestStore(t),
+		events: newEventBroker(),
+	}
+	rec := &store.ContainerRecord{
+		ID:       "ctr-1",
+		Name:     "web",
+		Image:    "docker.io/library/nginx:latest",
+		ImageID:  "sha256:deadbeef",
+		ExitCode: 137,
+	}
+	if err := h.store.AddContainer(rec); err != nil {
+		t.Fatalf("add container: %v", err)
+	}
+
+	h.publishEvent("container", "destroy", rec.ID, nil)
+	h.publishEvent("image", "load", "docker.io/library/nginx:latest", nil)
+	h.publishEvent("network", "destroy", "net-1", map[string]string{"name": "frontend", "type": "bridge"})
+	h.publishEvent("volume", "create", "data", nil)
+
+	if len(h.events.history) != 4 {
+		t.Fatalf("expected four events, got %d", len(h.events.history))
+	}
+
+	containerEv := h.events.history[0]
+	for key, want := range map[string]string{
+		"container": "ctr-1",
+		"daemon":    localEventDaemon,
+		"image":     "docker.io/library/nginx:latest",
+		"imageID":   "sha256:deadbeef",
+		"name":      "web",
+		"type":      "container",
+		"exitCode":  "137",
+	} {
+		if containerEv.Actor.Attributes[key] != want {
+			t.Fatalf("expected container %s=%q, got %#v", key, want, containerEv.Actor.Attributes)
+		}
+	}
+	if containerEv.From != "docker.io/library/nginx:latest" || containerEv.ID != "ctr-1" || containerEv.Status != "destroy" {
+		t.Fatalf("unexpected container event envelope %#v", containerEv)
+	}
+
+	imageEv := h.events.history[1]
+	for key, want := range map[string]string{
+		"daemon": localEventDaemon,
+		"image":  "docker.io/library/nginx:latest",
+		"name":   "docker.io/library/nginx:latest",
+		"type":   "image",
+	} {
+		if imageEv.Actor.Attributes[key] != want {
+			t.Fatalf("expected image %s=%q, got %#v", key, want, imageEv.Actor.Attributes)
+		}
+	}
+	if imageEv.From != "docker.io/library/nginx:latest" {
+		t.Fatalf("unexpected image event %#v", imageEv)
+	}
+
+	networkEv := h.events.history[2]
+	for key, want := range map[string]string{
+		"daemon":  localEventDaemon,
+		"driver":  "bridge",
+		"name":    "frontend",
+		"network": "frontend",
+		"scope":   "local",
+		"type":    "network",
+	} {
+		if networkEv.Actor.Attributes[key] != want {
+			t.Fatalf("expected network %s=%q, got %#v", key, want, networkEv.Actor.Attributes)
+		}
+	}
+	if networkEv.From != "frontend" || networkEv.Status != "destroy" {
+		t.Fatalf("unexpected network event %#v", networkEv)
+	}
+
+	volumeEv := h.events.history[3]
+	for key, want := range map[string]string{
+		"daemon": localEventDaemon,
+		"driver": "local",
+		"name":   "data",
+		"type":   "volume",
+	} {
+		if volumeEv.Actor.Attributes[key] != want {
+			t.Fatalf("expected volume %s=%q, got %#v", key, want, volumeEv.Actor.Attributes)
+		}
+	}
+	if volumeEv.From != "data" || volumeEv.Status != "create" {
+		t.Fatalf("unexpected volume event %#v", volumeEv)
+	}
+}
+
+func mustTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store init: %v", err)
+	}
+	return st
+}

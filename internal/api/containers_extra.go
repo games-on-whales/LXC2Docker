@@ -258,7 +258,9 @@ func (h *Handler) publishEvent(kind, action, id string, attrs map[string]string)
 	if attrs == nil {
 		attrs = map[string]string{}
 	}
+	attrs = h.normalizePublishedEventAttrs(kind, id, attrs)
 	now := time.Now()
+	from := publishedEventFrom(kind, id, attrs)
 	h.events.publish(Event{
 		Type:   kind,
 		Action: action,
@@ -269,7 +271,96 @@ func (h *Handler) publishEvent(kind, action, id string, attrs map[string]string)
 		Scope:    "local",
 		Time:     now.Unix(),
 		TimeNano: now.UnixNano(),
+		ID:       id,
+		Status:   action,
+		From:     from,
 	})
+}
+
+func (h *Handler) normalizePublishedEventAttrs(kind, id string, attrs map[string]string) map[string]string {
+	out := map[string]string{
+		"daemon": localEventDaemon,
+	}
+	for k, v := range attrs {
+		out[k] = v
+	}
+	switch kind {
+	case "container":
+		out["type"] = "container"
+		out["container"] = id
+		if rec := h.store.GetContainer(id); rec != nil {
+			if out["name"] == "" {
+				out["name"] = rec.Name
+			}
+			if out["image"] == "" {
+				out["image"] = rec.Image
+			}
+			if out["imageID"] == "" {
+				out["imageID"] = rec.ImageID
+			}
+			if out["exitCode"] == "" && rec.ExitCode != 0 {
+				out["exitCode"] = strconv.Itoa(rec.ExitCode)
+			}
+		}
+	case "image":
+		out["type"] = "image"
+		if out["image"] == "" {
+			out["image"] = id
+		}
+		if out["name"] == "" {
+			out["name"] = id
+		}
+	case "network":
+		driver := out["driver"]
+		if driver == "" && out["type"] != "" && out["type"] != "network" {
+			driver = out["type"]
+		}
+		if driver == "" {
+			driver = "bridge"
+		}
+		out["type"] = "network"
+		out["driver"] = driver
+		out["scope"] = "local"
+		if out["network"] == "" {
+			if out["name"] != "" {
+				out["network"] = out["name"]
+			} else {
+				out["network"] = id
+			}
+		}
+	case "volume":
+		out["type"] = "volume"
+		if out["driver"] == "" {
+			out["driver"] = "local"
+		}
+		if out["name"] == "" {
+			out["name"] = id
+		}
+	}
+	return out
+}
+
+func publishedEventFrom(kind, id string, attrs map[string]string) string {
+	switch kind {
+	case "container", "image":
+		if attrs["image"] != "" {
+			return attrs["image"]
+		}
+		if attrs["name"] != "" {
+			return attrs["name"]
+		}
+		return id
+	case "network", "volume":
+		if attrs["name"] != "" {
+			return attrs["name"]
+		}
+		if kind == "network" && attrs["network"] != "" {
+			return attrs["network"]
+		}
+		return id
+	default:
+		return id
+	}
 }
 
 func (h *Handler) ensureVolume(name string) (*store.VolumeRecord, error) {
