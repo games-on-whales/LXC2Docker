@@ -36,6 +36,17 @@ type ContainerConfig struct {
 	Privileged bool
 	CapAdd     []string // Docker-style names e.g. "NET_ADMIN"; CAP_ prefix optional
 	CapDrop    []string
+	// Sysctls maps kernel parameter name → value. Written as
+	// lxc.sysctl.<key> = <val>. LXC only applies the subset that's
+	// namespaced (net.*, kernel.*); host-wide keys are rejected at start.
+	Sysctls map[string]string
+	// Tmpfs maps in-container destination path → mount options
+	// (e.g. "/run" → "rw,nosuid,size=65536k"). Empty options use
+	// reasonable Docker-compatible defaults.
+	Tmpfs map[string]string
+	// ExtraHosts is a list of "name:ip" pairs appended to /etc/hosts in
+	// the container rootfs at create time. Docker's --add-host.
+	ExtraHosts []string
 	// LogFile is where the container console output is written.
 	// Set automatically by the manager.
 	LogFile string
@@ -407,6 +418,11 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	// CapDrop translate to lxc.cap.keep / lxc.cap.drop entries.
 	items = append(items, capabilityItems(cfg)...)
 
+	// Sysctls and Tmpfs: translated directly to LXC directives. Docker's
+	// --sysctl / --tmpfs forms both map cleanly without extra runtime work.
+	items = append(items, sysctlItems(cfg)...)
+	items = append(items, tmpfsItems(cfg)...)
+
 	// Console log so we can serve it via the logs API
 	if cfg.LogFile != "" {
 		items = append(items, configItem{"lxc.console.logfile", cfg.LogFile})
@@ -444,6 +460,50 @@ func normalizeCap(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
 	name = strings.TrimPrefix(name, "cap_")
 	return name
+}
+
+// sysctlItems emits one lxc.sysctl.<key> = <value> per configured sysctl.
+// LXC applies these in the container's namespaces at start; keys it can't
+// set (non-namespaced, like kernel.pid_max) cause the container to fail
+// fast with a clear error, which matches Docker's behavior.
+func sysctlItems(cfg *ContainerConfig) []configItem {
+	if len(cfg.Sysctls) == 0 {
+		return nil
+	}
+	items := make([]configItem, 0, len(cfg.Sysctls))
+	for k, v := range cfg.Sysctls {
+		// Reject injection via newlines/equals in the key — LXC would
+		// otherwise parse a value as a second config directive.
+		if strings.ContainsAny(k, "\n\r=") || strings.ContainsAny(v, "\n\r") {
+			continue
+		}
+		items = append(items, configItem{"lxc.sysctl." + k, v})
+	}
+	return items
+}
+
+// tmpfsItems emits one lxc.mount.entry per requested tmpfs. Docker's
+// HostConfig.Tmpfs value is a mount option string (e.g. "size=64m,noexec");
+// LXC's fstab-style entry wants flags in the 4th column. When the caller
+// gave no options we default to the same set Docker uses
+// (rw,nosuid,nodev,noexec).
+func tmpfsItems(cfg *ContainerConfig) []configItem {
+	if len(cfg.Tmpfs) == 0 {
+		return nil
+	}
+	items := make([]configItem, 0, len(cfg.Tmpfs))
+	for dest, options := range cfg.Tmpfs {
+		if options == "" {
+			options = "rw,nosuid,nodev,noexec"
+		}
+		// The LXC entry is fstab-style. `create=dir` makes LXC mkdir the
+		// target if it doesn't exist, matching Docker's behavior for
+		// paths that aren't in the image.
+		rel := strings.TrimPrefix(dest, "/")
+		entry := fmt.Sprintf("tmpfs %s tmpfs %s,create=dir 0 0", rel, options)
+		items = append(items, configItem{"lxc.mount.entry", entry})
+	}
+	return items
 }
 
 // combinedCmd merges entrypoint and cmd the same way Docker does.
@@ -781,6 +841,8 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 
 	// Capabilities / privileged: same rules as the legacy path.
 	items = append(items, capabilityItems(cfg)...)
+	items = append(items, sysctlItems(cfg)...)
+	items = append(items, tmpfsItems(cfg)...)
 
 	// Console log.
 	if cfg.LogFile != "" {

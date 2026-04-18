@@ -833,6 +833,40 @@ func (m *Manager) prepareRootfs(rootfs string, cfg ContainerConfig) {
 		log.Printf("prepareRootfs: warning: write resolv.conf: %v", err)
 	}
 
+	// Apply Docker's --add-host semantics by appending to /etc/hosts. We
+	// preserve any content the image shipped with so we don't wipe out
+	// distro-provided entries like "127.0.0.1 localhost".
+	if len(cfg.ExtraHosts) > 0 {
+		hostsPath := filepath.Join(rootfs, "etc", "hosts")
+		existing, _ := os.ReadFile(hostsPath)
+		var extra strings.Builder
+		if len(existing) > 0 && !strings.HasSuffix(string(existing), "\n") {
+			extra.WriteByte('\n')
+		}
+		extra.WriteString("# docker-lxc-daemon: --add-host entries\n")
+		for _, h := range cfg.ExtraHosts {
+			// Docker's format is "name:ip" (yes, name first). Accept either.
+			name, ip, ok := strings.Cut(h, ":")
+			if !ok {
+				continue
+			}
+			name = strings.TrimSpace(name)
+			ip = strings.TrimSpace(ip)
+			if name == "" || ip == "" {
+				continue
+			}
+			// /etc/hosts format is "<ip> <hostname>" (ip first); swap.
+			extra.WriteString(ip)
+			extra.WriteByte(' ')
+			extra.WriteString(name)
+			extra.WriteByte('\n')
+		}
+		combined := append(existing, []byte(extra.String())...)
+		if err := os.WriteFile(hostsPath, combined, 0o644); err != nil {
+			log.Printf("prepareRootfs: warning: write /etc/hosts: %v", err)
+		}
+	}
+
 	// Create symlinks for socket bind-mounts. Socket mounts use a directory
 	// mount instead of a file mount (see appendSocketMount), so the
 	// application needs a symlink from the expected path to the socket

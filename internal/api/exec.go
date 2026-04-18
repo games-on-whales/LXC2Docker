@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -154,7 +155,13 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 
 	if rec.Tty {
 		closeConn = false // runExecTTY closes conn itself
-		runExecTTY(cmd, conn)
+		// Register the PTY on the record as soon as it's available so a
+		// concurrent /resize request can forward the ioctl. runExecTTY
+		// clears it before returning.
+		runExecTTY(cmd, conn, func(ptmx *os.File) {
+			h.execs.update(rec.ID, func(r *execRecord) { r.Pty = ptmx })
+		})
+		h.execs.update(rec.ID, func(r *execRecord) { r.Pty = nil })
 	} else {
 		runExecMux(cmd, conn)
 	}
@@ -200,11 +207,17 @@ func (h *Handler) execInspect(w http.ResponseWriter, r *http.Request) {
 
 // runExecTTY runs cmd with a PTY attached and proxies raw bytes between the
 // PTY master and the hijacked connection. Used when Tty=true.
-func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter) {
+//
+// onReady is called with the PTY master as soon as it's available so
+// callers can register it for resize-forwarding. It may be nil.
+func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter, onReady func(*os.File)) {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		fmt.Fprintf(conn, "error starting pty: %s\n", err)
 		return
+	}
+	if onReady != nil {
+		onReady(ptmx)
 	}
 
 	var wg sync.WaitGroup

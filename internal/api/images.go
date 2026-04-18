@@ -21,6 +21,14 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 	filt := parseFilters(r)
 	records := h.store.ListImages()
 
+	// Build a one-shot usage index so we emit a real Containers count per
+	// image instead of -1. Portainer's Images tab uses this to enable the
+	// "Remove unused" button and to block delete-with-usage.
+	usage := map[string]int{}
+	for _, c := range h.store.ListContainers() {
+		usage[normalizeImageRef(c.Image)]++
+	}
+
 	out := make([]ImageSummary, 0, len(records))
 	for _, rec := range records {
 		if !filt.matchImageReference(rec.Ref) {
@@ -38,7 +46,7 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 			Size:        imageSize(h.mgr.LXCPath(), rec),
 			VirtualSize: imageSize(h.mgr.LXCPath(), rec),
 			Labels:      labels,
-			Containers:  -1, // Docker convention for "not computed"
+			Containers:  usage[rec.Ref],
 		})
 	}
 	jsonResponse(w, http.StatusOK, out)
@@ -132,6 +140,9 @@ func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 		OnStatus:    sendStatus,
 		OnEvent:     sendEvent,
 	})
+	if err == nil {
+		h.emitImage("pull", ref)
+	}
 	if err != nil {
 		// Match Docker's error-frame shape — Portainer displays the
 		// `errorDetail.message` field verbatim in the pull modal.
@@ -275,6 +286,7 @@ func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusConflict, err.Error())
 		return
 	}
+	h.emitImage("delete", ref)
 	jsonResponse(w, http.StatusOK, []map[string]string{
 		{"Untagged": ref},
 	})

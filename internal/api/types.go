@@ -2,7 +2,10 @@
 // by the raw docker CLI and GoW tooling.
 package api
 
-import "time"
+import (
+	"os"
+	"time"
+)
 
 // --- Container Create ---
 
@@ -526,6 +529,8 @@ type ErrorResponse struct {
 }
 
 // execRecord tracks an in-flight or completed exec instance.
+// Pty is set for Tty=true execs while the stream is active so resize
+// requests can forward TIOCSWINSZ to the live terminal.
 type execRecord struct {
 	ID          string
 	ContainerID string
@@ -535,4 +540,5 @@ type execRecord struct {
 	ExitCode    int
 	Running     bool
 	StartedAt   time.Time
+	Pty         *os.File
 }

@@ -80,6 +80,27 @@ func (h *Handler) emitContainer(action string, rec *store.ContainerRecord) {
 	h.emitContainerWithAttrs(action, rec, nil)
 }
 
+// emitImage publishes an "image" event. Portainer subscribes to the events
+// stream and refreshes its Images tab whenever it sees one. The actor ID
+// is the ref (e.g. "nginx:latest") to match Docker's convention.
+func (h *Handler) emitImage(action, ref string) {
+	now := time.Now()
+	h.events.publish(Event{
+		Type:   "image",
+		Action: action,
+		Actor: EventActor{
+			ID:         ref,
+			Attributes: map[string]string{"name": ref},
+		},
+		Scope:    "local",
+		Time:     now.Unix(),
+		TimeNano: now.UnixNano(),
+		ID:       ref,
+		Status:   action,
+		From:     ref,
+	})
+}
+
 // emitContainerWithAttrs emits a container lifecycle event with extra actor
 // attributes merged in. Used by /rename to carry an "oldName" value so
 // Portainer's event feed can render "foo renamed to bar".

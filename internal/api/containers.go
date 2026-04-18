@@ -104,6 +104,9 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Privileged:        req.HostConfig.Privileged,
 		CapAdd:            req.HostConfig.CapAdd,
 		CapDrop:           req.HostConfig.CapDrop,
+		Sysctls:           req.HostConfig.Sysctls,
+		Tmpfs:             req.HostConfig.Tmpfs,
+		ExtraHosts:        req.HostConfig.ExtraHosts,
 		ProxmoxCT:         req.Labels["gow.pve"] == "true",
 		LAN:               req.Labels["gow.lan"] == "true",
 	}
@@ -920,7 +923,7 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 	buf.Flush()
 
 	cmd := h.mgr.Exec(id, []string{"/bin/sh"}, nil)
-	runExecTTY(cmd, conn)
+	runExecTTY(cmd, conn, nil)
 }
 
 // safeJoin joins base and untrusted path, returning an error if the result

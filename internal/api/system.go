@@ -202,18 +202,44 @@ func detectCgroupDriver() string {
 // engine as misconfigured.
 
 func (h *Handler) listNetworks(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, http.StatusOK, defaultNetworks())
+	jsonResponse(w, http.StatusOK, h.networksWithContainers())
 }
 
 func (h *Handler) inspectNetwork(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
-	for _, n := range defaultNetworks() {
+	for _, n := range h.networksWithContainers() {
 		if n["Id"] == id || n["Name"] == id {
 			jsonResponse(w, http.StatusOK, n)
 			return
 		}
 	}
 	errResponse(w, http.StatusNotFound, "network not found")
+}
+
+// networksWithContainers returns the default network snapshot with the
+// gow bridge's Containers map populated from the store. Portainer's
+// Networks tab renders this as "containers attached" with links to each.
+func (h *Handler) networksWithContainers() []map[string]any {
+	nets := defaultNetworks()
+	members := map[string]any{}
+	for _, rec := range h.store.ListContainers() {
+		if rec.IPAddress == "" {
+			continue
+		}
+		members[rec.ID] = map[string]string{
+			"Name":        rec.Name,
+			"EndpointID":  rec.ID,
+			"MacAddress":  "",
+			"IPv4Address": rec.IPAddress + "/24",
+			"IPv6Address": "",
+		}
+	}
+	for _, n := range nets {
+		if n["Name"] == "gow" {
+			n["Containers"] = members
+		}
+	}
+	return nets
 }
 
 func (h *Handler) createNetwork(w http.ResponseWriter, r *http.Request) {
