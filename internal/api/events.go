@@ -357,5 +357,11 @@ func matchEvent(f filters, ev Event) bool {
 	if f.has("label") && !f.matchLabel(ev.Actor.Attributes) {
 		return false
 	}
+	if f.has("image") {
+		img := ev.Actor.Attributes["image"]
+		if !f.matchAny("image", img) {
+			return false
+		}
+	}
 	return true
 }

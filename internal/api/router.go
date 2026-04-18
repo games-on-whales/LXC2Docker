@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"time"
@@ -125,7 +126,7 @@ func (h *Handler) routes() http.Handler {
 		// 404 that litters the browser console and confuses users. The
 		// messages are short because Portainer displays them verbatim.
 		ni := notImplementedFunc("not supported by docker-lxc-daemon")
-		sub.HandleFunc("/build", ni).Methods(http.MethodPost)
+		sub.HandleFunc("/build", buildNotImplemented).Methods(http.MethodPost)
 		sub.HandleFunc("/images/load", ni).Methods(http.MethodPost)
 		sub.HandleFunc("/images/search", ni).Methods(http.MethodGet)
 		sub.HandleFunc("/commit", ni).Methods(http.MethodPost)
@@ -175,5 +176,18 @@ func (h *Handler) routes() http.Handler {
 func notImplementedFunc(msg string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotImplemented, msg)
+	}
+}
+
+func buildNotImplemented(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	msg := "image build is not supported by docker-lxc-daemon; use `docker pull` or the GoW image registry"
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"errorDetail": map[string]string{"message": msg},
+		"error":       msg,
+	})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
 	}
 }

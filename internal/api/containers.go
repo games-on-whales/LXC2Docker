@@ -420,7 +420,7 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			Command: cmd,
 			Created: rec.Created.Unix(),
 			State:   state,
-			Status:  stateToStatusWithHealth(state, rec.Created, rec.HealthStatus),
+			Status:  stateToStatusFull(state, rec.Created, rec.HealthStatus, rec.ExitCode, rec.FinishedAt),
 			Ports:   ports,
 			Labels:  rec.Labels,
 			Mounts:  mounts,
@@ -1598,10 +1598,14 @@ func writeLogFrame(w io.Writer, streamType byte, data []byte) {
 
 // stateToStatus returns a human-readable status string like Docker's "Up 2 hours".
 func stateToStatus(state string, created time.Time) string {
-	return stateToStatusWithHealth(state, created, "")
+	return stateToStatusFull(state, created, "", 0, nil)
 }
 
 func stateToStatusWithHealth(state string, created time.Time, health string) string {
+	return stateToStatusFull(state, created, health, 0, nil)
+}
+
+func stateToStatusFull(state string, created time.Time, health string, exitCode int, finishedAt *time.Time) string {
 	base := ""
 	switch state {
 	case "running":
@@ -1611,7 +1615,11 @@ func stateToStatusWithHealth(state string, created time.Time, health string) str
 	case "created":
 		return "Created"
 	case "exited":
-		return "Exited (0) " + humanDuration(time.Since(created)) + " ago"
+		since := time.Since(created)
+		if finishedAt != nil {
+			since = time.Since(*finishedAt)
+		}
+		return fmt.Sprintf("Exited (%d) %s ago", exitCode, humanDuration(since))
 	default:
 		return state
 	}
