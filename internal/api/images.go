@@ -332,6 +332,7 @@ func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
 		return
 	}
+	img := h.store.GetImage(ref)
 	if err := h.mgr.RemoveImage(ref); err != nil {
 		if force {
 			jsonResponse(w, http.StatusOK, []map[string]string{})
@@ -341,9 +342,11 @@ func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.emitImage("delete", ref)
-	jsonResponse(w, http.StatusOK, []map[string]string{
-		{"Untagged": ref},
-	})
+	out := []map[string]string{{"Untagged": ref}}
+	if img != nil {
+		out = append(out, map[string]string{"Deleted": "sha256:" + img.ID})
+	}
+	jsonResponse(w, http.StatusOK, out)
 }
 
 func normalizeImageRef(name string) string {

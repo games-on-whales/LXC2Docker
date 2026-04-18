@@ -638,6 +638,7 @@ func (h *Handler) removeVolume(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) pruneVolumes(w http.ResponseWriter, r *http.Request) {
 	filt := parseFilters(r)
 	var deleted []string
+	var reclaimed int64
 	for _, v := range h.store.ListVolumes() {
 		if h.volumeInUse(v.Name) {
 			continue
@@ -645,6 +646,7 @@ func (h *Handler) pruneVolumes(w http.ResponseWriter, r *http.Request) {
 		if !filt.matchLabel(v.Labels) {
 			continue
 		}
+		reclaimed += rootfsSize(v.Mountpoint)
 		os.RemoveAll(v.Mountpoint)
 		h.store.RemoveVolume(v.Name)
 		h.emitVolume("destroy", v.Name)
@@ -652,7 +654,7 @@ func (h *Handler) pruneVolumes(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"VolumesDeleted": deleted,
-		"SpaceReclaimed": 0,
+		"SpaceReclaimed": reclaimed,
 	})
 }
 

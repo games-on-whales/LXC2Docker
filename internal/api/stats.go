@@ -180,6 +180,7 @@ func (h *Handler) sampleStats(id, name string) dockerStats {
 
 	// Process count (cgroup v2 pids.current, v1 pids.current or tasks).
 	s.PidsStats.Current = readPidsCurrent(cgPath)
+	s.NumProcs = uint32(s.PidsStats.Current)
 
 	// Network (per-interface rx/tx from /proc/<pid>/net/dev).
 	if pid > 0 {

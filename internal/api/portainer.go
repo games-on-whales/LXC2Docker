@@ -22,6 +22,11 @@ func (h *Handler) pauseContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
+	state, _ := h.mgr.State(id)
+	if state != "running" {
+		errResponse(w, http.StatusConflict, "Container "+id+" is not running")
+		return
+	}
 	if err := h.mgr.PauseContainer(id); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -35,6 +40,11 @@ func (h *Handler) unpauseContainer(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
 	if id == "" {
 		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+	state, _ := h.mgr.State(id)
+	if state != "paused" {
+		errResponse(w, http.StatusConflict, "Container "+id+" is not paused")
 		return
 	}
 	if err := h.mgr.UnpauseContainer(id); err != nil {
@@ -296,6 +306,16 @@ func applyLiveLimits(id string, hc HostConfig) string {
 	writes := map[string]string{}
 	if hc.Memory > 0 {
 		writes["memory.max"] = strconv.FormatInt(hc.Memory, 10)
+	}
+	if hc.MemorySwap > 0 {
+		swap := hc.MemorySwap - hc.Memory
+		if swap < 0 {
+			swap = 0
+		}
+		writes["memory.swap.max"] = strconv.FormatInt(swap, 10)
+	}
+	if hc.MemoryReservation > 0 {
+		writes["memory.low"] = strconv.FormatInt(hc.MemoryReservation, 10)
 	}
 	if hc.CPUShares > 0 {
 		// Docker shares (1–1024) → cgroup v2 weight (1–10000).
