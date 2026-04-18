@@ -189,6 +189,8 @@ func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 
 	sendStatus(fmt.Sprintf("Pulling from %s", fromImage))
 
+	alreadyPresent := h.store.GetImage(ref) != nil
+
 	err := h.mgr.PullImageWith(ref, "amd64", lxc.PullOpts{
 		Credentials: creds,
 		OnStatus:    sendStatus,
@@ -198,8 +200,6 @@ func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 		h.emitImage("pull", ref)
 	}
 	if err != nil {
-		// Match Docker's error-frame shape — Portainer displays the
-		// `errorDetail.message` field verbatim in the pull modal.
 		enc.Encode(map[string]any{
 			"error": err.Error(),
 			"errorDetail": map[string]string{
@@ -210,7 +210,11 @@ func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sendStatus(fmt.Sprintf("Status: Downloaded newer image for %s", ref))
+	if alreadyPresent {
+		sendStatus(fmt.Sprintf("Status: Image is up to date for %s", ref))
+	} else {
+		sendStatus(fmt.Sprintf("Status: Downloaded newer image for %s", ref))
+	}
 }
 
 // decodeRegistryAuth parses Docker's X-Registry-Auth header, a base64url JSON

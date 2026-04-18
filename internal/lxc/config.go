@@ -40,9 +40,10 @@ type ContainerConfig struct {
 	// Security. Privileged grants full capabilities + unrestricted device
 	// access; equivalent to Docker's --privileged. CapAdd/CapDrop extend
 	// or restrict the default set when not privileged.
-	Privileged bool
-	CapAdd     []string // Docker-style names e.g. "NET_ADMIN"; CAP_ prefix optional
-	CapDrop    []string
+	Privileged  bool
+	CapAdd      []string // Docker-style names e.g. "NET_ADMIN"; CAP_ prefix optional
+	CapDrop     []string
+	SecurityOpt []string // Docker's --security-opt; e.g. "no-new-privileges:true"
 	// Sysctls maps kernel parameter name → value. Written as
 	// lxc.sysctl.<key> = <val>. LXC only applies the subset that's
 	// namespaced (net.*, kernel.*); host-wide keys are rejected at start.
@@ -459,6 +460,7 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	// and unrestricted device access is allowed. Non-privileged CapAdd /
 	// CapDrop translate to lxc.cap.keep / lxc.cap.drop entries.
 	items = append(items, capabilityItems(cfg)...)
+	items = append(items, securityOptItems(cfg)...)
 
 	// Sysctls and Tmpfs: translated directly to LXC directives. Docker's
 	// --sysctl / --tmpfs forms both map cleanly without extra runtime work.
@@ -503,6 +505,29 @@ func normalizeCap(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
 	name = strings.TrimPrefix(name, "cap_")
 	return name
+}
+
+// securityOptItems translates Docker --security-opt entries into LXC
+// directives. Currently only "no-new-privileges[:true|false]" is wired
+// through; other opts (seccomp profile overrides, apparmor) would require
+// custom profile plumbing outside the scope of this translation layer.
+func securityOptItems(cfg *ContainerConfig) []configItem {
+	var items []configItem
+	for _, opt := range cfg.SecurityOpt {
+		opt = strings.TrimSpace(opt)
+		key, val, _ := strings.Cut(opt, "=")
+		if val == "" {
+			key, val, _ = strings.Cut(opt, ":")
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "no-new-privileges":
+			v := strings.ToLower(strings.TrimSpace(val))
+			if v == "" || v == "true" || v == "1" {
+				items = append(items, configItem{"lxc.no_new_privs", "1"})
+			}
+		}
+	}
+	return items
 }
 
 // sysctlItems emits one lxc.sysctl.<key> = <value> per configured sysctl.
@@ -947,6 +972,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 
 	// Capabilities / privileged: same rules as the legacy path.
 	items = append(items, capabilityItems(cfg)...)
+	items = append(items, securityOptItems(cfg)...)
 	items = append(items, sysctlItems(cfg)...)
 	items = append(items, tmpfsItems(cfg)...)
 	items = append(items, ulimitItems(cfg)...)

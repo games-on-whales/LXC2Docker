@@ -144,6 +144,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Privileged:        req.HostConfig.Privileged,
 		CapAdd:            req.HostConfig.CapAdd,
 		CapDrop:           req.HostConfig.CapDrop,
+		SecurityOpt:       req.HostConfig.SecurityOpt,
 		Sysctls:           req.HostConfig.Sysctls,
 		Tmpfs:             req.HostConfig.Tmpfs,
 		ExtraHosts:        req.HostConfig.ExtraHosts,
