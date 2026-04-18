@@ -30,7 +30,7 @@ type buildState struct {
 	labels      map[string]string
 	user        string
 	stopSignal  string
-	healthcheck *oci.ImageHealthcheck
+	healthcheck *store.HealthcheckConfig
 	volumes     []string
 	shell       []string
 }
@@ -432,12 +432,12 @@ func evaluateBuildState(instrs []dockerfileInstruction) (buildState, error) {
 // Options are --interval=<duration>, --timeout=<duration>,
 // --start-period=<duration>, --retries=<n>. Durations accept Go's time.
 // ParseDuration syntax (e.g. "30s", "1m30s").
-func parseHealthcheckInstruction(args string) (*oci.ImageHealthcheck, error) {
+func parseHealthcheckInstruction(args string) (*store.HealthcheckConfig, error) {
 	raw := strings.TrimSpace(args)
 	if strings.EqualFold(raw, "NONE") {
-		return &oci.ImageHealthcheck{Test: []string{"NONE"}}, nil
+		return &store.HealthcheckConfig{Test: []string{"NONE"}}, nil
 	}
-	out := &oci.ImageHealthcheck{}
+	out := &store.HealthcheckConfig{}
 	for {
 		if !strings.HasPrefix(raw, "--") {
 			break
@@ -872,7 +872,7 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 	}
 
 	if h.mgr.UsePVE() {
-		storage := tmpRec.Storage
+		storage := h.mgr.PVEStorage()
 		if storage == "" {
 			storage = "large"
 		}
@@ -901,7 +901,7 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 			OCILabels:       state.labels,
 			OCIUser:         state.user,
 			OCIStopSignal:   state.stopSignal,
-			OCIHealthcheck:  buildHealthcheckToStore(state.healthcheck),
+			OCIHealthcheck:  state.healthcheck,
 			OCIVolumes:      append([]string{}, state.volumes...),
 			OCIShell:        append([]string{}, state.shell...),
 		})
@@ -933,25 +933,8 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 		OCILabels:      state.labels,
 		OCIUser:        state.user,
 		OCIStopSignal:  state.stopSignal,
-		OCIHealthcheck: buildHealthcheckToStore(state.healthcheck),
+		OCIHealthcheck: state.healthcheck,
 		OCIVolumes:     append([]string{}, state.volumes...),
 		OCIShell:       append([]string{}, state.shell...),
 	})
-}
-
-// buildHealthcheckToStore converts an oci.ImageHealthcheck (captured from
-// the Dockerfile) into the store's HealthcheckConfig shape. Mirrors
-// imageHealthcheckToStore in internal/lxc — kept here to avoid widening
-// the oci↔store surface for a one-off conversion.
-func buildHealthcheckToStore(h *oci.ImageHealthcheck) *store.HealthcheckConfig {
-	if h == nil {
-		return nil
-	}
-	return &store.HealthcheckConfig{
-		Test:        append([]string{}, h.Test...),
-		Interval:    h.Interval,
-		Timeout:     h.Timeout,
-		StartPeriod: h.StartPeriod,
-		Retries:     h.Retries,
-	}
 }

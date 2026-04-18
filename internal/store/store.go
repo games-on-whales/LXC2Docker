@@ -60,6 +60,7 @@ type ContainerRecord struct {
 	RestartCount    int    `json:"restart_count,omitempty"`     // updated by the watcher
 	AutoRemove      bool   `json:"auto_remove,omitempty"`       // remove after exit
 	StoppedByUser   bool   `json:"stopped_by_user,omitempty"`   // set on explicit stop/kill to defeat unless-stopped
+	Networks        map[string]NetworkAttachment `json:"networks,omitempty"`
 	// Raw HostConfig as JSON for full round-trip. Decoding happens at the
 	// API layer; the store treats this as opaque.
 	RawHostConfig []byte `json:"raw_host_config,omitempty"`
@@ -87,6 +88,49 @@ type HealthResult struct {
 	Output   string    `json:"Output"`
 }
 
+// HealthcheckConfig mirrors the Docker image-level Healthcheck block so builds,
+// saved images, and loaded images can persist checks without depending on the
+// OCI package shape.
+type HealthcheckConfig struct {
+	Test        []string `json:"Test"`
+	Interval    int64    `json:"Interval"`     // duration in nanoseconds
+	Timeout     int64    `json:"Timeout"`      // duration in nanoseconds
+	StartPeriod int64    `json:"StartPeriod"`  // duration in nanoseconds
+	Retries     int      `json:"Retries"`
+}
+
+// NetworkAttachment captures the subset of fields we keep when persisting
+// container↔network bindings.
+type NetworkAttachment struct {
+	NetworkID  string            `json:"network_id"`
+	IPAddress  string            `json:"ip_address"`
+	Gateway    string            `json:"gateway"`
+	MacAddress string            `json:"mac_address"`
+	EndpointID string            `json:"endpoint_id"`
+	Aliases    []string          `json:"aliases"`
+	Links      []string          `json:"links"`
+	DriverOpts map[string]string `json:"driver_opts"`
+	IPAMConfig *EndpointIPAMConfig `json:"ipam_config"`
+}
+
+// EndpointIPAMConfig stores the endpoint-level IPAM configuration that Docker
+// includes in network attachment details.
+type EndpointIPAMConfig struct {
+	IPv4Address  string   `json:"IPv4Address"`
+	IPv6Address  string   `json:"IPv6Address"`
+	LinkLocalIPs []string `json:"LinkLocalIPs"`
+}
+
+// NetworkRecord is a persisted user-defined network record.
+type NetworkRecord struct {
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Driver    string            `json:"driver"`
+	Scope     string            `json:"scope"`
+	CreatedAt time.Time         `json:"created_at"`
+	Labels    map[string]string `json:"labels"`
+}
+
 // PortBinding records a single host→container port mapping.
 type PortBinding struct {
 	HostPort      int    `json:"host_port"`
@@ -99,6 +143,7 @@ type PortBinding struct {
 // echo it back instead of hardcoding "bind". Defaults to "bind" for records
 // written before this field existed.
 type MountSpec struct {
+	Name        string `json:"name,omitempty"` // docker volume name, when Source is a named volume
 	Type        string `json:"type,omitempty"`
 	Source      string `json:"source"`
 	Destination string `json:"destination"`
@@ -124,6 +169,12 @@ type ImageRecord struct {
 	OCIWorkingDir string            `json:"oci_working_dir,omitempty"`
 	OCIPorts      []string          `json:"oci_ports,omitempty"`
 	OCILabels     map[string]string `json:"oci_labels,omitempty"`
+	OCIUser       string            `json:"oci_user,omitempty"`
+	OCIStopSignal string            `json:"oci_stop_signal,omitempty"`
+	OCIHealthcheck *HealthcheckConfig `json:"oci_healthcheck,omitempty"`
+	OCIVolumes    []string          `json:"oci_volumes,omitempty"`
+	OCIShell      []string          `json:"oci_shell,omitempty"`
+	TemplateDataset string           `json:"template_dataset,omitempty"`
 	// RepoDigest holds the image manifest digest ("sha256:...") when
 	// known. Populated by skopeo inspect after pull. Used to surface a
 	// canonical reference on the image detail page.
@@ -138,6 +189,7 @@ type VolumeRecord struct {
 	Driver     string            `json:"driver"`
 	Mountpoint string            `json:"mountpoint"`
 	Created    time.Time         `json:"created"`
+	CreatedAt  time.Time         `json:"created_at"`
 	Labels     map[string]string `json:"labels,omitempty"`
 	Options    map[string]string `json:"options,omitempty"`
 	OwnerID    string            `json:"owner_id,omitempty"`
@@ -148,6 +200,7 @@ type state struct {
 	Containers map[string]*ContainerRecord `json:"containers"` // keyed by ID
 	Images     map[string]*ImageRecord     `json:"images"`     // keyed by Ref (e.g. "ubuntu:22.04")
 	Volumes    map[string]*VolumeRecord    `json:"volumes"`    // keyed by Name
+	Networks   map[string]*NetworkRecord   `json:"networks"`   // keyed by ID
 	NextIP     int                         `json:"next_ip"`    // last octet of 10.100.0.x, starts at 2
 	FreeIPs    []int                       `json:"free_ips"`   // last octets of freed IPs available for reuse
 }
@@ -176,6 +229,7 @@ func NewAt(dir string) (*Store, error) {
 			Containers: make(map[string]*ContainerRecord),
 			Images:     make(map[string]*ImageRecord),
 			Volumes:    make(map[string]*VolumeRecord),
+			Networks:   make(map[string]*NetworkRecord),
 			NextIP:     2,
 		},
 	}
@@ -184,6 +238,11 @@ func NewAt(dir string) (*Store, error) {
 		return nil, fmt.Errorf("store: load: %w", err)
 	}
 	return s, nil
+}
+
+// RootDir returns the base directory backing the metadata store JSON file.
+func (s *Store) RootDir() string {
+	return filepath.Dir(s.path)
 }
 
 // AllocateIP returns the next available IP in the 10.100.0.0/24 range.
@@ -384,6 +443,65 @@ func (s *Store) RemoveVolume(name string) error {
 	return s.save()
 }
 
+// --- Networks ---
+
+// ListNetworks returns all persisted user-defined networks.
+func (s *Store) ListNetworks() []*NetworkRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*NetworkRecord, 0, len(s.data.Networks))
+	for _, n := range s.data.Networks {
+		out = append(out, n)
+	}
+	return out
+}
+
+// GetNetwork resolves a network by ID (including prefix) or name.
+func (s *Store) GetNetwork(idOrName string) *NetworkRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if idOrName == "" {
+		return nil
+	}
+	for id, n := range s.data.Networks {
+		if n == nil {
+			continue
+		}
+		if n.Name == idOrName || n.ID == idOrName || (len(idOrName) >= 4 && strings.HasPrefix(id, idOrName)) {
+			return n
+		}
+	}
+	return nil
+}
+
+// AddNetwork persists a user-defined network record.
+func (s *Store) AddNetwork(n *NetworkRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data.Networks == nil {
+		s.data.Networks = make(map[string]*NetworkRecord)
+	}
+	s.data.Networks[n.ID] = n
+	return s.save()
+}
+
+// RemoveNetwork removes a network record by ID or, if not found, by name.
+func (s *Store) RemoveNetwork(idOrName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.data.Networks[idOrName]; ok {
+		delete(s.data.Networks, idOrName)
+		return s.save()
+	}
+	for id, n := range s.data.Networks {
+		if n != nil && n.Name == idOrName {
+			delete(s.data.Networks, id)
+			return s.save()
+		}
+	}
+	return s.save()
+}
+
 // ResolveID resolves a partial or full container ID or name to a full ID.
 // Returns "" if not found.
 func (s *Store) ResolveID(idOrName string) string {
@@ -400,7 +518,7 @@ func (s *Store) ResolveID(idOrName string) string {
 	}
 	// Prefix match on ID
 	for id := range s.data.Containers {
-		if len(idOrName) >= 4 && len(id) >= len(idOrName) && id[:len(idOrName)] == idOrName {
+		if len(id) >= len(idOrName) && id[:len(idOrName)] == idOrName {
 			return id
 		}
 	}

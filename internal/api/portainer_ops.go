@@ -62,7 +62,7 @@ func (h *Handler) resizeContainer(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /exec/{id}/resize
-func (h *Handler) execResize(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) resizeExec(w http.ResponseWriter, r *http.Request) {
 	rec := h.execs.get(mux.Vars(r)["id"])
 	if rec == nil {
 		errResponse(w, http.StatusNotFound, "No such exec instance")
@@ -73,8 +73,8 @@ func (h *Handler) execResize(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, "invalid h/w query params")
 		return
 	}
-	if rec.pty != nil {
-		_ = pty.Setsize(rec.pty, &pty.Winsize{Rows: rows, Cols: cols})
+	if rec.Pty != nil {
+		_ = pty.Setsize(rec.Pty, &pty.Winsize{Rows: rows, Cols: cols})
 	}
 	w.WriteHeader(http.StatusOK)
 }

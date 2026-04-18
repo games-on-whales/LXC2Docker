@@ -2,8 +2,10 @@ package api
 
 import (
 	"encoding/json"
+	"os"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
@@ -19,6 +21,8 @@ type Handler struct {
 	store  *store.Store
 	execs  *execStore
 	events *eventBroker
+	attachMu  sync.Mutex
+	attachPTYs map[string]*os.File
 }
 
 // NewHandler wires up the Handler and returns an http.Handler ready to serve.
@@ -41,6 +45,7 @@ func newHandler(mgr *lxc.Manager, st *store.Store) *Handler {
 		store:  st,
 		execs:  newExecStore(),
 		events: newEventBroker(),
+		attachPTYs: make(map[string]*os.File),
 	}
 	// Periodically prune completed exec records to prevent memory leaks.
 	go func() {

@@ -196,6 +196,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.Mounts = append(cfg.Mounts, m)
 		storeMounts = append(storeMounts, store.MountSpec{
+			Name:        "",
 			Type:        "bind",
 			Source:      m.Source,
 			Destination: m.Destination,
@@ -227,6 +228,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		storeMounts = append(storeMounts, store.MountSpec{
+			Name:        volName,
 			Type:        "volume",
 			Source:      mountpoint,
 			Destination: path,
@@ -249,13 +251,14 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		source := m.Source
 		if mType == "volume" {
-			if resolved, err := h.ensureVolume(m.Source); err == nil {
-				source = resolved
+			if volumeRec, err := h.ensureVolume(m.Source); err == nil {
+				source = volumeRec.Mountpoint
 			} else {
 				continue
 			}
 		}
 		storeMounts = append(storeMounts, store.MountSpec{
+			Name:        m.Source,
 			Type:        mType,
 			Source:      source,
 			Destination: m.Target,
@@ -2041,13 +2044,6 @@ func hasMountAt(mounts []store.MountSpec, dest string) bool {
 	return false
 }
 
-// ensureVolume resolves a named volume to its backing directory, creating
-// it on demand. Anonymous volumes and compose-declared-but-not-pre-created
-// volumes both rely on auto-creation; this matches Docker's behavior.
-func (h *Handler) ensureVolume(name string) (string, error) {
-	return h.ensureVolumeOwned(name, "", false)
-}
-
 func (h *Handler) ensureVolumeOwned(name, owner string, anonymous bool) (string, error) {
 	if v := h.store.GetVolume(name); v != nil {
 		return v.Mountpoint, nil
@@ -2068,6 +2064,10 @@ func (h *Handler) ensureVolumeOwned(name, owner string, anonymous bool) (string,
 		return "", err
 	}
 	return mountpoint, nil
+}
+
+func (h *Handler) volumeRoot() string {
+	return filepath.Join(h.store.RootDir(), "volumes")
 }
 
 // mountJSONFrom converts a store mount record to the Docker wire format.

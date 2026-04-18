@@ -151,6 +151,5 @@ func sanitize(s string) string {
 		":", "_",
 		"/", "_",
 		" ", "_",
-		".", "_",
 	).Replace(s)
 }

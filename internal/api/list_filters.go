@@ -10,6 +10,13 @@ import (
 	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
 )
 
+func orDefault(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
 // listFilters is the decoded form of the `filters` query parameter used by
 // Docker's list endpoints: a JSON object mapping filter key to a list of
 // accepted values. An empty map means "no filter".
@@ -19,22 +26,29 @@ func parseListFilters(raw string) (listFilters, error) {
 	if raw == "" {
 		return listFilters{}, nil
 	}
-	// Docker accepts both shapes for historical reasons:
-	//   {"status":["running"]}            — slice form
-	//   {"status":{"running":true}}       — map form, values ignored
-	// Try the slice form first, then fall back to decoding the map.
-	var slice map[string][]string
-	if err := json.Unmarshal([]byte(raw), &slice); err == nil {
-		return listFilters(slice), nil
-	}
-	var asMap map[string]map[string]bool
-	if err := json.Unmarshal([]byte(raw), &asMap); err != nil {
+
+	rawObj := map[string]json.RawMessage{}
+	if err := json.Unmarshal([]byte(raw), &rawObj); err != nil {
 		return nil, err
 	}
+
 	out := listFilters{}
-	for k, v := range asMap {
-		for key := range v {
-			out[k] = append(out[k], key)
+	for key, rawValue := range rawObj {
+		var asSlice []string
+		if err := json.Unmarshal(rawValue, &asSlice); err == nil {
+			out[key] = append(out[key], asSlice...)
+			continue
+		}
+
+		var asMap map[string]bool
+		if err := json.Unmarshal(rawValue, &asMap); err != nil {
+			return nil, err
+		}
+
+		for k, enabled := range asMap {
+			if key == "label" || enabled {
+				out[key] = append(out[key], k)
+			}
 		}
 	}
 	return out, nil
@@ -64,7 +78,7 @@ func matchesContainerFilters(rec *store.ContainerRecord, state string, f listFil
 	if !f.anyMatch("status", state) {
 		return false
 	}
-	if !f.anyMatch("id", rec.ID, rec.ID[:12]) {
+	if !matchesContainerIDFilter(f["id"], rec.ID) {
 		return false
 	}
 	if !f.anyMatch("name", rec.Name, "/"+rec.Name) {
@@ -73,10 +87,9 @@ func matchesContainerFilters(rec *store.ContainerRecord, state string, f listFil
 	// "ancestor" matches the container's image ref — exact match or with an
 	// implicit ":latest" tag stripped on either side.
 	if vals := f["ancestor"]; len(vals) > 0 {
-		image := normalizeImageRef(rec.Image)
 		matched := false
 		for _, v := range vals {
-			if normalizeImageRef(v) == image {
+			if ancestorsMatch(rec.Image, v) {
 				matched = true
 				break
 			}
@@ -89,6 +102,53 @@ func matchesContainerFilters(rec *store.ContainerRecord, state string, f listFil
 		return false
 	}
 	return true
+}
+
+func matchesContainerIDFilter(filters []string, id string) bool {
+	if len(filters) == 0 {
+		return true
+	}
+	for _, want := range filters {
+		if want == id || strings.HasPrefix(id, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// ancestorsMatch compares an image reference coming from a container record against
+// a user-provided filter value, accepting canonical and registry-stripped forms.
+func ancestorsMatch(recordImage, filter string) bool {
+	left := imageRefCandidates(recordImage)
+	right := imageRefCandidates(filter)
+	for l := range left {
+		if _, ok := right[l]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func imageRefCandidates(ref string) map[string]struct{} {
+	norm := normalizeImageRef(ref)
+	cands := map[string]struct{}{
+		norm: {},
+	}
+	short := shortenImageRef(norm)
+	cands[short] = struct{}{}
+	return cands
+}
+
+func shortenImageRef(ref string) string {
+	// Strip registry if it looks like a host (contains '.' or ':').
+	if i := strings.Index(ref, "/"); i != -1 {
+		prefix := ref[:i]
+		if strings.Contains(prefix, ".") || strings.Contains(prefix, ":") {
+			ref = ref[i+1:]
+		}
+	}
+	ref = strings.TrimPrefix(ref, "library/")
+	return ref
 }
 
 // matchesLabelFilter implements Docker's label filter: each entry is either

@@ -2,13 +2,11 @@ package api
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -85,147 +83,6 @@ func (h *Handler) resolveImageBaseDir(ref string) (string, func(), error) {
 	return snap, noop, nil
 }
 
-func (h *Handler) containerStats(w http.ResponseWriter, r *http.Request) {
-	id := h.resolveID(mux.Vars(r)["id"])
-	if id == "" {
-		errResponse(w, http.StatusNotFound, "No such container")
-		return
-	}
-	stream := r.URL.Query().Get("stream")
-	if stream == "" || stream == "1" || strings.EqualFold(stream, "true") {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		enc := json.NewEncoder(w)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		// Track the previous sample so PreCPUStats reflects the prior tick
-		// instead of zeros. Portainer's CPU% formula divides the delta in
-		// container CPU usage by the delta in system CPU usage; without a
-		// previous sample the chart pegs to either zero or 100%.
-		var prev *ContainerStats
-		for {
-			stats := h.snapshotContainerStats(id)
-			if prev != nil {
-				stats.PreRead = prev.Read
-				stats.PreCPUStats = prev.CPUStats
-			}
-			if err := enc.Encode(stats); err != nil {
-				return
-			}
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-			cur := stats
-			prev = &cur
-			select {
-			case <-r.Context().Done():
-				return
-			case <-ticker.C:
-			}
-		}
-	}
-	jsonResponse(w, http.StatusOK, h.snapshotContainerStats(id))
-}
-
-func (h *Handler) snapshotContainerStats(id string) ContainerStats {
-	now := time.Now().UTC()
-	cg, _ := h.mgr.CgroupPath(id)
-	memUsage := readUint64(filepath.Join("/sys/fs/cgroup", cg, "memory.current"))
-	memLimit := readUint64(filepath.Join("/sys/fs/cgroup", cg, "memory.max"))
-	if memLimit == 0 || memLimit == ^uint64(0) {
-		memLimit = systemMemTotal()
-	}
-	pids := int(readUint64(filepath.Join("/sys/fs/cgroup", cg, "pids.current")))
-	cpuTotal, cpuUser, cpuKernel := readCPUStat(filepath.Join("/sys/fs/cgroup", cg, "cpu.stat"))
-	systemCPU := readSystemCPUUsage()
-
-	return ContainerStats{
-		Read:    now.Format(time.RFC3339Nano),
-		PreRead: now.Add(-time.Second).Format(time.RFC3339Nano),
-		PidsStats: PidsStats{
-			Current: pids,
-		},
-		BlkioStats:   readBlkioStats(filepath.Join("/sys/fs/cgroup", cg, "io.stat")),
-		NumProcs:     pids,
-		StorageStats: map[string]any{},
-		CPUStats: CPUStats{
-			CPUUsage: CPUUsage{
-				TotalUsage:        cpuTotal,
-				PercpuUsage:       make([]uint64, runtime.NumCPU()),
-				UsageInKernelmode: cpuKernel,
-				UsageInUsermode:   cpuUser,
-			},
-			SystemCPUUsage: systemCPU,
-			OnlineCPUs:     runtime.NumCPU(),
-		},
-		PreCPUStats: CPUStats{
-			CPUUsage: CPUUsage{
-				PercpuUsage: make([]uint64, runtime.NumCPU()),
-			},
-			OnlineCPUs: runtime.NumCPU(),
-		},
-		MemoryStats: MemoryStats{
-			Usage:    memUsage,
-			MaxUsage: maxOrFallback(readUint64(filepath.Join("/sys/fs/cgroup", cg, "memory.peak")), memUsage),
-			Limit:    memLimit,
-			Failcnt:  readMemoryEventsOOM(filepath.Join("/sys/fs/cgroup", cg, "memory.events")),
-			Stats:    readMemoryStat(filepath.Join("/sys/fs/cgroup", cg, "memory.stat")),
-		},
-		Networks: h.snapshotNetStats(id),
-	}
-}
-
-// snapshotNetStats reads /proc/<pid>/net/dev inside the container's network
-// namespace (pid lookup via lxc-info) and returns a per-interface stats map
-// matching Docker's shape. The loopback interface is dropped so Portainer's
-// charts focus on externally-visible traffic; a container with no running
-// init (pid<=0) returns an empty map.
-func (h *Handler) snapshotNetStats(id string) map[string]NetStats {
-	out := map[string]NetStats{}
-	pid, err := h.mgr.InitPID(id)
-	if err != nil || pid <= 0 {
-		return out
-	}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/net/dev", pid))
-	if err != nil {
-		return out
-	}
-	for i, line := range strings.Split(string(data), "\n") {
-		if i < 2 {
-			// Skip the two-line header.
-			continue
-		}
-		name, raw, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
-		}
-		name = strings.TrimSpace(name)
-		if name == "" || name == "lo" {
-			continue
-		}
-		fields := strings.Fields(raw)
-		if len(fields) < 16 {
-			continue
-		}
-		out[name] = NetStats{
-			RxBytes:   parseUint64(fields[0]),
-			RxPackets: parseUint64(fields[1]),
-			RxErrors:  parseUint64(fields[2]),
-			RxDropped: parseUint64(fields[3]),
-			TxBytes:   parseUint64(fields[8]),
-			TxPackets: parseUint64(fields[9]),
-			TxErrors:  parseUint64(fields[10]),
-			TxDropped: parseUint64(fields[11]),
-		}
-	}
-	return out
-}
-
-func parseUint64(s string) uint64 {
-	n, _ := strconv.ParseUint(s, 10, 64)
-	return n
-}
-
 // readBlkioStats parses cgroup v2's io.stat format into Docker's BlkioStats
 // shape. io.stat has one line per device:
 //
@@ -282,6 +139,11 @@ func readBlkioStats(path string) map[string][]any {
 	return out
 }
 
+func parseUint64(s string) uint64 {
+	n, _ := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+	return n
+}
+
 func blkioEntry(major, minor uint64, op string, value uint64) map[string]any {
 	return map[string]any{
 		"major": major,
@@ -318,8 +180,8 @@ func readMemoryEventsOOM(path string) uint64 {
 		if err != nil {
 			return 0
 		}
-		return n
-	}
+	return n
+}
 	return 0
 }
 
@@ -397,7 +259,7 @@ func (h *Handler) publishEvent(kind, action, id string, attrs map[string]string)
 		attrs = map[string]string{}
 	}
 	now := time.Now()
-	h.eventsHub.publish(EventMessage{
+	h.events.publish(Event{
 		Type:   kind,
 		Action: action,
 		Actor: EventActor{

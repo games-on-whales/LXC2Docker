@@ -43,7 +43,6 @@ func TestBuildLANConfig(t *testing.T) {
 	cfg, err := buildLANConfig(
 		[]string{
 			"vmbr0=10.10.0/24:10.10.0.1",
-			"vmbr1=10.20.0/24:10.20.0.1",
 		},
 		"",
 		"",
@@ -53,15 +52,15 @@ func TestBuildLANConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildLANConfig returned error: %v", err)
 	}
-	if len(cfg.Bridges) != 2 {
-		t.Fatalf("expected 2 bridges, got %d", len(cfg.Bridges))
+	if cfg.Bridge != "vmbr0" {
+		t.Fatalf("expected vmbr0, got %q", cfg.Bridge)
 	}
-	if cfg.Default != "vmbr0" {
-		t.Fatalf("expected first bridge as default, got %q", cfg.Default)
+	if cfg.Prefix != "10.10.0" {
+		t.Fatalf("unexpected prefix %q", cfg.Prefix)
 	}
 }
 
-func TestBuildLANConfigDuplicateBridge(t *testing.T) {
+func TestBuildLANConfigMultipleBridgeUnsupported(t *testing.T) {
 	t.Parallel()
 
 	_, err := buildLANConfig([]string{
@@ -69,7 +68,7 @@ func TestBuildLANConfigDuplicateBridge(t *testing.T) {
 		"vmbr0=10.20.0/24:10.20.0.1",
 	}, "", "", "", 0)
 	if err == nil {
-		t.Fatal("expected duplicate bridge error")
+		t.Fatal("expected multi-bridge error")
 	}
 }
 
@@ -80,7 +79,7 @@ func TestBuildLANConfigLegacyBridge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildLANConfig returned error: %v", err)
 	}
-	if _, ok := cfg.Bridges["vmbr-legacy"]; !ok {
-		t.Fatal("legacy bridge not present")
+	if cfg.Bridge != "vmbr-legacy" {
+		t.Fatalf("expected legacy bridge vmbr-legacy, got %q", cfg.Bridge)
 	}
 }

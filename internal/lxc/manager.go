@@ -1513,6 +1513,24 @@ func (m *Manager) LogPath(id string) string {
 // LXCPath returns the container storage root.
 func (m *Manager) LXCPath() string { return m.lxcPath }
 
+// ImageRootfsPath resolves a template image ref to a filesystem rootfs path,
+// if available. It returns an empty string when the image is not backed by a
+// readable directory path. For PVE-backed templates this returns the dataset
+// mountpoint path where the base rootfs is typically exposed.
+func (m *Manager) ImageRootfsPath(ref string) string {
+	rec := m.store.GetImage(ref)
+	if rec == nil {
+		return ""
+	}
+	if rec.TemplateName != "" {
+		return filepath.Join(m.lxcPath, rec.TemplateName, "rootfs")
+	}
+	if m.UsePVE() && rec.TemplateVMID > 0 {
+		return fmt.Sprintf("/%s/basevol-%d-disk-0", m.pveStorage, rec.TemplateVMID)
+	}
+	return ""
+}
+
 // RootfsPath returns the rootfs path for a container.
 // For PVE CTs returns the ZFS subvol path; otherwise the lxcpath rootfs.
 func (m *Manager) RootfsPath(id string) string {

@@ -124,65 +124,64 @@ func main() {
 	}
 }
 
-// buildLANConfig assembles the daemon's bridge catalog from the new
-// repeatable --bridge flag and the legacy single-bridge flags. Each
-// --bridge value parses as 'name=prefix/subnet:gateway'. The legacy
-// flags, if any are set, become an additional entry; the first entry
-// added becomes the default. Returns an empty config (no bridges) when
-// neither form is provided — the daemon is then LAN-disabled and any
-// container requesting LAN will fail at create time.
+// buildLANConfig resolves a single LAN bridge. In the current manager
+// implementation only one bridge is supported, so this function accepts at most
+// one `--bridge` entry and the legacy single-bridge flags as fallback.
 func buildLANConfig(specs []string, legacyName, legacyPrefix, legacyGateway string, legacySubnet int) (lxc.LANConfig, error) {
-	cfg := lxc.LANConfig{Bridges: map[string]lxc.BridgeSpec{}}
-	for _, raw := range specs {
-		spec, err := parseBridgeSpec(raw)
+	if len(specs) > 1 {
+		return lxc.LANConfig{}, fmt.Errorf("multiple --bridge values are unsupported")
+	}
+	if len(specs) == 1 {
+		spec, err := parseBridgeSpec(specs[0])
 		if err != nil {
-			return cfg, err
+			return lxc.LANConfig{}, err
 		}
-		if _, dup := cfg.Bridges[spec.Name]; dup {
-			return cfg, fmt.Errorf("duplicate bridge %q", spec.Name)
-		}
-		cfg.Bridges[spec.Name] = spec
-		if cfg.Default == "" {
-			cfg.Default = spec.Name
-		}
+		return lxc.LANConfig{
+			Bridge:  spec.Name,
+			Prefix:  spec.Prefix,
+			Gateway: spec.Gateway,
+			Subnet:  spec.Subnet,
+		}, nil
 	}
 	if legacyName != "" {
-		if _, exists := cfg.Bridges[legacyName]; !exists {
-			cfg.Bridges[legacyName] = lxc.BridgeSpec{
-				Name:    legacyName,
-				Prefix:  legacyPrefix,
-				Gateway: legacyGateway,
-				Subnet:  legacySubnet,
-			}
-			if cfg.Default == "" {
-				cfg.Default = legacyName
-			}
-		}
+		return lxc.LANConfig{
+			Bridge:  legacyName,
+			Prefix:  legacyPrefix,
+			Gateway: legacyGateway,
+			Subnet:  legacySubnet,
+		}, nil
 	}
-	return cfg, nil
+	return lxc.LANConfig{}, nil
 }
 
-// parseBridgeSpec parses 'name=prefix/subnet:gateway' into a BridgeSpec.
+type bridgeSpec struct {
+	Name    string
+	Prefix  string
+	Gateway string
+	Subnet  int
+}
+
+// parseBridgeSpec parses 'name=prefix/subnet:gateway' into a bridgeSpec.
 // Example: 'vmbr0=192.168.1/23:192.168.1.1'.
-func parseBridgeSpec(raw string) (lxc.BridgeSpec, error) {
+func parseBridgeSpec(raw string) (bridgeSpec, error) {
 	nameRest := strings.SplitN(raw, "=", 2)
 	if len(nameRest) != 2 || nameRest[0] == "" {
-		return lxc.BridgeSpec{}, fmt.Errorf("bridge spec %q: expected 'name=prefix/subnet:gateway'", raw)
+		return bridgeSpec{}, fmt.Errorf("bridge spec %q: expected 'name=prefix/subnet:gateway'", raw)
 	}
 	name := nameRest[0]
 	netGw := strings.SplitN(nameRest[1], ":", 2)
 	if len(netGw) != 2 {
-		return lxc.BridgeSpec{}, fmt.Errorf("bridge spec %q: missing ':gateway'", raw)
+		return bridgeSpec{}, fmt.Errorf("bridge spec %q: missing ':gateway'", raw)
 	}
 	prefSub := strings.SplitN(netGw[0], "/", 2)
 	if len(prefSub) != 2 {
-		return lxc.BridgeSpec{}, fmt.Errorf("bridge spec %q: prefix must be 'prefix/subnet'", raw)
+		return bridgeSpec{}, fmt.Errorf("bridge spec %q: prefix must be 'prefix/subnet'", raw)
 	}
 	subnet, err := strconv.Atoi(prefSub[1])
 	if err != nil {
-		return lxc.BridgeSpec{}, fmt.Errorf("bridge spec %q: invalid subnet: %w", raw, err)
+		return bridgeSpec{}, fmt.Errorf("bridge spec %q: invalid subnet: %w", raw, err)
 	}
-	return lxc.BridgeSpec{
+	return bridgeSpec{
 		Name:    name,
 		Prefix:  prefSub[0],
 		Gateway: netGw[1],

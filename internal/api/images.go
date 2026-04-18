@@ -22,13 +22,22 @@ import (
 func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 	filt := parseFilters(r)
 	records := h.store.ListImages()
+	lpf, err := parseListFilters(r.URL.Query().Get("filters"))
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
+		return
+	}
+	parsedUntil, err := parsePruneUntil(lpf)
+	if err != nil {
+		errResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	usage := map[string]int{}
 	for _, c := range h.store.ListContainers() {
 		usage[normalizeImageRef(c.Image)]++
 	}
 
-	cutoff := parsePruneUntil(filt["until"])
 	wantDangling := danglingWant(filt["dangling"])
 
 	grouped := map[string]*ImageSummary{}
@@ -37,7 +46,7 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 		if !filt.matchImageReference(rec.Ref) {
 			continue
 		}
-		if !cutoff.IsZero() && rec.Created.After(cutoff) {
+		if parsedUntil != nil && rec.Created.After(*parsedUntil) {
 			continue
 		}
 		if !filt.matchLabel(rec.OCILabels) {

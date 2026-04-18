@@ -194,6 +194,13 @@ type ContainerJSON struct {
 	NetworkSettings NetworkSettings  `json:"NetworkSettings"`
 }
 
+// ChangeResponse is returned by GET /containers/{id}/changes.
+// Kind maps to 0=modified,1=added,2=deleted.
+type ChangeResponse struct {
+	Path string `json:"Path"`
+	Kind int    `json:"Kind"`
+}
+
 // GraphDriver mirrors Docker's storage-driver block. LXC doesn't use one, so
 // we report a fixed "lxc" driver with no data. Portainer displays the driver
 // name on the container detail page.
@@ -273,6 +280,54 @@ type ContainerConfig struct {
 	Healthcheck  *Healthcheck        `json:"Healthcheck,omitempty"`
 }
 
+// EndpointIPAMConfig is the API model for per-endpoint IPAM data.
+type EndpointIPAMConfig struct {
+	IPv4Address  string   `json:"IPv4Address"`
+	IPv6Address  string   `json:"IPv6Address"`
+	LinkLocalIPs []string `json:"LinkLocalIPs"`
+}
+
+// Volume create request body.
+type VolumeCreateRequest struct {
+	Name       string            `json:"Name"`
+	Driver     string            `json:"Driver"`
+	DriverOpts map[string]string `json:"DriverOpts"`
+	Labels     map[string]string `json:"Labels"`
+}
+
+// VolumeCreateResponse is returned by POST /volumes/create.
+type VolumeCreateResponse struct {
+	Name       string            `json:"Name"`
+	Driver     string            `json:"Driver"`
+	Mountpoint string            `json:"Mountpoint"`
+	CreatedAt  string            `json:"CreatedAt"`
+	Labels     map[string]string `json:"Labels"`
+	Options    map[string]string `json:"Options"`
+	Scope      string            `json:"Scope"`
+}
+
+// VolumeUsage is the list/inspect representation for volumes.
+type VolumeUsage struct {
+	Name       string            `json:"Name"`
+	Driver     string            `json:"Driver"`
+	Mountpoint string            `json:"Mountpoint"`
+	CreatedAt  string            `json:"CreatedAt"`
+	Labels     map[string]string `json:"Labels"`
+	Options    map[string]string `json:"Options"`
+	Scope      string            `json:"Scope"`
+	UsageData  VolumeUsageData   `json:"UsageData"`
+}
+
+type VolumeUsageData struct {
+	RefCount int   `json:"RefCount"`
+	Size     int64 `json:"Size"`
+}
+
+type VolumeListResponse struct {
+	Volumes  []VolumeUsage `json:"Volumes"`
+	Warnings []string      `json:"Warnings"`
+}
+
 // NetworkSettings holds the IP and network info for a container. Portainer
 // reads the top-level Bridge/Ports/IPAddress fields and the per-network
 // Networks map; `docker inspect` output duplicates IPAddress at both levels.
@@ -298,7 +353,7 @@ type NetworkSettings struct {
 // pair is how Portainer cross-references the container to the Networks tab;
 // keep them populated so the "View network" link on a container works.
 type EndpointSettings struct {
-	IPAMConfig          any      `json:"IPAMConfig"`
+	IPAMConfig          *EndpointIPAMConfig `json:"IPAMConfig"`
 	Links               []string `json:"Links"`
 	Aliases             []string `json:"Aliases"`
 	NetworkID           string   `json:"NetworkID"`
@@ -309,8 +364,8 @@ type EndpointSettings struct {
 	IPv6Gateway         string   `json:"IPv6Gateway"`
 	GlobalIPv6Address   string   `json:"GlobalIPv6Address"`
 	GlobalIPv6PrefixLen int      `json:"GlobalIPv6PrefixLen"`
-	MacAddress          string   `json:"MacAddress"`
-	DriverOpts          any      `json:"DriverOpts"`
+	MacAddress          string            `json:"MacAddress"`
+	DriverOpts          map[string]string `json:"DriverOpts"`
 }
 
 // --- Container List ---

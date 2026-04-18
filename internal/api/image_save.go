@@ -233,6 +233,28 @@ func zfsMountpoint(dataset string) (string, error) {
 	return mp, nil
 }
 
+func splitImageRef(ref string) (string, string) {
+	repo := strings.TrimSpace(ref)
+	if repo == "" {
+		return "", "latest"
+	}
+	if i := strings.Index(repo, ":"); i != -1 {
+		return repo[:i], repo[i+1:]
+	}
+	return repo, "latest"
+}
+
+func copyLabels(labels map[string]string) map[string]string {
+	if len(labels) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(labels))
+	for k, v := range labels {
+		out[k] = v
+	}
+	return out
+}
+
 // writeLayerTar tars root into outPath and returns the payload's sha256.
 // Uses the host `tar` binary for speed and correct handling of xattrs,
 // symlinks, and device files that pure-Go tar would mangle.
