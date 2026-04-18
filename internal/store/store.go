@@ -387,6 +387,10 @@ func (s *Store) ResolveID(idOrName string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	idOrName = strings.TrimPrefix(idOrName, "/")
+	if idOrName == "" {
+		return ""
+	}
 	// Exact ID match
 	if _, ok := s.data.Containers[idOrName]; ok {
 		return idOrName

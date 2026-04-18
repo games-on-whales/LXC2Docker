@@ -48,6 +48,9 @@ type ContainerConfig struct {
 	// ExtraHosts is a list of "name:ip" pairs appended to /etc/hosts in
 	// the container rootfs at create time. Docker's --add-host.
 	ExtraHosts []string
+	DNS        []string
+	DNSSearch  []string
+	DNSOptions []string
 	// LogFile is where the container console output is written.
 	// Set automatically by the manager.
 	LogFile string

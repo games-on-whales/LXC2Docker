@@ -385,7 +385,9 @@ type ImageInspect struct {
 	Author          string            `json:"Author"`
 	Config          *ContainerConfig  `json:"Config"`
 	Architecture    string            `json:"Architecture"`
+	Variant         string            `json:"Variant,omitempty"`
 	Os              string            `json:"Os"`
+	OsVersion       string            `json:"OsVersion,omitempty"`
 	Size            int64             `json:"Size"`
 	VirtualSize     int64             `json:"VirtualSize"`
 	GraphDriver     GraphDriver       `json:"GraphDriver"`

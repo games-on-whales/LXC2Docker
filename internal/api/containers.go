@@ -25,9 +25,11 @@ import (
 
 // POST /containers/create
 func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("name")
-	if strings.HasPrefix(name, "/") {
-		name = name[1:]
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	name = strings.TrimPrefix(name, "/")
+	if name != "" && !isValidContainerName(name) {
+		errResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid container name (%s), only [a-zA-Z0-9][a-zA-Z0-9_.-]+ are allowed", name))
+		return
 	}
 
 	var req ContainerCreateRequest
@@ -127,6 +129,9 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Sysctls:           req.HostConfig.Sysctls,
 		Tmpfs:             req.HostConfig.Tmpfs,
 		ExtraHosts:        req.HostConfig.ExtraHosts,
+		DNS:               req.HostConfig.DNS,
+		DNSSearch:         req.HostConfig.DNSSearch,
+		DNSOptions:        req.HostConfig.DNSOptions,
 		ProxmoxCT:         req.Labels["gow.pve"] == "true",
 		LAN:               req.Labels["gow.lan"] == "true",
 	}
@@ -1598,6 +1603,23 @@ func (h *Handler) exposedPortsFor(rec *store.ContainerRecord) map[string]struct{
 		return nil
 	}
 	return out
+}
+
+func isValidContainerName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		if r == '_' || r == '.' || r == '-' ||
+			(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			if i == 0 && (r == '_' || r == '.' || r == '-') {
+				return false
+			}
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func healthcheckFrom(rec *store.ContainerRecord) *Healthcheck {

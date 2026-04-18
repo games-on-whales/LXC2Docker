@@ -276,6 +276,7 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 		Created:         rec.Created.Format(time.RFC3339),
 		Architecture:    rec.Arch,
 		Os:              "linux",
+		OsVersion:       rec.Release,
 		Size:            imageSize(h.mgr.LXCPath(), rec),
 		VirtualSize:     imageSize(h.mgr.LXCPath(), rec),
 		Config:          cfg,

@@ -1072,11 +1072,10 @@ func (m *Manager) prepareRootfs(rootfs string, cfg ContainerConfig) {
 		}
 	}
 
-	// Ensure resolv.conf for DNS resolution.
 	resolvPath := filepath.Join(rootfs, "etc", "resolv.conf")
 	os.Remove(resolvPath)
 	os.MkdirAll(filepath.Dir(resolvPath), 0o755)
-	if err := os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644); err != nil {
+	if err := os.WriteFile(resolvPath, []byte(buildResolvConf(cfg)), 0o644); err != nil {
 		log.Printf("prepareRootfs: warning: write resolv.conf: %v", err)
 	}
 
@@ -1532,6 +1531,42 @@ func (m *Manager) RootfsPath(id string) string {
 }
 
 // --- helpers ---
+
+func buildResolvConf(cfg ContainerConfig) string {
+	var b strings.Builder
+	if len(cfg.DNS) == 0 {
+		b.WriteString("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+	} else {
+		for _, d := range cfg.DNS {
+			d = strings.TrimSpace(d)
+			if d != "" && !strings.ContainsAny(d, "\r\n") {
+				b.WriteString("nameserver ")
+				b.WriteString(d)
+				b.WriteByte('\n')
+			}
+		}
+	}
+	if len(cfg.DNSSearch) > 0 {
+		b.WriteString("search")
+		for _, s := range cfg.DNSSearch {
+			s = strings.TrimSpace(s)
+			if s != "" && !strings.ContainsAny(s, "\r\n") {
+				b.WriteByte(' ')
+				b.WriteString(s)
+			}
+		}
+		b.WriteByte('\n')
+	}
+	for _, o := range cfg.DNSOptions {
+		o = strings.TrimSpace(o)
+		if o != "" && !strings.ContainsAny(o, "\r\n") {
+			b.WriteString("options ")
+			b.WriteString(o)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
 
 // sanitizeHostname converts a string to a valid DNS hostname: lowercase,
 // only letters/digits/hyphens, max 63 chars, no leading/trailing hyphens.
