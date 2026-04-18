@@ -88,10 +88,9 @@ func (m *Manager) reconcile() {
 }
 
 // StartGC launches a background goroutine that periodically removes stopped
-// ephemeral containers. Compose-managed services (those with Docker Compose
-// labels) and Proxmox CTs (VMID > 0) are left alone. This handles the common
-// case where Wolf sessions end abnormally (e.g. daemon restart) and child
-// containers (PulseAudio, Steam, Wolf-UI) are left behind.
+// ephemeral containers. Permanent user CTs (VMID < 10000) and compose-managed
+// services are left alone. Ephemerals (VMID >= 10000 or legacy VMID=0) whose
+// state is "exited" are reaped.
 func (m *Manager) StartGC(ctx context.Context) {
 	go func() {
 		// Run immediately on startup to clean leftovers, then periodically.
@@ -110,38 +109,25 @@ func (m *Manager) StartGC(ctx context.Context) {
 }
 
 func (m *Manager) gc() {
-	// Separate ephemeral containers into stopped (remove immediately) and
-	// running (check for orphans).
 	var stopped []*store.ContainerRecord
-	var runningSession []*store.ContainerRecord // Wolf-UI, WolfSteam, etc.
-	var runningSupport []*store.ContainerRecord // WolfPulseAudio, etc.
 
 	for _, rec := range m.store.ListContainers() {
-		// Never touch Proxmox CTs or compose-managed services.
-		if rec.VMID > 0 {
+		// Skip permanent user CTs (0 < VMID < 10000).
+		if rec.VMID > 0 && rec.VMID < ephemeralVMIDBase {
 			continue
 		}
+		// Skip compose-managed services.
 		if rec.Labels != nil {
 			if _, ok := rec.Labels["com.docker.compose.service"]; ok {
 				continue
 			}
 		}
 
-		state, _ := m.State(rec.ID)
-		if state == "exited" {
+		if state, _ := m.State(rec.ID); state == "exited" {
 			stopped = append(stopped, rec)
-		} else if state == "running" {
-			// Session containers have unique per-session names (Wolf-UI_<id>,
-			// WolfSteam_<id>). Support containers are generic (WolfPulseAudio).
-			if strings.Contains(rec.Name, "_") {
-				runningSession = append(runningSession, rec)
-			} else {
-				runningSupport = append(runningSupport, rec)
-			}
 		}
 	}
 
-	// Remove all stopped ephemeral containers.
 	for _, rec := range stopped {
 		log.Printf("GC: removing stopped container %s (%s)", rec.Name, rec.ID[:12])
 		if rec.IPAddress != "" {
@@ -149,39 +135,6 @@ func (m *Manager) gc() {
 		}
 		if err := m.RemoveContainer(rec.ID); err != nil {
 			log.Printf("GC: failed to remove %s: %v", rec.ID[:12], err)
-		}
-	}
-
-	// Orphan detection: if there are support containers (PulseAudio) but
-	// no session containers AND no running Proxmox CTs, the support
-	// containers are orphans from sessions that ended abnormally.
-	// PVE CTs (like Wolf) spawn support containers (PulseAudio) via the
-	// Docker API — we must not kill them while the CT is still running.
-	if len(runningSession) == 0 && len(runningSupport) > 0 {
-		pveCTRunning := false
-		for _, rec := range m.store.ListContainers() {
-			if rec.VMID > 0 {
-				if st, _ := m.State(rec.ID); st == "running" {
-					pveCTRunning = true
-					break
-				}
-			}
-		}
-		if !pveCTRunning {
-			for _, rec := range runningSupport {
-				log.Printf("GC: stopping orphaned container %s (%s, image=%s)",
-					rec.Name, rec.ID[:12], rec.Image)
-				if err := m.StopContainer(rec.ID, 5*time.Second); err != nil {
-					log.Printf("GC: failed to stop %s: %v", rec.ID[:12], err)
-					continue
-				}
-				if rec.IPAddress != "" {
-					RemovePortForwards(rec.IPAddress)
-				}
-				if err := m.RemoveContainer(rec.ID); err != nil {
-					log.Printf("GC: failed to remove %s: %v", rec.ID[:12], err)
-				}
-			}
 		}
 	}
 }
@@ -568,51 +521,41 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	return nil
 }
 
-// createEphemeralPVE creates a raw-LXC container by ZFS-cloning the PVE
-// template's rootfs. The container is NOT visible in the Proxmox UI but its
-// rootfs lives on the PVE storage pool (ZFS).
+// createEphemeralPVE creates an ephemeral Proxmox CT via pct clone, using a
+// VMID from the ephemeral range (>= 10000) so it's distinguishable from
+// permanent user CTs. The container is visible in the Proxmox web UI; the
+// GC reaps it when it exits.
 func (m *Manager) createEphemeralPVE(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
-	// ZFS clone the template rootfs for instant provisioning.
-	// pct template converts subvol → basevol, so clone from basevol.
-	snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, imgRec.TemplateVMID)
-	cloneDataset := fmt.Sprintf("%s/lxc-%s", m.pveStorage, id)
-	cloneMountpoint := fmt.Sprintf("/%s/lxc-%s", m.pveStorage, id)
+	vmid, err := allocateEphemeralVMID()
+	if err != nil {
+		return fmt.Errorf("manager: %w", err)
+	}
 
-	log.Printf("CreateContainer[ephemeral]: ZFS clone %s → %s", snapDataset, cloneDataset)
-	out, err := exec.Command("zfs", "clone",
-		"-o", fmt.Sprintf("mountpoint=%s", cloneMountpoint),
-		snapDataset, cloneDataset,
+	// Fill in LAN config from daemon settings before any networking setup.
+	if cfg.LAN && m.lan.Bridge != "" {
+		cfg.LANBridge = m.lan.Bridge
+		cfg.LANIP = fmt.Sprintf("%s.%d/%d", m.lan.Prefix, vmid%254+1, m.lan.Subnet)
+		cfg.LANGateway = m.lan.Gateway
+		log.Printf("CreateContainer[ephemeral]: LAN NIC on %s with IP %s", cfg.LANBridge, cfg.LANIP)
+	}
+
+	log.Printf("CreateContainer[ephemeral]: pct clone %d → VMID %d for %s", imgRec.TemplateVMID, vmid, id[:12])
+	out, err := exec.Command("pct", "clone",
+		fmt.Sprintf("%d", imgRec.TemplateVMID),
+		fmt.Sprintf("%d", vmid),
+		"--full",
+		"--storage", m.pveStorage,
 	).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: zfs clone %s → %s: %s: %w", snapDataset, cloneDataset, out, err)
+		return fmt.Errorf("manager: pct clone %d → %d: %s: %w", imgRec.TemplateVMID, vmid, out, err)
 	}
 
-	// Create the LXC config directory.
-	containerDir := filepath.Join(m.lxcPath, id)
-	if err := os.MkdirAll(containerDir, 0o755); err != nil {
-		exec.Command("zfs", "destroy", cloneDataset).Run()
-		return fmt.Errorf("manager: mkdir %s: %w", containerDir, err)
-	}
-
-	// Write a minimal LXC config that references the ZFS clone as rootfs.
-	minimalConfig := fmt.Sprintf(`lxc.include = /usr/share/lxc/config/common.conf
-lxc.arch = linux64
-lxc.rootfs.path = dir:%s
-lxc.uts.name = %s
-`, cloneMountpoint, id)
-	configPath := filepath.Join(containerDir, "config")
-	if err := os.WriteFile(configPath, []byte(minimalConfig), 0o644); err != nil {
-		exec.Command("zfs", "destroy", cloneDataset).Run()
-		return fmt.Errorf("manager: write config: %w", err)
-	}
-
-	// Allocate IP for bridge networking.
+	// Allocate IP for bridge networking (internal gow0).
 	var ip string
 	if cfg.NetworkMode != "host" {
 		ip, err = m.store.AllocateIP()
 		if err != nil {
-			exec.Command("zfs", "destroy", cloneDataset).Run()
-			os.RemoveAll(containerDir)
+			exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run()
 			return fmt.Errorf("manager: allocate IP: %w", err)
 		}
 	}
@@ -623,18 +566,30 @@ lxc.uts.name = %s
 		return fmt.Errorf("manager: mkdir log dir: %w", err)
 	}
 
-	// Rewrite config with full daemon-managed settings.
-	// Note: rewriteConfig may populate cfg.SocketLinks for socket bind mounts.
-	if err := rewriteConfig(configPath, &cfg, ip, id); err != nil {
-		return fmt.Errorf("manager: rewrite config: %w", err)
+	// Determine the container hostname (use Docker name, sanitized for DNS).
+	hostname := id[:12]
+	if storeRec := m.store.GetContainer(id); storeRec != nil {
+		hostname = storeRec.Name
+	}
+	hostname = sanitizeHostname(hostname)
+
+	// Build rootfs spec for Proxmox config.
+	rootfsSpec := fmt.Sprintf("%s:subvol-%d-disk-0,size=4G", m.pveStorage, vmid)
+	rootfsPath := m.pveRootfsPath(vmid)
+
+	// Write the Proxmox CT config.
+	if err := writePVEConfig(vmid, hostname, rootfsSpec, rootfsPath, &cfg, ip); err != nil {
+		exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run()
+		return fmt.Errorf("manager: write PVE config: %w", err)
 	}
 
-	// Prepare rootfs: runtime dirs, resolv.conf, socket symlinks.
-	m.prepareRootfs(cloneMountpoint, cfg)
+	// Prepare rootfs: runtime dirs, resolv.conf.
+	m.prepareRootfs(rootfsPath, cfg)
 
-	// Update store record with IP (VMID stays 0 for ephemeral).
+	// Update store record with IP and VMID.
 	if storeRec := m.store.GetContainer(id); storeRec != nil {
 		storeRec.IPAddress = ip
+		storeRec.VMID = vmid
 		return m.store.AddContainer(storeRec)
 	}
 	return nil
@@ -1055,7 +1010,12 @@ func sanitizeHostname(s string) string {
 	return h
 }
 
-// allocateVMID requests the next available Proxmox VMID.
+// ephemeralVMIDBase is the lowest VMID used for daemon-managed ephemeral CTs.
+// VMIDs below this are treated as permanent user CTs and never touched by GC.
+const ephemeralVMIDBase = 10000
+
+// allocateVMID requests the next available Proxmox VMID for a permanent CT.
+// Used for CTs explicitly marked ProxmoxCT=true (via the gow.pve=true label).
 func allocateVMID() (int, error) {
 	out, err := exec.Command("pvesh", "get", "/cluster/nextid").Output()
 	if err != nil {
@@ -1066,6 +1026,29 @@ func allocateVMID() (int, error) {
 		return 0, fmt.Errorf("parse VMID %q: %w", string(out), err)
 	}
 	return vmid, nil
+}
+
+// allocateEphemeralVMID returns the smallest free VMID at or above
+// ephemeralVMIDBase. Ephemeral CTs live in this range so GC and tooling can
+// distinguish them from permanent user CTs at a glance.
+func allocateEphemeralVMID() (int, error) {
+	entries, err := filepath.Glob("/etc/pve/lxc/*.conf")
+	if err != nil {
+		return 0, fmt.Errorf("allocate ephemeral VMID: %w", err)
+	}
+	used := make(map[int]bool, len(entries))
+	for _, e := range entries {
+		var id int
+		if _, err := fmt.Sscanf(filepath.Base(e), "%d.conf", &id); err == nil {
+			used[id] = true
+		}
+	}
+	for id := ephemeralVMIDBase; id < ephemeralVMIDBase+10000; id++ {
+		if !used[id] {
+			return id, nil
+		}
+	}
+	return 0, fmt.Errorf("allocate ephemeral VMID: range %d-%d exhausted", ephemeralVMIDBase, ephemeralVMIDBase+9999)
 }
 
 // pveRootfsPath returns the rootfs path for a Proxmox CT on ZFS storage.
