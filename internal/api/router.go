@@ -125,6 +125,7 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/images/{name:.*}/history", h.imageHistory).Methods(http.MethodGet)
 		sub.HandleFunc("/images/{name:.*}/tag", h.tagImage).Methods(http.MethodPost)
 		sub.HandleFunc("/images/{name:.*}", h.removeImage).Methods(http.MethodDelete)
+		sub.HandleFunc("/containers/{id}/export", h.exportContainer).Methods(http.MethodGet)
 
 		// Distribution (registry manifest probe used by Portainer's pull modal)
 		sub.HandleFunc("/distribution/{name:.*}/json", h.distributionInspect).Methods(http.MethodGet)
@@ -134,7 +135,8 @@ func (h *Handler) routes() http.Handler {
 		// 404 that litters the browser console and confuses users. The
 		// messages are short because Portainer displays them verbatim.
 		ni := notImplementedFunc("not supported by docker-lxc-daemon")
-		sub.HandleFunc("/build", buildNotImplemented).Methods(http.MethodPost)
+		sub.HandleFunc("/build", h.buildImage).Methods(http.MethodPost)
+		sub.HandleFunc("/build/prune", h.pruneBuildCache).Methods(http.MethodPost)
 		sub.HandleFunc("/images/load", h.loadImage).Methods(http.MethodPost)
 		sub.HandleFunc("/commit", h.commitContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/session", ni).Methods(http.MethodPost)

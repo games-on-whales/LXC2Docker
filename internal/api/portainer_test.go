@@ -167,6 +167,72 @@ func TestImagesSearchRouteHitsSearchImagesHandler(t *testing.T) {
 	}
 }
 
+func TestContainerExportRouteHitsExportHandler(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		store:      nil,
+		attachPTYs: map[string]*os.File{},
+		events:     newEventBroker(),
+	}
+
+	r := h.routes()
+	req := httptest.NewRequest(http.MethodGet, "/v1.45/containers/abc/export", nil)
+	match := &mux.RouteMatch{}
+	if !r.Match(req, match) {
+		t.Fatal("expected /containers/{id}/export route to match")
+	}
+
+	got, ok := match.Handler.(http.HandlerFunc)
+	if !ok {
+		t.Fatalf("expected route handler to be http.HandlerFunc, got %T", match.Handler)
+	}
+
+	want := http.HandlerFunc(h.exportContainer)
+	if reflect.ValueOf(got).Pointer() != reflect.ValueOf(want).Pointer() {
+		t.Fatalf("expected /containers/{id}/export to map to exportContainer handler")
+	}
+}
+
+func TestBuildRoutesHitBuildHandlers(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		attachPTYs: map[string]*os.File{},
+		events:     newEventBroker(),
+	}
+
+	r := h.routes()
+
+	buildReq := httptest.NewRequest(http.MethodPost, "/v1.45/build?t=foo", nil)
+	buildMatch := &mux.RouteMatch{}
+	if !r.Match(buildReq, buildMatch) {
+		t.Fatal("expected /build route to match")
+	}
+	buildGot, ok := buildMatch.Handler.(http.HandlerFunc)
+	if !ok {
+		t.Fatalf("expected /build handler to be http.HandlerFunc, got %T", buildMatch.Handler)
+	}
+	wantBuild := http.HandlerFunc(h.buildImage)
+	if reflect.ValueOf(buildGot).Pointer() != reflect.ValueOf(wantBuild).Pointer() {
+		t.Fatalf("expected /build to map to buildImage handler")
+	}
+
+	pruneReq := httptest.NewRequest(http.MethodPost, "/v1.45/build/prune", nil)
+	pruneMatch := &mux.RouteMatch{}
+	if !r.Match(pruneReq, pruneMatch) {
+		t.Fatal("expected /build/prune route to match")
+	}
+	pruneGot, ok := pruneMatch.Handler.(http.HandlerFunc)
+	if !ok {
+		t.Fatalf("expected /build/prune handler to be http.HandlerFunc, got %T", pruneMatch.Handler)
+	}
+	wantPrune := http.HandlerFunc(h.pruneBuildCache)
+	if reflect.ValueOf(pruneGot).Pointer() != reflect.ValueOf(wantPrune).Pointer() {
+		t.Fatalf("expected /build/prune to map to pruneBuildCache handler")
+	}
+}
+
 func TestSearchImagesFiltersLocalCatalog(t *testing.T) {
 	t.Parallel()
 
