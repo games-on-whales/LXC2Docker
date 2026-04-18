@@ -28,10 +28,18 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 		usage[normalizeImageRef(c.Image)]++
 	}
 
+	cutoff := parsePruneUntil(filt["until"])
+
 	grouped := map[string]*ImageSummary{}
 	ids := []string{}
 	for _, rec := range records {
 		if !filt.matchImageReference(rec.Ref) {
+			continue
+		}
+		if !cutoff.IsZero() && rec.Created.After(cutoff) {
+			continue
+		}
+		if !filt.matchLabel(rec.OCILabels) {
 			continue
 		}
 		key := rec.ID

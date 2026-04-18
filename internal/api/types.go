@@ -256,12 +256,12 @@ type ContainerConfig struct {
 	AttachStdin  bool                `json:"AttachStdin"`
 	AttachStdout bool                `json:"AttachStdout"`
 	AttachStderr bool                `json:"AttachStderr"`
-	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
 	Tty          bool                `json:"Tty"`
 	OpenStdin    bool                `json:"OpenStdin"`
 	StdinOnce    bool                `json:"StdinOnce"`
 	Image        string              `json:"Image"`
-	Volumes      map[string]struct{} `json:"Volumes,omitempty"`
+	Volumes      map[string]struct{} `json:"Volumes"`
 	Cmd          []string            `json:"Cmd"`
 	Entrypoint   []string            `json:"Entrypoint"`
 	Env          []string            `json:"Env"`

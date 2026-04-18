@@ -709,6 +709,7 @@ func volumeJSON(v *store.VolumeRecord) map[string]any {
 		"Mountpoint": v.Mountpoint,
 		"CreatedAt":  v.Created.Format(time.RFC3339Nano),
 		"Scope":      "local",
+		"Status":     map[string]any{},
 		"Options":    opts,
 		"Labels":     labels,
 	}

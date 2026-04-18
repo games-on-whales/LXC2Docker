@@ -633,7 +633,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			OpenStdin:    rec.OpenStdin,
 			ExposedPorts: h.exposedPortsFor(rec),
 			Image:        rec.Image,
-			Volumes:      rec.Volumes,
+			Volumes:      ensureStructMap(rec.Volumes),
 			Cmd:          ensureSlice(rec.Cmd),
 			Entrypoint:   ensureSlice(rec.Entrypoint),
 			Env:          ensureSlice(rec.Env),
@@ -1720,9 +1720,6 @@ func (h *Handler) exposedPortsFor(rec *store.ContainerRecord) map[string]struct{
 			out[p] = struct{}{}
 		}
 	}
-	if len(out) == 0 {
-		return nil
-	}
 	return out
 }
 
@@ -1736,6 +1733,13 @@ func ensureSlice(s []string) []string {
 func ensureMap(m map[string]string) map[string]string {
 	if m == nil {
 		return map[string]string{}
+	}
+	return m
+}
+
+func ensureStructMap(m map[string]struct{}) map[string]struct{} {
+	if m == nil {
+		return map[string]struct{}{}
 	}
 	return m
 }
