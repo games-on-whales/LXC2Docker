@@ -34,6 +34,7 @@ type ContainerConfig struct {
 	CpusetMems        string       // Docker's --cpuset-mems (e.g. "0")
 	PidsLimit         int64        // Maximum PIDs in the container (0 = unlimited)
 	Ulimits           []Ulimit     // Docker-style ulimits (lxc.prlimit.<name>)
+	ShmSize           int64        // /dev/shm tmpfs size in bytes (0 = kernel default)
 	WorkingDir        string       // container cwd; maps to lxc.init.cwd
 	// Security. Privileged grants full capabilities + unrestricted device
 	// access; equivalent to Docker's --privileged. CapAdd/CapDrop extend
@@ -257,7 +258,7 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 
 	// Docker-compatible default mounts: /dev/shm (shared memory) is required
 	// by most graphical apps (Wayland/wlroots), IPC, and many libraries.
-	items = append(items, configItem{"lxc.mount.entry", "tmpfs dev/shm tmpfs rw,nosuid,nodev,create=dir 0 0"})
+	items = append(items, configItem{"lxc.mount.entry", shmMountEntry(cfg.ShmSize)})
 
 	// Network configuration.
 	if cfg.LANBridge != "" {
@@ -518,6 +519,14 @@ func sysctlItems(cfg *ContainerConfig) []configItem {
 		items = append(items, configItem{"lxc.sysctl." + k, v})
 	}
 	return items
+}
+
+func shmMountEntry(size int64) string {
+	opts := "rw,nosuid,nodev,create=dir"
+	if size > 0 {
+		opts += fmt.Sprintf(",size=%d", size)
+	}
+	return "tmpfs dev/shm tmpfs " + opts + " 0 0"
 }
 
 // ulimitItems maps HostConfig.Ulimits onto lxc.prlimit.<name> directives.
@@ -783,7 +792,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	items = append(items, configItem{"lxc.mount.auto", "proc:mixed sys:mixed"})
 
 	// /dev/shm
-	items = append(items, configItem{"lxc.mount.entry", "tmpfs dev/shm tmpfs rw,nosuid,nodev,create=dir 0 0"})
+	items = append(items, configItem{"lxc.mount.entry", shmMountEntry(cfg.ShmSize)})
 
 	// Network configuration.
 	if cfg.LANBridge != "" {

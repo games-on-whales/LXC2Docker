@@ -139,6 +139,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		CpusetMems:        req.HostConfig.CpusetMems,
 		PidsLimit:         req.HostConfig.PidsLimit,
 		Ulimits:           apiToLXCUlimits(req.HostConfig.Ulimits),
+		ShmSize:           req.HostConfig.ShmSize,
 		Privileged:        req.HostConfig.Privileged,
 		CapAdd:            req.HostConfig.CapAdd,
 		CapDrop:           req.HostConfig.CapDrop,

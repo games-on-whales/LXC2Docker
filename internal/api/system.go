@@ -141,7 +141,7 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 		OperatingSystem:    "docker-lxc-daemon",
 		OSVersion:          unameRelease(uname),
 		OSType:             "linux",
-		Architecture:       runtime.GOARCH,
+		Architecture:       unameArch(runtime.GOARCH),
 		NCPU:               runtime.NumCPU(),
 		MemTotal:           int64(si.Totalram) * int64(si.Unit),
 		DockerRootDir:      h.mgr.LXCPath(),
@@ -181,6 +181,26 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 		Warnings:           []string{},
 	}
 	jsonResponse(w, http.StatusOK, resp)
+}
+
+func unameArch(goarch string) string {
+	switch goarch {
+	case "amd64":
+		return "x86_64"
+	case "arm64":
+		return "aarch64"
+	case "arm":
+		return "armv7l"
+	case "386":
+		return "i686"
+	case "ppc64le":
+		return "ppc64le"
+	case "s390x":
+		return "s390x"
+	case "riscv64":
+		return "riscv64"
+	}
+	return goarch
 }
 
 // detectCgroupVersion returns "1" or "2" based on whether unified cgroup v2 is
