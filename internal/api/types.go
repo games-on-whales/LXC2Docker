@@ -464,6 +464,15 @@ type ImageMetadata struct {
 	LastTagTime string `json:"LastTagTime"`
 }
 
+// ImageSearchResult is a compact entry from GET /images/search.
+type ImageSearchResult struct {
+	Description string `json:"description"`
+	IsAutomated bool   `json:"is_automated"`
+	IsOfficial  bool   `json:"is_official"`
+	Name        string `json:"name"`
+	StarCount   int    `json:"star_count"`
+}
+
 // --- Exec ---
 
 // ExecCreateRequest is the body of POST /containers/{id}/exec.

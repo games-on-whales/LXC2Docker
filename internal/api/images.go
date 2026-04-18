@@ -230,6 +230,63 @@ func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// GET /images/search
+func (h *Handler) searchImages(w http.ResponseWriter, r *http.Request) {
+	term := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("term")))
+	if term == "" {
+		errResponse(w, http.StatusBadRequest, "term query parameter is required")
+		return
+	}
+
+	limit := 25
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			errResponse(w, http.StatusBadRequest, "invalid limit parameter")
+			return
+		}
+		limit = n
+	}
+
+	seen := map[string]ImageSearchResult{}
+	for _, rec := range h.store.ListImages() {
+		name := shortenImageRef(normalizeImageRef(rec.Ref))
+		cname := strings.ToLower(name)
+		if !strings.Contains(cname, term) {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = ImageSearchResult{
+			Name:        name,
+			Description: "",
+			StarCount:   0,
+			IsOfficial:  false,
+			IsAutomated: false,
+		}
+	}
+
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	results := make([]ImageSearchResult, 0, len(names))
+	for _, name := range names {
+		if limit == 0 {
+			break
+		}
+		results = append(results, seen[name])
+		if limit > 0 {
+			limit--
+		}
+	}
+
+	jsonResponse(w, http.StatusOK, results)
+}
+
 // decodeRegistryAuth parses Docker's X-Registry-Auth header, a base64url JSON
 // object. When the header is empty or malformed we return "" — skopeo then
 // does an anonymous pull, which matches the behavior before credentials

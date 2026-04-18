@@ -139,3 +139,74 @@ func TestImagesGetBulkRouteHitsSaveImagesHandler(t *testing.T) {
 		t.Fatalf("expected /images/get to map to saveImages handler")
 	}
 }
+
+func TestImagesSearchRouteHitsSearchImagesHandler(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		store:      nil,
+		attachPTYs: map[string]*os.File{},
+		events:     newEventBroker(),
+	}
+
+	r := h.routes()
+	req := httptest.NewRequest(http.MethodGet, "/v1.45/images/search?term=nginx", nil)
+	match := &mux.RouteMatch{}
+	if !r.Match(req, match) {
+		t.Fatal("expected /images/search route to match")
+	}
+
+	got, ok := match.Handler.(http.HandlerFunc)
+	if !ok {
+		t.Fatalf("expected route handler to be http.HandlerFunc, got %T", match.Handler)
+	}
+
+	want := http.HandlerFunc(h.searchImages)
+	if reflect.ValueOf(got).Pointer() != reflect.ValueOf(want).Pointer() {
+		t.Fatalf("expected /images/search to map to searchImages handler")
+	}
+}
+
+func TestSearchImagesFiltersLocalCatalog(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store init: %v", err)
+	}
+	if err := st.AddImage(&store.ImageRecord{ID: "sha1", Ref: "docker.io/library/nginx:latest"}); err != nil {
+		t.Fatalf("add image: %v", err)
+	}
+	if err := st.AddImage(&store.ImageRecord{ID: "sha2", Ref: "docker.io/library/busybox:latest"}); err != nil {
+		t.Fatalf("add image: %v", err)
+	}
+	if err := st.AddImage(&store.ImageRecord{ID: "sha3", Ref: "docker.io/library/nginx:alpine"}); err != nil {
+		t.Fatalf("add image: %v", err)
+	}
+
+	h := &Handler{
+		store:      st,
+		attachPTYs: map[string]*os.File{},
+		execs:      newExecStore(),
+		events:     newEventBroker(),
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1.45/images/search?term=nginx", nil)
+	h.searchImages(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var out []ImageSearchResult
+	if err := json.NewDecoder(rr.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected one match, got %d: %#v", len(out), out)
+	}
+	if out[0].Name != "nginx" {
+		t.Fatalf("expected match name nginx, got %#v", out[0].Name)
+	}
+}
