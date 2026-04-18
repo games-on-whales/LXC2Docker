@@ -41,6 +41,12 @@ type dockerfileInstruction struct {
 	line int
 }
 
+type dockerfileStage struct {
+	baseRef      string
+	name         string
+	instructions []dockerfileInstruction
+}
+
 // buildImage implements a constrained single-stage Dockerfile builder.
 // It is intentionally narrow but functional enough for basic Portainer flows:
 // FROM, ARG, WORKDIR, ENV, COPY, ADD, RUN, CMD, ENTRYPOINT, EXPOSE, LABEL.
@@ -50,6 +56,7 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, "build tag is required via query param t")
 		return
 	}
+	targetStage := strings.TrimSpace(r.URL.Query().Get("target"))
 
 	dockerfilePath := r.URL.Query().Get("dockerfile")
 	if dockerfilePath == "" {
@@ -138,23 +145,20 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 		argSet[k] = v
 	}
 	for i := range instrs {
-		if instrs[i].op == "ARG" || instrs[i].op == "FROM" {
+		if instrs[i].op == "ARG" {
 			continue
 		}
 		instrs[i].args = substituteBuildArgs(instrs[i].args, argSet)
 	}
-	state, err := evaluateBuildState(instrs)
+
+	stages, err := splitDockerfileStages(instrs)
 	if err != nil {
-		fail(err.Error())
+		fail("parse Dockerfile: " + err.Error())
 		return
 	}
-	for k, v := range queryLabels {
-		state.labels[k] = v
-	}
-
-	send(map[string]string{"stream": fmt.Sprintf("Step 1: resolving base image %s\n", state.baseRef)})
-	if err := h.ensureBuildBaseImage(normalizeImageRef(state.baseRef), send); err != nil {
-		fail("pull base image: " + err.Error())
+	targetIdx, err := selectBuildTarget(stages, targetStage)
+	if err != nil {
+		fail(err.Error())
 		return
 	}
 
@@ -166,100 +170,148 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	tmpID := "build-" + generateID()[:12]
-	rec := &store.ContainerRecord{
-		ID:         tmpID,
-		Name:       tmpID,
-		Image:      normalizeImageRef(state.baseRef),
-		ImageID:    normalizeImageRef(state.baseRef),
-		Created:    time.Now(),
-		Env:        append([]string{}, state.env...),
-		Entrypoint: state.entrypoint,
-		Cmd:        state.cmd,
-	}
-	if err := h.store.AddContainer(rec); err != nil {
-		fail("create temp build record: " + err.Error())
-		return
-	}
-
-	cleanupTemp := func() {
-		if st, _ := h.mgr.State(tmpID); st == "running" {
-			_ = h.mgr.StopContainer(tmpID, 5*time.Second)
+	stageRefs := map[string]string{}
+	tempRefs := []string{}
+	buildNonce := generateID()[:8]
+	cleanupStageImages := func() {
+		for _, ref := range tempRefs {
+			_ = h.mgr.RemoveImage(ref)
 		}
-		_ = h.mgr.RemoveContainer(tmpID)
 	}
 
-	send(map[string]string{"stream": fmt.Sprintf("Step 2: cloning base image into temporary builder %s\n", tmpID)})
-	if err := h.mgr.CreateContainer(tmpID, normalizeImageRef(state.baseRef), buildContainerConfigFromState(state)); err != nil {
-		_ = h.store.RemoveContainer(tmpID)
-		fail("create temporary builder: " + err.Error())
-		return
-	}
-
-	rootfs := h.mgr.RootfsPath(tmpID)
-	send(map[string]string{"stream": "Step 3: applying Dockerfile instructions\n"})
-	for i, inst := range instrs {
-		send(map[string]string{"stream": fmt.Sprintf("Step %d: %s %s\n", i+3, inst.op, inst.args)})
-		switch inst.op {
-		case "FROM", "LABEL", "ARG", "USER", "STOPSIGNAL", "HEALTHCHECK", "VOLUME", "SHELL":
-			continue
-		case "WORKDIR":
-			dst := resolveContainerPath(state.workdir, inst.args)
-			if err := os.MkdirAll(filepath.Join(rootfs, strings.TrimPrefix(dst, "/")), 0o755); err != nil {
-				cleanupTemp()
-				fail("WORKDIR: " + err.Error())
-				return
-			}
-			state.workdir = dst
-		case "ENV":
-			state.env = mergeEnv(state.env, parseEnvInstruction(inst.args))
-		case "COPY", "ADD":
-			if err := applyCopyInstruction(ctxDir, rootfs, state.workdir, inst.args); err != nil {
-				cleanupTemp()
-				fail(inst.op + ": " + err.Error())
-				return
-			}
-		case "RUN":
-			script := inst.args
-			if state.workdir != "" {
-				script = fmt.Sprintf("mkdir -p %q && cd %q && %s", state.workdir, state.workdir, inst.args)
-			}
-			// Prefix chroot to the declared SHELL (default /bin/sh -lc) so
-			// subsequent RUN invocations obey a user-set SHELL directive.
-			shellArgs := runShell(state.shell)
-			args := append([]string{rootfs}, shellArgs...)
-			args = append(args, script)
-			cmd := exec.Command("chroot", args...)
-			cmd.Env = append(os.Environ(), state.env...)
-			out, err := cmd.CombinedOutput()
-			if len(out) > 0 {
-				send(map[string]string{"stream": string(out)})
-			}
-			if err != nil {
-				cleanupTemp()
-				fail("RUN failed: " + err.Error())
-				return
-			}
-		case "CMD":
-			state.cmd = parseCommandInstruction(inst.args)
-		case "ENTRYPOINT":
-			state.entrypoint = parseCommandInstruction(inst.args)
-		case "EXPOSE":
-			state.exposed = append(state.exposed, strings.Fields(inst.args)...)
-		default:
-			cleanupTemp()
-			fail(fmt.Sprintf("unsupported Dockerfile instruction %q on line %d", inst.op, inst.line))
+	step := 1
+	for idx, stage := range stages[:targetIdx+1] {
+		state, err := evaluateBuildStage(stage)
+		if err != nil {
+			cleanupStageImages()
+			fail(err.Error())
 			return
 		}
+		for k, v := range queryLabels {
+			state.labels[k] = v
+		}
+		baseRef := normalizeImageRef(resolveStageBaseRef(stage.baseRef, stageRefs))
+		send(map[string]string{"stream": fmt.Sprintf("Step %d: resolving base image %s\n", step, baseRef)})
+		step++
+		if err := h.ensureBuildBaseImage(baseRef, send); err != nil {
+			cleanupStageImages()
+			fail("pull base image: " + err.Error())
+			return
+		}
+
+		tmpID := "build-" + generateID()[:12]
+		rec := &store.ContainerRecord{
+			ID:         tmpID,
+			Name:       tmpID,
+			Image:      baseRef,
+			ImageID:    baseRef,
+			Created:    time.Now(),
+			Env:        append([]string{}, state.env...),
+			Entrypoint: state.entrypoint,
+			Cmd:        state.cmd,
+		}
+		if err := h.store.AddContainer(rec); err != nil {
+			cleanupStageImages()
+			fail("create temp build record: " + err.Error())
+			return
+		}
+
+		cleanupTemp := func() {
+			if st, _ := h.mgr.State(tmpID); st == "running" {
+				_ = h.mgr.StopContainer(tmpID, 5*time.Second)
+			}
+			_ = h.mgr.RemoveContainer(tmpID)
+			_ = h.store.RemoveContainer(tmpID)
+		}
+
+		send(map[string]string{"stream": fmt.Sprintf("Step %d: cloning base image into temporary builder %s\n", step, tmpID)})
+		step++
+		if err := h.mgr.CreateContainer(tmpID, baseRef, buildContainerConfigFromState(state)); err != nil {
+			_ = h.store.RemoveContainer(tmpID)
+			cleanupStageImages()
+			fail("create temporary builder: " + err.Error())
+			return
+		}
+
+		rootfs := h.mgr.RootfsPath(tmpID)
+		for _, inst := range stage.instructions {
+			send(map[string]string{"stream": fmt.Sprintf("Step %d: %s %s\n", step, inst.op, inst.args)})
+			step++
+			switch inst.op {
+			case "FROM", "LABEL", "ARG", "USER", "STOPSIGNAL", "HEALTHCHECK", "VOLUME", "SHELL":
+				continue
+			case "WORKDIR":
+				dst := resolveContainerPath(state.workdir, inst.args)
+				if err := os.MkdirAll(filepath.Join(rootfs, strings.TrimPrefix(dst, "/")), 0o755); err != nil {
+					cleanupTemp()
+					cleanupStageImages()
+					fail("WORKDIR: " + err.Error())
+					return
+				}
+				state.workdir = dst
+			case "ENV":
+				state.env = mergeEnv(state.env, parseEnvInstruction(inst.args))
+			case "COPY", "ADD":
+				if err := h.applyCopyInstruction(ctxDir, rootfs, state.workdir, inst.args, stageRefs, send); err != nil {
+					cleanupTemp()
+					cleanupStageImages()
+					fail(inst.op + ": " + err.Error())
+					return
+				}
+			case "RUN":
+				script := inst.args
+				if state.workdir != "" {
+					script = fmt.Sprintf("mkdir -p %q && cd %q && %s", state.workdir, state.workdir, inst.args)
+				}
+				shellArgs := runShell(state.shell)
+				args := append([]string{rootfs}, shellArgs...)
+				args = append(args, script)
+				cmd := exec.Command("chroot", args...)
+				cmd.Env = append(os.Environ(), state.env...)
+				out, err := cmd.CombinedOutput()
+				if len(out) > 0 {
+					send(map[string]string{"stream": string(out)})
+				}
+				if err != nil {
+					cleanupTemp()
+					cleanupStageImages()
+					fail("RUN failed: " + err.Error())
+					return
+				}
+			case "CMD":
+				state.cmd = parseCommandInstruction(inst.args)
+			case "ENTRYPOINT":
+				state.entrypoint = parseCommandInstruction(inst.args)
+			case "EXPOSE":
+				state.exposed = append(state.exposed, strings.Fields(inst.args)...)
+			default:
+				cleanupTemp()
+				cleanupStageImages()
+				fail(fmt.Sprintf("unsupported Dockerfile instruction %q on line %d", inst.op, inst.line))
+				return
+			}
+		}
+
+		outRef := normalizeImageRef(tag)
+		if idx != targetIdx {
+			outRef = normalizeImageRef(fmt.Sprintf("dld-build-stage-%s-%d:latest", buildNonce, idx))
+			tempRefs = append(tempRefs, outRef)
+		}
+		send(map[string]string{"stream": fmt.Sprintf("Step %d: finalizing stage %s\n", step, outRef)})
+		step++
+		if err := h.finalizeBuiltImage(tmpID, outRef, state); err != nil {
+			cleanupTemp()
+			cleanupStageImages()
+			fail("finalize image: " + err.Error())
+			return
+		}
+		stageRefs[strconv.Itoa(idx)] = outRef
+		if stage.name != "" {
+			stageRefs[stage.name] = outRef
+		}
 	}
 
-	send(map[string]string{"stream": fmt.Sprintf("Step %d: finalizing image %s\n", len(instrs)+3, normalizeImageRef(tag))})
-	if err := h.finalizeBuiltImage(tmpID, normalizeImageRef(tag), state); err != nil {
-		cleanupTemp()
-		fail("finalize image: " + err.Error())
-		return
-	}
-
+	cleanupStageImages()
 	send(map[string]string{"stream": fmt.Sprintf("Successfully built %s\n", normalizeImageRef(tag))})
 	send(map[string]any{"aux": map[string]string{"ID": normalizeImageRef(tag)}})
 }
@@ -370,21 +422,15 @@ func parseDockerfile(contents string) ([]dockerfileInstruction, error) {
 	return out, nil
 }
 
-func evaluateBuildState(instrs []dockerfileInstruction) (buildState, error) {
+func evaluateBuildStage(stage dockerfileStage) (buildState, error) {
 	state := buildState{
 		workdir: "/",
 		env:     []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 		labels:  map[string]string{},
 	}
-	fromCount := 0
-	for _, inst := range instrs {
+	state.baseRef = stage.baseRef
+	for _, inst := range stage.instructions {
 		switch inst.op {
-		case "FROM":
-			fromCount++
-			if fromCount > 1 {
-				return state, fmt.Errorf("multi-stage builds are not supported")
-			}
-			state.baseRef = strings.Fields(inst.args)[0]
 		case "WORKDIR":
 			state.workdir = resolveContainerPath(state.workdir, inst.args)
 		case "ENV":
@@ -422,6 +468,88 @@ func evaluateBuildState(instrs []dockerfileInstruction) (buildState, error) {
 		return state, fmt.Errorf("Dockerfile must contain FROM")
 	}
 	return state, nil
+}
+
+func splitDockerfileStages(instrs []dockerfileInstruction) ([]dockerfileStage, error) {
+	stages := []dockerfileStage{}
+	current := dockerfileStage{}
+	seenFrom := false
+	for _, inst := range instrs {
+		if inst.op == "FROM" {
+			if seenFrom {
+				stages = append(stages, current)
+			}
+			baseRef, name, err := parseFromInstruction(inst.args)
+			if err != nil {
+				return nil, fmt.Errorf("parse FROM on line %d: %w", inst.line, err)
+			}
+			current = dockerfileStage{
+				baseRef:      baseRef,
+				name:         name,
+				instructions: []dockerfileInstruction{inst},
+			}
+			seenFrom = true
+			continue
+		}
+		if !seenFrom {
+			if inst.op == "ARG" {
+				continue
+			}
+			return nil, fmt.Errorf("Dockerfile must contain FROM before %s on line %d", inst.op, inst.line)
+		}
+		current.instructions = append(current.instructions, inst)
+	}
+	if seenFrom {
+		stages = append(stages, current)
+	}
+	if len(stages) == 0 {
+		return nil, fmt.Errorf("Dockerfile must contain FROM")
+	}
+	return stages, nil
+}
+
+func parseFromInstruction(args string) (baseRef, name string, err error) {
+	tokens := splitShellTokens(args)
+	clean := make([]string, 0, len(tokens))
+	for i := 0; i < len(tokens); i++ {
+		if strings.HasPrefix(tokens[i], "--") {
+			if tokens[i] == "--platform" && i+1 < len(tokens) {
+				i++
+			}
+			continue
+		}
+		clean = append(clean, tokens[i])
+	}
+	if len(clean) == 0 {
+		return "", "", fmt.Errorf("missing base image")
+	}
+	baseRef = clean[0]
+	if len(clean) >= 3 && strings.EqualFold(clean[1], "AS") {
+		name = clean[2]
+	}
+	return baseRef, name, nil
+}
+
+func selectBuildTarget(stages []dockerfileStage, target string) (int, error) {
+	if len(stages) == 0 {
+		return -1, fmt.Errorf("no build stages found")
+	}
+	if strings.TrimSpace(target) == "" {
+		return len(stages) - 1, nil
+	}
+	for idx, stage := range stages {
+		if stage.name == target || strconv.Itoa(idx) == target {
+			return idx, nil
+		}
+	}
+	return -1, fmt.Errorf("target stage %q not found", target)
+}
+
+func resolveStageBaseRef(baseRef string, stageRefs map[string]string) string {
+	if ref, ok := stageRefs[baseRef]; ok {
+		return ref
+	}
+	return baseRef
 }
 
 // parseHealthcheckInstruction handles the two HEALTHCHECK forms:
@@ -687,28 +815,68 @@ func parseCommandInstruction(args string) []string {
 	return []string{"/bin/sh", "-lc", args}
 }
 
-func applyCopyInstruction(ctxDir, rootfs, workdir, args string) error {
-	parts := strings.Fields(args)
-	clean := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if strings.HasPrefix(p, "--") {
+func parseCopyInstruction(args string) (from string, sources []string, dest string, err error) {
+	tokens := splitShellTokens(args)
+	clean := make([]string, 0, len(tokens))
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		if !strings.HasPrefix(tok, "--") {
+			clean = append(clean, tok)
 			continue
 		}
-		clean = append(clean, p)
+		switch {
+		case strings.HasPrefix(tok, "--from="):
+			from = strings.TrimPrefix(tok, "--from=")
+		case tok == "--from" && i+1 < len(tokens):
+			i++
+			from = tokens[i]
+		default:
+			if !strings.Contains(tok, "=") && i+1 < len(tokens) && (tok == "--chmod" || tok == "--chown") {
+				i++
+			}
+		}
 	}
 	if len(clean) < 2 {
+		return "", nil, "", fmt.Errorf("COPY/ADD requires at least one source and a destination")
+	}
+	return from, clean[:len(clean)-1], clean[len(clean)-1], nil
+}
+
+func (h *Handler) applyCopyInstruction(ctxDir, rootfs, workdir, args string, stageRefs map[string]string, send func(any)) error {
+	from, srcs, dest, err := parseCopyInstruction(args)
+	if err != nil {
 		return fmt.Errorf("COPY/ADD requires at least one source and a destination")
 	}
-	dest := resolveContainerPath(workdir, clean[len(clean)-1])
+	dest = resolveContainerPath(workdir, dest)
 	destAbs := filepath.Join(rootfs, strings.TrimPrefix(dest, "/"))
-	srcs := clean[:len(clean)-1]
 	if len(srcs) > 1 {
 		if err := os.MkdirAll(destAbs, 0o755); err != nil {
 			return err
 		}
 	}
+	sourceRoot := ctxDir
+	cleanup := func() {}
+	if from != "" {
+		resolvedFrom := resolveStageBaseRef(from, stageRefs)
+		normRef := normalizeImageRef(resolvedFrom)
+		if h.store.GetImage(normRef) == nil {
+			if err := h.ensureBuildBaseImage(normRef, send); err != nil {
+				return err
+			}
+		}
+		var err error
+		sourceRoot, cleanup, err = h.openImageRootfs(h.store.GetImage(normRef))
+		if err != nil {
+			return err
+		}
+	}
+	defer cleanup()
 	for _, src := range srcs {
-		srcAbs, err := safeJoin(ctxDir, src)
+		srcPath := src
+		if from != "" {
+			srcPath = resolveContainerPath("/", src)
+		}
+		srcAbs, err := safeJoin(sourceRoot, srcPath)
 		if err != nil {
 			return err
 		}
