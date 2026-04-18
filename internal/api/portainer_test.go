@@ -188,30 +188,43 @@ func TestSwarmRoutesReturnSwarmUnavailable(t *testing.T) {
 
 	r := mustMuxRouter(t, h.routes())
 	tests := []struct {
-		path string
+		method string
+		path   string
 	}{
-		{"/v1.45/swarm"},
-		{"/v1.45/swarm/init"},
-		{"/v1.45/swarm/join"},
-		{"/v1.45/swarm/leave"},
-		{"/v1.45/nodes"},
-		{"/v1.45/services"},
-		{"/v1.45/tasks"},
-		{"/v1.45/configs"},
-		{"/v1.45/secrets"},
+		{method: http.MethodGet, path: "/v1.45/swarm"},
+		{method: http.MethodPost, path: "/v1.45/swarm/init"},
+		{method: http.MethodPost, path: "/v1.45/swarm/join"},
+		{method: http.MethodPost, path: "/v1.45/swarm/leave"},
+		{method: http.MethodGet, path: "/v1.45/swarm/unlockkey"},
+		{method: http.MethodPost, path: "/v1.45/swarm/update"},
+		{method: http.MethodGet, path: "/v1.45/nodes"},
+		{method: http.MethodGet, path: "/v1.45/nodes/node-1"},
+		{method: http.MethodPost, path: "/v1.45/nodes/node-1/update"},
+		{method: http.MethodGet, path: "/v1.45/services"},
+		{method: http.MethodPost, path: "/v1.45/services/create"},
+		{method: http.MethodGet, path: "/v1.45/services/service-1"},
+		{method: http.MethodDelete, path: "/v1.45/services/service-1"},
+		{method: http.MethodPost, path: "/v1.45/services/service-1/update"},
+		{method: http.MethodGet, path: "/v1.45/services/service-1/logs"},
+		{method: http.MethodGet, path: "/v1.45/tasks"},
+		{method: http.MethodGet, path: "/v1.45/tasks/task-1"},
+		{method: http.MethodGet, path: "/v1.45/configs"},
+		{method: http.MethodPost, path: "/v1.45/configs/create"},
+		{method: http.MethodGet, path: "/v1.45/configs/config-1"},
+		{method: http.MethodDelete, path: "/v1.45/configs/config-1"},
+		{method: http.MethodGet, path: "/v1.45/secrets"},
+		{method: http.MethodPost, path: "/v1.45/secrets/create"},
+		{method: http.MethodGet, path: "/v1.45/secrets/secret-1"},
+		{method: http.MethodDelete, path: "/v1.45/secrets/secret-1"},
 	}
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.path, func(t *testing.T) {
 			t.Parallel()
-			method := http.MethodGet
-			if tc.path == "/v1.45/swarm/init" || tc.path == "/v1.45/swarm/join" || tc.path == "/v1.45/swarm/leave" {
-				method = http.MethodPost
-			}
-			req := httptest.NewRequest(method, tc.path, nil)
-			match := &mux.RouteMatch{}
-			if !r.Match(req, match) {
-				t.Fatalf("expected %s route to match", tc.path)
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, httptest.NewRequest(tc.method, tc.path, nil))
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected 503 for %s %s, got %d body=%s", tc.method, tc.path, rr.Code, rr.Body.String())
 			}
 		})
 	}
