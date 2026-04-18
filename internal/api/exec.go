@@ -179,11 +179,22 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		// concurrent /resize request can forward the ioctl. runExecTTY
 		// clears it before returning.
 		runExecTTY(cmd, conn, func(ptmx *os.File) {
-			h.execs.update(rec.ID, func(r *execRecord) { r.Pty = ptmx })
+			h.execs.update(rec.ID, func(r *execRecord) {
+				r.Pty = ptmx
+				if cmd.Process != nil {
+					r.Pid = cmd.Process.Pid
+				}
+			})
 		})
 		h.execs.update(rec.ID, func(r *execRecord) { r.Pty = nil })
 	} else {
-		runExecMux(cmd, conn)
+		runExecMux(cmd, conn, func() {
+			h.execs.update(rec.ID, func(r *execRecord) {
+				if cmd.Process != nil {
+					r.Pid = cmd.Process.Pid
+				}
+			})
+		})
 	}
 
 	code := 0
@@ -192,25 +203,40 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 	}
 	h.execs.update(rec.ID, func(r *execRecord) {
 		r.Running = false
+		r.Pid = 0
 		r.ExitCode = code
 	})
 }
 
 func (h *Handler) startDetachedExec(execID string, cmd *exec.Cmd) {
-	h.execs.update(execID, func(r *execRecord) {
-		r.Running = true
-		r.StartedAt = time.Now()
-	})
 	go func() {
-		err := cmd.Run()
+		if err := cmd.Start(); err != nil {
+			h.execs.update(execID, func(r *execRecord) {
+				r.Running = false
+				r.Pid = 0
+				r.ExitCode = 1
+			})
+			return
+		}
+		h.execs.update(execID, func(r *execRecord) {
+			r.Running = true
+			r.StartedAt = time.Now()
+			if cmd.Process != nil {
+				r.Pid = cmd.Process.Pid
+			}
+		})
+		err := cmd.Wait()
 		code := 0
 		if err != nil {
 			if ee, ok := err.(*exec.ExitError); ok {
 				code = ee.ExitCode()
+			} else {
+				code = 1
 			}
 		}
 		h.execs.update(execID, func(r *execRecord) {
 			r.Running = false
+			r.Pid = 0
 			r.ExitCode = code
 		})
 	}()
@@ -249,6 +275,7 @@ func (h *Handler) execInspect(w http.ResponseWriter, r *http.Request) {
 		OpenStderr: rec.AttachStderr,
 		CanRemove:  !rec.Running,
 		DetachKeys: rec.DetachKeys,
+		Pid:        rec.Pid,
 	})
 }
 
@@ -295,7 +322,7 @@ func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter, onReady func(*os.File)) {
 
 // runExecMux runs cmd with pipes and multiplexes stdout/stderr into the
 // Docker raw-stream format. Used when Tty=false.
-func runExecMux(cmd *exec.Cmd, conn io.ReadWriter) {
+func runExecMux(cmd *exec.Cmd, conn io.ReadWriter, onStart func()) {
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
 	cmd.Stdout = stdoutW
@@ -304,6 +331,9 @@ func runExecMux(cmd *exec.Cmd, conn io.ReadWriter) {
 	if err := cmd.Start(); err != nil {
 		writeLogFrame(conn, 2, []byte("error: "+err.Error()+"\n"))
 		return
+	}
+	if onStart != nil {
+		onStart()
 	}
 
 	var wg sync.WaitGroup

@@ -668,6 +668,7 @@ type execRecord struct {
 	WorkingDir  string
 	User        string
 	Privileged  bool
+	Pid         int
 	ExitCode    int
 	Running     bool
 	StartedAt   time.Time
