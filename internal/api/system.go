@@ -69,6 +69,7 @@ func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
 		components = append(components, VersionComponent{
 			Name:    "LXC",
 			Version: v,
+			Details: map[string]string{},
 		})
 	}
 
@@ -164,7 +165,7 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 		},
 		Swarm: SwarmInfo{
 			LocalNodeState: "inactive",
-			RemoteManagers: nil,
+			RemoteManagers: []string{},
 		},
 		Plugins: PluginsInfo{
 			Volume:        []string{"local"},
@@ -187,6 +188,7 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 		SecurityOptions:    []string{"name=seccomp,profile=default"},
 		LoggingDriver:      "json-file",
 		Warnings:           []string{},
+		ClientInfo:         map[string]string{},
 	}
 	jsonResponse(w, http.StatusOK, resp)
 }

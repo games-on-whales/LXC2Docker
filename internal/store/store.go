@@ -45,8 +45,12 @@ type ContainerRecord struct {
 	Hostname     string              `json:"hostname,omitempty"`
 	Domainname   string              `json:"domainname,omitempty"`
 	User         string              `json:"user,omitempty"`
+	AttachStdin  bool                `json:"attach_stdin,omitempty"`
+	AttachStdout bool                `json:"attach_stdout,omitempty"`
+	AttachStderr bool                `json:"attach_stderr,omitempty"`
 	Tty          bool                `json:"tty,omitempty"`
 	OpenStdin    bool                `json:"open_stdin,omitempty"`
+	StdinOnce    bool                `json:"stdin_once,omitempty"`
 	WorkingDir   string              `json:"working_dir,omitempty"`
 	StopSignal   string              `json:"stop_signal,omitempty"`
 	ExposedPorts map[string]struct{} `json:"exposed_ports,omitempty"`

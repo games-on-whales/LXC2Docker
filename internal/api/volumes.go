@@ -159,6 +159,7 @@ func volumeCreateResponse(v *store.VolumeRecord) VolumeCreateResponse {
 		CreatedAt:  v.CreatedAt.Format(time.RFC3339),
 		Labels:     normalizeStringMap(v.Labels),
 		Options:    normalizeStringMap(v.Options),
+		Status:     map[string]string{},
 		Scope:      "local",
 	}
 }
@@ -180,6 +181,7 @@ func volumeUsage(st *store.Store, v *store.VolumeRecord, size int64) VolumeUsage
 		CreatedAt:  v.CreatedAt.Format(time.RFC3339),
 		Labels:     normalizeStringMap(v.Labels),
 		Options:    normalizeStringMap(v.Options),
+		Status:     map[string]string{},
 		Scope:      "local",
 		UsageData: VolumeUsageData{
 			RefCount: refCount,

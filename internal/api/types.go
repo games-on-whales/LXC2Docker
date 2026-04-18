@@ -303,6 +303,7 @@ type VolumeCreateResponse struct {
 	CreatedAt  string            `json:"CreatedAt"`
 	Labels     map[string]string `json:"Labels"`
 	Options    map[string]string `json:"Options"`
+	Status     map[string]string `json:"Status"`
 	Scope      string            `json:"Scope"`
 }
 
@@ -314,6 +315,7 @@ type VolumeUsage struct {
 	CreatedAt  string            `json:"CreatedAt"`
 	Labels     map[string]string `json:"Labels"`
 	Options    map[string]string `json:"Options"`
+	Status     map[string]string `json:"Status"`
 	Scope      string            `json:"Scope"`
 	UsageData  VolumeUsageData   `json:"UsageData"`
 }
@@ -519,6 +521,8 @@ type ExecProcessConfig struct {
 	Tty        bool     `json:"tty"`
 	Entrypoint string   `json:"entrypoint"`
 	Arguments  []string `json:"arguments"`
+	User       string   `json:"user"`
+	Privileged bool     `json:"privileged"`
 }
 
 // --- System ---
@@ -545,7 +549,7 @@ type VersionResponse struct {
 type VersionComponent struct {
 	Name    string            `json:"Name"`
 	Version string            `json:"Version"`
-	Details map[string]string `json:"Details,omitempty"`
+	Details map[string]string `json:"Details"`
 }
 
 // InfoResponse is a trimmed body for GET /info. It includes the fields
@@ -590,7 +594,7 @@ type InfoResponse struct {
 	SecurityOptions    []string          `json:"SecurityOptions"`
 	LoggingDriver      string            `json:"LoggingDriver"`
 	Warnings           []string          `json:"Warnings"`
-	ClientInfo         map[string]string `json:"ClientInfo,omitempty"`
+	ClientInfo         map[string]string `json:"ClientInfo"`
 }
 
 // RegistryConfig is the nested RegistryConfig object in /info.
@@ -655,9 +659,13 @@ type execRecord struct {
 	ContainerID string
 	Cmd         []string
 	Tty         bool
+	AttachStdin bool
+	AttachStdout bool
+	AttachStderr bool
 	Env         []string
 	WorkingDir  string
 	User        string
+	Privileged  bool
 	ExitCode    int
 	Running     bool
 	StartedAt   time.Time

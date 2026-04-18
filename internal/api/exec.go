@@ -96,9 +96,13 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 		ContainerID: containerID,
 		Cmd:         req.Cmd,
 		Tty:         req.Tty,
+		AttachStdin: req.AttachStdin,
+		AttachStdout: req.AttachStdout,
+		AttachStderr: req.AttachStderr,
 		Env:         mergedEnv,
 		WorkingDir:  req.WorkingDir,
 		User:        req.User,
+		Privileged:  req.Privileged,
 	}
 	h.execs.add(rec)
 
@@ -227,11 +231,13 @@ func (h *Handler) execInspect(w http.ResponseWriter, r *http.Request) {
 		ProcessConfig: ExecProcessConfig{
 			Tty:        rec.Tty,
 			Entrypoint: entrypoint,
-			Arguments:  args,
+			Arguments:  ensureSlice(args),
+			User:       rec.User,
+			Privileged: rec.Privileged,
 		},
-		OpenStdin:  rec.Tty,
-		OpenStdout: true,
-		OpenStderr: !rec.Tty,
+		OpenStdin:  rec.AttachStdin,
+		OpenStdout: rec.AttachStdout,
+		OpenStderr: rec.AttachStderr,
 		CanRemove:  !rec.Running,
 	})
 }
