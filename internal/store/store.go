@@ -178,10 +178,19 @@ type ImageRecord struct {
 	OCICmd        []string          `json:"oci_cmd,omitempty"`
 	OCIEnv        []string          `json:"oci_env,omitempty"`
 	OCIWorkingDir string            `json:"oci_working_dir,omitempty"`
+	OCIHostname   string            `json:"oci_hostname,omitempty"`
+	OCIDomainname string            `json:"oci_domainname,omitempty"`
 	OCIPorts      []string          `json:"oci_ports,omitempty"`
 	OCILabels     map[string]string `json:"oci_labels,omitempty"`
 	OCIUser       string            `json:"oci_user,omitempty"`
+	OCIAttachStdin bool             `json:"oci_attach_stdin,omitempty"`
+	OCIAttachStdout bool            `json:"oci_attach_stdout,omitempty"`
+	OCIAttachStderr bool            `json:"oci_attach_stderr,omitempty"`
+	OCITty        bool              `json:"oci_tty,omitempty"`
+	OCIOpenStdin  bool              `json:"oci_open_stdin,omitempty"`
+	OCIStdinOnce  bool              `json:"oci_stdin_once,omitempty"`
 	OCIStopSignal string            `json:"oci_stop_signal,omitempty"`
+	OCIStopTimeout int              `json:"oci_stop_timeout,omitempty"`
 	OCIHealthcheck *HealthcheckConfig `json:"oci_healthcheck,omitempty"`
 	OCIVolumes    []string          `json:"oci_volumes,omitempty"`
 	OCIShell      []string          `json:"oci_shell,omitempty"`

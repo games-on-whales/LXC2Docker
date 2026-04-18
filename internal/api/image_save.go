@@ -309,14 +309,23 @@ func synthesiseImageConfig(rec *store.ImageRecord, layerSHA string) ([]byte, str
 		}
 	}
 	cfg := map[string]any{
+		"Hostname":     rec.OCIHostname,
+		"Domainname":   rec.OCIDomainname,
 		"Env":          append([]string{}, rec.OCIEnv...),
 		"Cmd":          append([]string{}, rec.OCICmd...),
 		"Entrypoint":   append([]string{}, rec.OCIEntrypoint...),
 		"WorkingDir":   rec.OCIWorkingDir,
 		"User":         rec.OCIUser,
+		"AttachStdin":  rec.OCIAttachStdin,
+		"AttachStdout": rec.OCIAttachStdout,
+		"AttachStderr": rec.OCIAttachStderr,
 		"StopSignal":   rec.OCIStopSignal,
+		"StopTimeout":  rec.OCIStopTimeout,
 		"Labels":       copyLabels(rec.OCILabels),
 		"ExposedPorts": ports,
+		"Tty":          rec.OCITty,
+		"OpenStdin":    rec.OCIOpenStdin,
+		"StdinOnce":    rec.OCIStdinOnce,
 		"Volumes":      volumes,
 	}
 	if hc := rec.OCIHealthcheck; hc != nil {
@@ -393,14 +402,23 @@ type saveImageConfig struct {
 }
 
 type saveImageConfigBody struct {
+	Hostname     string              `json:"Hostname"`
+	Domainname   string              `json:"Domainname"`
 	Env          []string            `json:"Env"`
 	Cmd          []string            `json:"Cmd"`
 	Entrypoint   []string            `json:"Entrypoint"`
 	WorkingDir   string              `json:"WorkingDir"`
 	User         string              `json:"User"`
+	AttachStdin  bool                `json:"AttachStdin"`
+	AttachStdout bool                `json:"AttachStdout"`
+	AttachStderr bool                `json:"AttachStderr"`
 	StopSignal   string              `json:"StopSignal"`
+	StopTimeout  *int                `json:"StopTimeout"`
 	Labels       map[string]string   `json:"Labels"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
+	Tty          bool                `json:"Tty"`
+	OpenStdin    bool                `json:"OpenStdin"`
+	StdinOnce    bool                `json:"StdinOnce"`
 	Volumes      map[string]struct{} `json:"Volumes"`
 	Healthcheck  *struct {
 		Test        []string `json:"Test"`
@@ -516,6 +534,8 @@ func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send 
 			TemplateDataset: dataset,
 			Created:         createdAt,
 			Release:         cfg.OSVersion,
+			OCIHostname:     effective.Hostname,
+			OCIDomainname:   effective.Domainname,
 			OCIEntrypoint:   append([]string{}, effective.Entrypoint...),
 			OCICmd:          append([]string{}, effective.Cmd...),
 			OCIEnv:          append([]string{}, effective.Env...),
@@ -523,7 +543,14 @@ func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send 
 			OCIPorts:        mapKeys(effective.ExposedPorts),
 			OCILabels:       copyLabels(effective.Labels),
 			OCIUser:         effective.User,
+			OCIAttachStdin:  effective.AttachStdin,
+			OCIAttachStdout: effective.AttachStdout,
+			OCIAttachStderr: effective.AttachStderr,
+			OCITty:          effective.Tty,
+			OCIOpenStdin:    effective.OpenStdin,
+			OCIStdinOnce:    effective.StdinOnce,
 			OCIStopSignal:   effective.StopSignal,
+			OCIStopTimeout:  stopTimeoutValue(effective.StopTimeout),
 			OCIVolumes:      mapKeys(effective.Volumes),
 		}
 		if hc := effective.Healthcheck; hc != nil && len(hc.Test) > 0 {

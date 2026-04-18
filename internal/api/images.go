@@ -448,8 +448,16 @@ func imageConfigFromRecord(rec *store.ImageRecord) *ContainerConfig {
 		}
 	}
 	return normalizeContainerConfig(&ContainerConfig{
+		Hostname:     rec.OCIHostname,
+		Domainname:   rec.OCIDomainname,
 		User:         rec.OCIUser,
+		AttachStdin:  rec.OCIAttachStdin,
+		AttachStdout: rec.OCIAttachStdout,
+		AttachStderr: rec.OCIAttachStderr,
 		ExposedPorts: exposed,
+		Tty:          rec.OCITty,
+		OpenStdin:    rec.OCIOpenStdin,
+		StdinOnce:    rec.OCIStdinOnce,
 		Volumes:      volumes,
 		Cmd:          rec.OCICmd,
 		Entrypoint:   rec.OCIEntrypoint,
@@ -457,6 +465,7 @@ func imageConfigFromRecord(rec *store.ImageRecord) *ContainerConfig {
 		Labels:       ensureMap(rec.OCILabels),
 		WorkingDir:   rec.OCIWorkingDir,
 		StopSignal:   rec.OCIStopSignal,
+		StopTimeout:  stopTimeoutPtr(rec.OCIStopTimeout),
 		Healthcheck:  healthcheckFromImage(rec),
 	})
 }

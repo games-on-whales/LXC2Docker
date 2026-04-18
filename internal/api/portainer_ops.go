@@ -619,8 +619,17 @@ func (h *Handler) commitContainer(w http.ResponseWriter, r *http.Request) {
 	dup.OCIWorkingDir = committedString(rec.WorkingDir, src.OCIWorkingDir)
 	dup.OCIPorts = committedSetKeys(rec.ExposedPorts, src.OCIPorts)
 	dup.OCILabels = committedLabels(rec.Labels, src.OCILabels)
+	dup.OCIHostname = committedString(rec.Hostname, src.OCIHostname)
+	dup.OCIDomainname = committedString(rec.Domainname, src.OCIDomainname)
 	dup.OCIUser = committedString(rec.User, src.OCIUser)
+	dup.OCIAttachStdin = committedBool(rec.AttachStdin, src.OCIAttachStdin)
+	dup.OCIAttachStdout = committedBool(rec.AttachStdout, src.OCIAttachStdout)
+	dup.OCIAttachStderr = committedBool(rec.AttachStderr, src.OCIAttachStderr)
+	dup.OCITty = committedBool(rec.Tty, src.OCITty)
+	dup.OCIOpenStdin = committedBool(rec.OpenStdin, src.OCIOpenStdin)
+	dup.OCIStdinOnce = committedBool(rec.StdinOnce, src.OCIStdinOnce)
 	dup.OCIStopSignal = committedString(rec.StopSignal, src.OCIStopSignal)
+	dup.OCIStopTimeout = committedInt(rec.StopTimeout, src.OCIStopTimeout)
 	dup.OCIHealthcheck = committedHealthcheck(rec, src.OCIHealthcheck)
 	dup.OCIVolumes = committedSetKeys(rec.Volumes, src.OCIVolumes)
 	applyCommitConfig(&dup, cfg)
@@ -669,6 +678,20 @@ func committedStringSlice(values, fallback []string) []string {
 		return append([]string{}, fallback...)
 	}
 	return append([]string{}, values...)
+}
+
+func committedBool(value, fallback bool) bool {
+	if value {
+		return true
+	}
+	return fallback
+}
+
+func committedInt(value, fallback int) int {
+	if value != 0 {
+		return value
+	}
+	return fallback
 }
 
 func committedSetKeys(values map[string]struct{}, fallback []string) []string {
@@ -738,9 +761,18 @@ type commitConfig struct {
 	Entrypoint   []string            `json:"Entrypoint"`
 	Env          []string            `json:"Env"`
 	Labels       map[string]string   `json:"Labels"`
+	Hostname     *string             `json:"Hostname"`
+	Domainname   *string             `json:"Domainname"`
 	User         *string             `json:"User"`
+	AttachStdin  *bool               `json:"AttachStdin"`
+	AttachStdout *bool               `json:"AttachStdout"`
+	AttachStderr *bool               `json:"AttachStderr"`
+	Tty          *bool               `json:"Tty"`
+	OpenStdin    *bool               `json:"OpenStdin"`
+	StdinOnce    *bool               `json:"StdinOnce"`
 	WorkingDir   *string             `json:"WorkingDir"`
 	StopSignal   *string             `json:"StopSignal"`
+	StopTimeout  *int                `json:"StopTimeout"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
 	Volumes      map[string]struct{} `json:"Volumes"`
 	Healthcheck  *Healthcheck        `json:"Healthcheck"`
@@ -778,14 +810,41 @@ func applyCommitConfig(rec *store.ImageRecord, cfg *commitConfig) {
 	if cfg.Labels != nil {
 		rec.OCILabels = copyLabels(cfg.Labels)
 	}
+	if cfg.Hostname != nil {
+		rec.OCIHostname = *cfg.Hostname
+	}
+	if cfg.Domainname != nil {
+		rec.OCIDomainname = *cfg.Domainname
+	}
 	if cfg.User != nil {
 		rec.OCIUser = *cfg.User
+	}
+	if cfg.AttachStdin != nil {
+		rec.OCIAttachStdin = *cfg.AttachStdin
+	}
+	if cfg.AttachStdout != nil {
+		rec.OCIAttachStdout = *cfg.AttachStdout
+	}
+	if cfg.AttachStderr != nil {
+		rec.OCIAttachStderr = *cfg.AttachStderr
+	}
+	if cfg.Tty != nil {
+		rec.OCITty = *cfg.Tty
+	}
+	if cfg.OpenStdin != nil {
+		rec.OCIOpenStdin = *cfg.OpenStdin
+	}
+	if cfg.StdinOnce != nil {
+		rec.OCIStdinOnce = *cfg.StdinOnce
 	}
 	if cfg.WorkingDir != nil {
 		rec.OCIWorkingDir = *cfg.WorkingDir
 	}
 	if cfg.StopSignal != nil {
 		rec.OCIStopSignal = *cfg.StopSignal
+	}
+	if cfg.StopTimeout != nil {
+		rec.OCIStopTimeout = *cfg.StopTimeout
 	}
 	if cfg.ExposedPorts != nil {
 		rec.OCIPorts = mapKeys(cfg.ExposedPorts)
