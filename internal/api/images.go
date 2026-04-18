@@ -29,6 +29,7 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cutoff := parsePruneUntil(filt["until"])
+	wantDangling := danglingWant(filt["dangling"])
 
 	grouped := map[string]*ImageSummary{}
 	ids := []string{}
@@ -40,6 +41,9 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if !filt.matchLabel(rec.OCILabels) {
+			continue
+		}
+		if wantDangling != nil && *wantDangling != imageIsDangling(rec) {
 			continue
 		}
 		key := rec.ID
@@ -366,6 +370,24 @@ func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]string{"Deleted": "sha256:" + img.ID})
 	}
 	jsonResponse(w, http.StatusOK, out)
+}
+
+func danglingWant(vals []string) *bool {
+	for _, v := range vals {
+		switch v {
+		case "1", "true":
+			t := true
+			return &t
+		case "0", "false":
+			f := false
+			return &f
+		}
+	}
+	return nil
+}
+
+func imageIsDangling(rec *store.ImageRecord) bool {
+	return rec.Ref == "" || strings.HasSuffix(rec.Ref, "<none>:<none>")
 }
 
 func (h *Handler) findImageByID(id string) *store.ImageRecord {

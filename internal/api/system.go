@@ -170,7 +170,7 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 		Isolation:          "",
 		CgroupDriver:       detectCgroupDriver(),
 		CgroupVersion:      detectCgroupVersion(),
-		SystemTime:         time.Now().Format(time.RFC3339Nano),
+		SystemTime:         time.Now().UTC().Format(time.RFC3339Nano),
 		Labels:             []string{},
 		ExperimentalBuild:  false,
 		HTTPProxy:          os.Getenv("HTTP_PROXY"),

@@ -1166,12 +1166,16 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 			errResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		rec := h.store.GetContainer(id)
+		h.emitContainer("die", rec)
 	}
 	if err := h.mgr.StartContainer(id); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	h.emitContainer("restart", h.store.GetContainer(id))
+	rec := h.store.GetContainer(id)
+	h.emitContainer("start", rec)
+	h.emitContainer("restart", rec)
 	w.WriteHeader(http.StatusNoContent)
 }
 
