@@ -439,6 +439,12 @@ type ExecInspect struct {
 	Running       bool              `json:"Running"`
 	ExitCode      int               `json:"ExitCode"`
 	ProcessConfig ExecProcessConfig `json:"ProcessConfig"`
+	OpenStdin     bool              `json:"OpenStdin"`
+	OpenStderr    bool              `json:"OpenStderr"`
+	OpenStdout    bool              `json:"OpenStdout"`
+	CanRemove     bool              `json:"CanRemove"`
+	DetachKeys    string            `json:"DetachKeys"`
+	Pid           int               `json:"Pid"`
 }
 
 // ExecProcessConfig holds the command run via exec.

@@ -126,9 +126,26 @@ func (h *Handler) pruneContainers(w http.ResponseWriter, r *http.Request) {
 // leave the set untouched and report no work done. Acking prevents the UI
 // from showing an error.
 func (h *Handler) pruneImages(w http.ResponseWriter, r *http.Request) {
+	used := map[string]bool{}
+	for _, c := range h.store.ListContainers() {
+		used[normalizeImageRef(c.Image)] = true
+	}
+	var deleted []map[string]string
+	var reclaimed int64
+	for _, img := range h.store.ListImages() {
+		if used[img.Ref] {
+			continue
+		}
+		reclaimed += imageSize(h.mgr.LXCPath(), img)
+		if err := h.mgr.RemoveImage(img.Ref); err == nil {
+			deleted = append(deleted, map[string]string{"Untagged": img.Ref})
+			deleted = append(deleted, map[string]string{"Deleted": "sha256:" + img.ID})
+			h.emitImage("delete", img.Ref)
+		}
+	}
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"ImagesDeleted":  []any{},
-		"SpaceReclaimed": 0,
+		"ImagesDeleted":  deleted,
+		"SpaceReclaimed": reclaimed,
 	})
 }
 

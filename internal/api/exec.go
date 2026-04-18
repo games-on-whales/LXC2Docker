@@ -225,6 +225,10 @@ func (h *Handler) execInspect(w http.ResponseWriter, r *http.Request) {
 			Entrypoint: entrypoint,
 			Arguments:  args,
 		},
+		OpenStdin:  rec.Tty,
+		OpenStdout: true,
+		OpenStderr: !rec.Tty,
+		CanRemove:  !rec.Running,
 	})
 }
 

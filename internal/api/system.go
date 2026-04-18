@@ -285,63 +285,78 @@ func (h *Handler) pruneNetworks(w http.ResponseWriter, r *http.Request) {
 // fetch from `zfs get used`, but that would add a shell-out per entry).
 func (h *Handler) systemDF(w http.ResponseWriter, r *http.Request) {
 	lxcPath := h.mgr.LXCPath()
+	wanted := map[string]bool{}
+	for _, t := range r.URL.Query()["type"] {
+		wanted[strings.ToLower(t)] = true
+	}
+	all := len(wanted) == 0
 
-	var layersSize int64
-	images := make([]map[string]any, 0)
-	for _, img := range h.store.ListImages() {
-		size := imageSize(lxcPath, img)
-		layersSize += size
-		images = append(images, map[string]any{
-			"Id":          "sha256:" + img.ID,
-			"RepoTags":    []string{img.Ref},
-			"RepoDigests": []string{},
-			"Created":     img.Created.Unix(),
-			"Size":        size,
-			"VirtualSize": size,
-			"SharedSize":  0,
-			"Containers":  -1,
-		})
+	resp := map[string]any{"LayersSize": int64(0)}
+
+	if all || wanted["image"] {
+		var layersSize int64
+		images := make([]map[string]any, 0)
+		for _, img := range h.store.ListImages() {
+			size := imageSize(lxcPath, img)
+			layersSize += size
+			images = append(images, map[string]any{
+				"Id":          "sha256:" + img.ID,
+				"RepoTags":    []string{img.Ref},
+				"RepoDigests": []string{},
+				"Created":     img.Created.Unix(),
+				"Size":        size,
+				"VirtualSize": size,
+				"SharedSize":  0,
+				"Containers":  -1,
+			})
+		}
+		resp["LayersSize"] = layersSize
+		resp["Images"] = images
 	}
 
-	containers := make([]map[string]any, 0)
-	for _, c := range h.store.ListContainers() {
-		size := rootfsSize(h.mgr.RootfsPath(c.ID))
-		containers = append(containers, map[string]any{
-			"Id":         c.ID,
-			"Names":      []string{"/" + c.Name},
-			"Image":      c.Image,
-			"ImageID":    c.ImageID,
-			"Created":    c.Created.Unix(),
-			"SizeRw":     size,
-			"SizeRootFs": size,
-			"State":      "", // Portainer doesn't read this on df
-			"Labels":     c.Labels,
-		})
+	if all || wanted["container"] {
+		containers := make([]map[string]any, 0)
+		for _, c := range h.store.ListContainers() {
+			size := rootfsSize(h.mgr.RootfsPath(c.ID))
+			containers = append(containers, map[string]any{
+				"Id":         c.ID,
+				"Names":      []string{"/" + c.Name},
+				"Image":      c.Image,
+				"ImageID":    c.ImageID,
+				"Created":    c.Created.Unix(),
+				"SizeRw":     size,
+				"SizeRootFs": size,
+				"State":      "",
+				"Labels":     c.Labels,
+			})
+		}
+		resp["Containers"] = containers
 	}
 
-	volumes := make([]map[string]any, 0)
-	for _, v := range h.store.ListVolumes() {
-		volumes = append(volumes, map[string]any{
-			"Name":       v.Name,
-			"Driver":     v.Driver,
-			"Mountpoint": v.Mountpoint,
-			"CreatedAt":  v.Created.Format(time.RFC3339),
-			"Scope":      "local",
-			"Labels":     v.Labels,
-			"UsageData": map[string]int64{
-				"Size":     rootfsSize(v.Mountpoint),
-				"RefCount": int64(volumeRefCount(h.store, v.Name)),
-			},
-		})
+	if all || wanted["volume"] {
+		volumes := make([]map[string]any, 0)
+		for _, v := range h.store.ListVolumes() {
+			volumes = append(volumes, map[string]any{
+				"Name":       v.Name,
+				"Driver":     v.Driver,
+				"Mountpoint": v.Mountpoint,
+				"CreatedAt":  v.Created.Format(time.RFC3339),
+				"Scope":      "local",
+				"Labels":     v.Labels,
+				"UsageData": map[string]int64{
+					"Size":     rootfsSize(v.Mountpoint),
+					"RefCount": int64(volumeRefCount(h.store, v.Name)),
+				},
+			})
+		}
+		resp["Volumes"] = volumes
 	}
 
-	jsonResponse(w, http.StatusOK, map[string]any{
-		"LayersSize": layersSize,
-		"Images":     images,
-		"Containers": containers,
-		"Volumes":    volumes,
-		"BuildCache": []any{},
-	})
+	if all || wanted["build-cache"] {
+		resp["BuildCache"] = []any{}
+	}
+
+	jsonResponse(w, http.StatusOK, resp)
 }
 
 // rootfsSize is a best-effort disk-usage walker for a directory. Errors on

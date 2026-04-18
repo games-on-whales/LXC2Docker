@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -401,6 +402,9 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, summary)
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Created > out[j].Created
+	})
 	jsonResponse(w, http.StatusOK, out)
 }
 
@@ -682,21 +686,42 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	// Poll until the container stops.
+	condition := r.URL.Query().Get("condition")
+	if condition == "" {
+		condition = "not-running"
+	}
+	wasRunning := false
+	if state, _ := h.mgr.State(id); state == "running" {
+		wasRunning = true
+	}
 	ctx := r.Context()
 	for {
-		state, _ := h.mgr.State(id)
-		if state != "running" {
-			jsonResponse(w, http.StatusOK, map[string]any{
-				"StatusCode": 0,
-				"Error":      nil,
-			})
-			return
-		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(500 * time.Millisecond):
+		}
+		switch condition {
+		case "removed":
+			if h.store.GetContainer(id) == nil {
+				jsonResponse(w, http.StatusOK, map[string]any{"StatusCode": 0, "Error": nil})
+				return
+			}
+		case "next-exit":
+			state, _ := h.mgr.State(id)
+			if !wasRunning && state == "running" {
+				wasRunning = true
+			}
+			if wasRunning && state != "running" {
+				jsonResponse(w, http.StatusOK, map[string]any{"StatusCode": 0, "Error": nil})
+				return
+			}
+		default:
+			state, _ := h.mgr.State(id)
+			if state != "running" {
+				jsonResponse(w, http.StatusOK, map[string]any{"StatusCode": 0, "Error": nil})
+				return
+			}
 		}
 	}
 }
@@ -730,6 +755,10 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
 	if id == "" {
 		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+	if r.URL.Query().Get("link") == "1" || r.URL.Query().Get("link") == "true" {
+		errResponse(w, http.StatusBadRequest, "container links are not supported by docker-lxc-daemon")
 		return
 	}
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
