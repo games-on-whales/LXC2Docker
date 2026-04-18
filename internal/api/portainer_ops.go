@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
 
@@ -601,6 +602,16 @@ func (h *Handler) commitContainer(w http.ResponseWriter, r *http.Request) {
 	dup := *src
 	dup.Ref = ref
 	dup.Created = time.Now()
+	dup.OCIEntrypoint = committedStringSlice(rec.Entrypoint, src.OCIEntrypoint)
+	dup.OCICmd = committedStringSlice(rec.Cmd, src.OCICmd)
+	dup.OCIEnv = committedStringSlice(rec.Env, src.OCIEnv)
+	dup.OCIWorkingDir = committedString(rec.WorkingDir, src.OCIWorkingDir)
+	dup.OCIPorts = committedSetKeys(rec.ExposedPorts, src.OCIPorts)
+	dup.OCILabels = committedLabels(rec.Labels, src.OCILabels)
+	dup.OCIUser = committedString(rec.User, src.OCIUser)
+	dup.OCIStopSignal = committedString(rec.StopSignal, src.OCIStopSignal)
+	dup.OCIHealthcheck = committedHealthcheck(rec, src.OCIHealthcheck)
+	dup.OCIVolumes = committedSetKeys(rec.Volumes, src.OCIVolumes)
 	if err := h.store.AddImage(&dup); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -609,4 +620,54 @@ func (h *Handler) commitContainer(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusCreated, map[string]string{
 		"Id": "sha256:" + dup.ID,
 	})
+}
+
+func committedString(value, fallback string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return fallback
+}
+
+func committedStringSlice(values, fallback []string) []string {
+	if len(values) == 0 {
+		return append([]string{}, fallback...)
+	}
+	return append([]string{}, values...)
+}
+
+func committedSetKeys(values map[string]struct{}, fallback []string) []string {
+	if len(values) == 0 {
+		return append([]string{}, fallback...)
+	}
+	return append([]string{}, mapKeys(values)...)
+}
+
+func committedLabels(values, fallback map[string]string) map[string]string {
+	if len(values) == 0 {
+		return copyLabels(fallback)
+	}
+	return copyLabels(values)
+}
+
+func committedHealthcheck(rec *store.ContainerRecord, fallback *store.HealthcheckConfig) *store.HealthcheckConfig {
+	if len(rec.HealthcheckTest) > 0 {
+		return &store.HealthcheckConfig{
+			Test:        append([]string{}, rec.HealthcheckTest...),
+			Interval:    rec.HealthcheckInterval,
+			Timeout:     rec.HealthcheckTimeout,
+			Retries:     rec.HealthcheckRetries,
+			StartPeriod: rec.HealthcheckStartPeriod,
+		}
+	}
+	if fallback == nil {
+		return nil
+	}
+	return &store.HealthcheckConfig{
+		Test:        append([]string{}, fallback.Test...),
+		Interval:    fallback.Interval,
+		Timeout:     fallback.Timeout,
+		Retries:     fallback.Retries,
+		StartPeriod: fallback.StartPeriod,
+	}
 }
