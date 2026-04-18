@@ -137,6 +137,8 @@ type VolumeRecord struct {
 	Created    time.Time         `json:"created"`
 	Labels     map[string]string `json:"labels,omitempty"`
 	Options    map[string]string `json:"options,omitempty"`
+	OwnerID    string            `json:"owner_id,omitempty"`
+	Anonymous  bool              `json:"anonymous,omitempty"`
 }
 
 type state struct {
@@ -254,6 +256,7 @@ func (s *Store) GetContainer(id string) *ContainerRecord {
 func (s *Store) FindContainerByName(name string) *ContainerRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	name = strings.TrimPrefix(name, "/")
 	for _, r := range s.data.Containers {
 		if r.Name == name {
 			return r

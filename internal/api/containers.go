@@ -174,13 +174,11 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	// rely on this so state persists across container rebuilds even
 	// without an explicit --mount flag.
 	for path := range req.Volumes {
-		// Skip paths that already have an explicit bind or mount — user
-		// intent wins over the Dockerfile's VOLUME directive.
 		if hasMountAt(storeMounts, path) {
 			continue
 		}
 		volName := generateID()[:12] + "_anon"
-		mountpoint, err := h.ensureVolume(volName)
+		mountpoint, err := h.ensureVolumeOwned(volName, id, true)
 		if err != nil {
 			continue
 		}
@@ -758,8 +756,23 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusConflict, err.Error())
 		return
 	}
+	os.Remove(h.mgr.LogPath(id))
+	os.Remove(h.mgr.LogPath(id) + ".1")
+	if r.URL.Query().Get("v") == "1" || r.URL.Query().Get("v") == "true" {
+		h.removeAnonVolumesOf(id)
+	}
 	h.emitContainer("destroy", rec)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) removeAnonVolumesOf(id string) {
+	for _, v := range h.store.ListVolumes() {
+		if !v.Anonymous || v.OwnerID != id {
+			continue
+		}
+		os.RemoveAll(v.Mountpoint)
+		h.store.RemoveVolume(v.Name)
+	}
 }
 
 // GET /containers/{id}/logs
@@ -1097,6 +1110,10 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	q := r.URL.Query()
+	logsFlag := q.Get("logs") == "1" || q.Get("logs") == "true"
+	streamFlag := q.Get("stream") != "0" && q.Get("stream") != "false"
+
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		errResponse(w, http.StatusInternalServerError, "streaming not supported")
@@ -1115,8 +1132,49 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 	buf.WriteString("\r\n")
 	buf.Flush()
 
-	cmd := h.mgr.Exec(id, []string{"/bin/sh"}, nil)
-	runExecTTY(cmd, conn, nil)
+	logPath := h.mgr.LogPath(id)
+	if logsFlag {
+		if f, err := os.Open(logPath); err == nil {
+			io.Copy(conn, f)
+			f.Close()
+		}
+	}
+	if !streamFlag {
+		return
+	}
+
+	f, err := os.OpenFile(logPath, os.O_RDONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.Seek(0, io.SeekEnd)
+
+	ctx := r.Context()
+	buffer := make([]byte, 32*1024)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if s, _ := h.mgr.State(id); s != "running" && s != "paused" {
+			return
+		}
+		n, readErr := f.Read(buffer)
+		if n > 0 {
+			if _, err := conn.Write(buffer[:n]); err != nil {
+				return
+			}
+		}
+		if readErr == io.EOF || n == 0 {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		if readErr != nil {
+			return
+		}
+	}
 }
 
 // safeJoin joins base and untrusted path, returning an error if the result
@@ -1438,6 +1496,10 @@ func hasMountAt(mounts []store.MountSpec, dest string) bool {
 // it on demand. Anonymous volumes and compose-declared-but-not-pre-created
 // volumes both rely on auto-creation; this matches Docker's behavior.
 func (h *Handler) ensureVolume(name string) (string, error) {
+	return h.ensureVolumeOwned(name, "", false)
+}
+
+func (h *Handler) ensureVolumeOwned(name, owner string, anonymous bool) (string, error) {
 	if v := h.store.GetVolume(name); v != nil {
 		return v.Mountpoint, nil
 	}
@@ -1450,6 +1512,8 @@ func (h *Handler) ensureVolume(name string) (string, error) {
 		Driver:     "local",
 		Mountpoint: mountpoint,
 		Created:    time.Now(),
+		OwnerID:    owner,
+		Anonymous:  anonymous,
 	}
 	if err := h.store.AddVolume(rec); err != nil {
 		return "", err
