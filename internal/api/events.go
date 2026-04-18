@@ -151,10 +151,17 @@ func (h *Handler) emitVolume(action, name string) {
 }
 
 func (h *Handler) emitNetwork(action, id, name string) {
+	h.emitNetworkFull(action, id, name, "")
+}
+
+func (h *Handler) emitNetworkFull(action, id, name, containerID string) {
 	now := time.Now()
 	attrs := map[string]string{"type": "bridge"}
 	if name != "" {
 		attrs["name"] = name
+	}
+	if containerID != "" {
+		attrs["container"] = containerID
 	}
 	h.events.publish(Event{
 		Type:   "network",
@@ -326,6 +333,9 @@ func matchEvent(f filters, ev Event) bool {
 		return false
 	}
 	if f.has("event") && !f.matchAny("event", ev.Action) {
+		return false
+	}
+	if f.has("scope") && !f.matchAny("scope", ev.Scope) {
 		return false
 	}
 	if f.has("container") {

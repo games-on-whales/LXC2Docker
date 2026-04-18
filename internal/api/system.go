@@ -247,6 +247,12 @@ func (h *Handler) listNetworks(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
+		if filt.has("label") {
+			labels, _ := n["Labels"].(map[string]string)
+			if !filt.matchLabel(labels) {
+				continue
+			}
+		}
 		out = append(out, n)
 	}
 	jsonResponse(w, http.StatusOK, out)
@@ -324,7 +330,15 @@ func (h *Handler) connectNetwork(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "network not found")
 		return
 	}
-	h.emitNetwork("connect", id, "")
+	var body struct {
+		Container string `json:"Container"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	cid := ""
+	if body.Container != "" {
+		cid = h.store.ResolveID(body.Container)
+	}
+	h.emitNetworkFull("connect", id, "", cid)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -334,7 +348,15 @@ func (h *Handler) disconnectNetwork(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "network not found")
 		return
 	}
-	h.emitNetwork("disconnect", id, "")
+	var body struct {
+		Container string `json:"Container"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	cid := ""
+	if body.Container != "" {
+		cid = h.store.ResolveID(body.Container)
+	}
+	h.emitNetworkFull("disconnect", id, "", cid)
 	w.WriteHeader(http.StatusOK)
 }
 
