@@ -185,6 +185,8 @@ type ContainerJSON struct {
 	Driver          string           `json:"Driver"`
 	Platform        string           `json:"Platform"`
 	GraphDriver     GraphDriver      `json:"GraphDriver"`
+	SizeRw          int64            `json:"SizeRw,omitempty"`
+	SizeRootFs      int64            `json:"SizeRootFs,omitempty"`
 	Config          *ContainerConfig `json:"Config"`
 	HostConfig      *HostConfig      `json:"HostConfig"`
 	Mounts          []MountJSON      `json:"Mounts"`
@@ -412,6 +414,8 @@ type ExecCreateRequest struct {
 	Tty          bool     `json:"Tty"`
 	Env          []string `json:"Env"`
 	WorkingDir   string   `json:"WorkingDir"`
+	User         string   `json:"User"`
+	Privileged   bool     `json:"Privileged"`
 }
 
 // ExecCreateResponse is the body returned by POST /containers/{id}/exec.

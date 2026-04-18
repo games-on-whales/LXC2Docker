@@ -318,6 +318,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 // GET /containers/json
 func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
+	withSize := r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true"
 	filt := parseFilters(r)
 	records := h.store.ListContainers()
 
@@ -376,7 +377,7 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		for _, m := range rec.Mounts {
 			mounts = append(mounts, mountJSONFrom(m))
 		}
-		out = append(out, ContainerSummary{
+		summary := ContainerSummary{
 			ID:      rec.ID,
 			Names:   []string{"/" + rec.Name},
 			Image:   normalizeImageRef(rec.Image),
@@ -394,7 +395,13 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			NetworkSettings: &ContainerSummaryNetSettings{
 				Networks: networkSettingsFor(rec),
 			},
-		})
+		}
+		if withSize {
+			sz := rootfsSize(h.mgr.RootfsPath(rec.ID))
+			summary.SizeRw = sz
+			summary.SizeRootFs = sz
+		}
+		out = append(out, summary)
 	}
 	jsonResponse(w, http.StatusOK, out)
 }
@@ -553,6 +560,11 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Networks:    networkSettingsFor(rec),
 		},
 	}
+	if r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true" {
+		sz := rootfsSize(h.mgr.RootfsPath(id))
+		resp.SizeRw = sz
+		resp.SizeRootFs = sz
+	}
 	jsonResponse(w, http.StatusOK, resp)
 }
 
@@ -561,6 +573,10 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
 	if id == "" {
 		errResponse(w, http.StatusNotFound, "No such container")
+		return
+	}
+	if s, _ := h.mgr.State(id); s == "running" {
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	if err := h.mgr.StartContainer(id); err != nil {
@@ -614,7 +630,15 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	if err := h.mgr.StopContainer(id, stopTimeout(r)); err != nil {
+	if s, _ := h.mgr.State(id); s != "running" && s != "paused" {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	stopSig := ""
+	if rec := h.store.GetContainer(id); rec != nil {
+		stopSig = rec.StopSignal
+	}
+	if err := h.mgr.StopContainerWithSignal(id, stopTimeout(r), stopSig); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -894,11 +918,20 @@ func parseUnixTS(v string) time.Time {
 	if v == "" {
 		return time.Time{}
 	}
-	ts, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		return time.Time{}
+	if ts, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return time.Unix(ts, 0)
 	}
-	return time.Unix(ts, 0)
+	if ts, err := strconv.ParseFloat(v, 64); err == nil {
+		sec := int64(ts)
+		nsec := int64((ts - float64(sec)) * 1e9)
+		return time.Unix(sec, nsec)
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, v); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 // readRotatedTail opens a rotated log file (<log>.1) and returns up to n

@@ -94,6 +94,7 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 		Tty:         req.Tty,
 		Env:         mergedEnv,
 		WorkingDir:  req.WorkingDir,
+		User:        req.User,
 	}
 	h.execs.add(rec)
 
@@ -127,7 +128,7 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 
 	if req.Detach {
 		// Fire-and-forget: run the command, don't stream output.
-		cmd := h.mgr.Exec(rec.ContainerID, execCmd, rec.Env)
+		cmd := h.mgr.ExecAs(rec.ContainerID, execCmd, rec.Env, rec.User)
 		go func() {
 			err := cmd.Run()
 			code := 0
@@ -173,7 +174,7 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 
 	h.execs.update(rec.ID, func(r *execRecord) { r.Running = true; r.StartedAt = time.Now() })
 
-	cmd := h.mgr.Exec(rec.ContainerID, execCmd, rec.Env)
+	cmd := h.mgr.ExecAs(rec.ContainerID, execCmd, rec.Env, rec.User)
 
 	if rec.Tty {
 		closeConn = false // runExecTTY closes conn itself

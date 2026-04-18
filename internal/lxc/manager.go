@@ -1191,22 +1191,44 @@ func (m *Manager) startLXCContainer(id string) error {
 // StopContainer stops a running container gracefully, waiting up to timeout.
 // For Proxmox CTs uses pct shutdown; otherwise lxc-stop.
 func (m *Manager) StopContainer(id string, timeout time.Duration) error {
+	return m.StopContainerWithSignal(id, timeout, "")
+}
+
+func (m *Manager) StopContainerWithSignal(id string, timeout time.Duration, signal string) error {
 	state, _ := m.State(id)
 	if state != "running" {
 		return nil
 	}
 
-	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+	rec := m.store.GetContainer(id)
+	if rec != nil && rec.VMID > 0 {
 		out, err := exec.Command("pct", "shutdown",
 			fmt.Sprintf("%d", rec.VMID),
 			"--timeout", fmt.Sprintf("%d", int(timeout.Seconds())),
 		).CombinedOutput()
 		if err != nil {
-			// Fall back to forced stop.
 			out2, err2 := exec.Command("pct", "stop", fmt.Sprintf("%d", rec.VMID)).CombinedOutput()
 			if err2 != nil {
 				return fmt.Errorf("manager: pct stop %d: %s (shutdown: %s): %w", rec.VMID, out2, out, err2)
 			}
+		}
+		return nil
+	}
+
+	if signal != "" && signal != "SIGTERM" && signal != "TERM" && signal != "15" {
+		if err := m.KillContainer(id, signal); err != nil {
+			return err
+		}
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if s, _ := m.State(id); s != "running" {
+				return nil
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		out, err := exec.Command("lxc-stop", "--kill", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("manager: force stop %s: %s: %w", id, out, err)
 		}
 		return nil
 	}
@@ -1415,18 +1437,62 @@ func (m *Manager) State(id string) (string, error) {
 // Exec runs cmd inside the container. For PVE CTs uses pct exec;
 // otherwise lxc-attach. Returns an *exec.Cmd not yet started.
 func (m *Manager) Exec(id string, cmd []string, env []string) *exec.Cmd {
+	return m.ExecAs(id, cmd, env, "")
+}
+
+// ExecAs is like Exec but honors a Docker-style user spec ("uid",
+// "uid:gid", "user", or "user:group"). Passed to lxc-attach via -u/-g. PVE
+// mode doesn't support arbitrary UID/GID via pct exec, so we wrap the
+// command with su -c in that case.
+func (m *Manager) ExecAs(id string, cmd, env []string, user string) *exec.Cmd {
 	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
 		args := []string{"exec", fmt.Sprintf("%d", rec.VMID), "--"}
-		args = append(args, cmd...)
+		if user != "" {
+			joined := shellJoin(cmd)
+			args = append(args, "su", "-s", "/bin/sh", "-c", joined, userName(user))
+		} else {
+			args = append(args, cmd...)
+		}
 		c := exec.Command("pct", args...)
 		c.Env = env
 		return c
 	}
-	args := []string{"-n", id, "--lxcpath", m.lxcPath, "--"}
+	args := []string{"-n", id, "--lxcpath", m.lxcPath}
+	if user != "" {
+		uid, gid := parseUserSpec(user)
+		if uid != "" {
+			args = append(args, "-u", uid)
+		}
+		if gid != "" {
+			args = append(args, "-g", gid)
+		}
+	}
+	args = append(args, "--")
 	args = append(args, cmd...)
 	c := exec.Command("lxc-attach", args...)
 	c.Env = env
 	return c
+}
+
+func parseUserSpec(s string) (uid, gid string) {
+	u, g, _ := strings.Cut(s, ":")
+	return u, g
+}
+
+func userName(s string) string {
+	u, _, _ := strings.Cut(s, ":")
+	return u
+}
+
+func shellJoin(argv []string) string {
+	var b strings.Builder
+	for i, a := range argv {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString("'" + strings.ReplaceAll(a, "'", `'\''`) + "'")
+	}
+	return b.String()
 }
 
 // LogPath returns the console log file path for a container.
