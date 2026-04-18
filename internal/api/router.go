@@ -11,19 +11,22 @@ import (
 )
 
 // Handler is the root HTTP handler. It holds references to the LXC manager
-// and the metadata store, and owns the in-memory exec instance table.
+// and the metadata store, owns the in-memory exec instance table, and fans
+// out lifecycle events to /events subscribers.
 type Handler struct {
-	mgr   *lxc.Manager
-	store *store.Store
-	execs *execStore
+	mgr    *lxc.Manager
+	store  *store.Store
+	execs  *execStore
+	events *eventBroker
 }
 
 // NewHandler wires up the Handler and returns an http.Handler ready to serve.
 func NewHandler(mgr *lxc.Manager, st *store.Store) http.Handler {
 	h := &Handler{
-		mgr:   mgr,
-		store: st,
-		execs: newExecStore(),
+		mgr:    mgr,
+		store:  st,
+		execs:  newExecStore(),
+		events: newEventBroker(),
 	}
 	// Periodically prune completed exec records to prevent memory leaks.
 	go func() {
@@ -48,18 +51,30 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/_ping", h.ping).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/version", h.version).Methods(http.MethodGet)
 		sub.HandleFunc("/info", h.info).Methods(http.MethodGet)
-		sub.HandleFunc("/events", h.events).Methods(http.MethodGet)
+		sub.HandleFunc("/events", h.eventsStream).Methods(http.MethodGet)
+		sub.HandleFunc("/system/df", h.systemDF).Methods(http.MethodGet)
+		sub.HandleFunc("/auth", h.auth).Methods(http.MethodPost)
 
-		// Networks (stub)
+		// Networks
 		sub.HandleFunc("/networks", h.listNetworks).Methods(http.MethodGet)
-		sub.HandleFunc("/networks/{id}", h.inspectNetwork).Methods(http.MethodGet)
 		sub.HandleFunc("/networks/create", h.createNetwork).Methods(http.MethodPost)
+		sub.HandleFunc("/networks/prune", h.pruneNetworks).Methods(http.MethodPost)
+		sub.HandleFunc("/networks/{id}", h.inspectNetwork).Methods(http.MethodGet)
+		sub.HandleFunc("/networks/{id}", h.removeNetwork).Methods(http.MethodDelete)
 		sub.HandleFunc("/networks/{id}/connect", h.connectNetwork).Methods(http.MethodPost)
 		sub.HandleFunc("/networks/{id}/disconnect", h.disconnectNetwork).Methods(http.MethodPost)
+
+		// Volumes (stubs — the daemon uses bind mounts, but Portainer polls)
+		sub.HandleFunc("/volumes", h.listVolumes).Methods(http.MethodGet)
+		sub.HandleFunc("/volumes/create", h.createVolume).Methods(http.MethodPost)
+		sub.HandleFunc("/volumes/prune", h.pruneVolumes).Methods(http.MethodPost)
+		sub.HandleFunc("/volumes/{name}", h.inspectVolume).Methods(http.MethodGet)
+		sub.HandleFunc("/volumes/{name}", h.removeVolume).Methods(http.MethodDelete)
 
 		// Containers
 		sub.HandleFunc("/containers/json", h.listContainers).Methods(http.MethodGet)
 		sub.HandleFunc("/containers/create", h.createContainer).Methods(http.MethodPost)
+		sub.HandleFunc("/containers/prune", h.pruneContainers).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/json", h.inspectContainer).Methods(http.MethodGet)
 		sub.HandleFunc("/containers/{id}/start", h.startContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/stop", h.stopContainer).Methods(http.MethodPost)
@@ -67,7 +82,12 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/containers/{id}/wait", h.waitContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/restart", h.restartContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/rename", h.renameContainer).Methods(http.MethodPost)
+		sub.HandleFunc("/containers/{id}/pause", h.pauseContainer).Methods(http.MethodPost)
+		sub.HandleFunc("/containers/{id}/unpause", h.unpauseContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/top", h.topContainer).Methods(http.MethodGet)
+		sub.HandleFunc("/containers/{id}/stats", h.containerStats).Methods(http.MethodGet)
+		sub.HandleFunc("/containers/{id}/changes", h.containerChanges).Methods(http.MethodGet)
+		sub.HandleFunc("/containers/{id}/resize", h.resizeContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/attach", h.attachContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/containers/{id}/logs", h.containerLogs).Methods(http.MethodGet)
 		sub.HandleFunc("/containers/{id}/archive", h.putArchive).Methods(http.MethodPut)
@@ -77,12 +97,15 @@ func (h *Handler) routes() http.Handler {
 		// Images
 		sub.HandleFunc("/images/json", h.listImages).Methods(http.MethodGet)
 		sub.HandleFunc("/images/create", h.pullImage).Methods(http.MethodPost)
+		sub.HandleFunc("/images/prune", h.pruneImages).Methods(http.MethodPost)
 		sub.HandleFunc("/images/{name:.*}/json", h.inspectImage).Methods(http.MethodGet)
+		sub.HandleFunc("/images/{name:.*}/history", h.imageHistory).Methods(http.MethodGet)
 		sub.HandleFunc("/images/{name:.*}", h.removeImage).Methods(http.MethodDelete)
 
 		// Exec
 		sub.HandleFunc("/containers/{id}/exec", h.execCreate).Methods(http.MethodPost)
 		sub.HandleFunc("/exec/{id}/start", h.execStart).Methods(http.MethodPost)
+		sub.HandleFunc("/exec/{id}/resize", h.resizeExec).Methods(http.MethodPost)
 		sub.HandleFunc("/exec/{id}/json", h.execInspect).Methods(http.MethodGet)
 	}
 

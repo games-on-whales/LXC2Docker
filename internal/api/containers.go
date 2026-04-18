@@ -189,6 +189,8 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("createContainer: success %s", id[:12])
 
+	h.emitContainer("create", h.store.GetContainer(id))
+
 	jsonResponse(w, http.StatusCreated, ContainerCreateResponse{
 		ID:       id,
 		Warnings: []string{},
@@ -219,6 +221,20 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 				Type:        pb.Proto,
 			})
 		}
+		mounts := make([]MountJSON, 0, len(rec.Mounts))
+		for _, m := range rec.Mounts {
+			mode := "rw"
+			if m.ReadOnly {
+				mode = "ro"
+			}
+			mounts = append(mounts, MountJSON{
+				Type:        "bind",
+				Source:      m.Source,
+				Destination: m.Destination,
+				Mode:        mode,
+				RW:          !m.ReadOnly,
+			})
+		}
 		out = append(out, ContainerSummary{
 			ID:      rec.ID,
 			Names:   []string{"/" + rec.Name},
@@ -230,9 +246,43 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			Status:  stateToStatus(state, rec.Created),
 			Ports:   ports,
 			Labels:  rec.Labels,
+			Mounts:  mounts,
+			HostConfig: &ContainerSummaryHostConfig{
+				NetworkMode: networkModeFor(rec),
+			},
+			NetworkSettings: &ContainerSummaryNetSettings{
+				Networks: networkSettingsFor(rec),
+			},
 		})
 	}
 	jsonResponse(w, http.StatusOK, out)
+}
+
+// networkModeFor returns the NetworkMode string Portainer displays in the list
+// view. Matches the resolution in the create handler.
+func networkModeFor(rec *store.ContainerRecord) string {
+	if rec.Labels["gow.lan"] == "true" {
+		return "lan"
+	}
+	return "gow"
+}
+
+// networkSettingsFor builds the per-network endpoint map for a container.
+// One entry per attached network ("gow" is the daemon's managed bridge).
+func networkSettingsFor(rec *store.ContainerRecord) map[string]EndpointSettings {
+	if rec.IPAddress == "" {
+		return map[string]EndpointSettings{}
+	}
+	return map[string]EndpointSettings{
+		"gow": {
+			NetworkID:   "gow",
+			EndpointID:  rec.ID,
+			Gateway:     lxc.BridgeGW,
+			IPAddress:   rec.IPAddress,
+			IPPrefixLen: 24,
+			Aliases:     []string{rec.Name},
+		},
+	}
 }
 
 // GET /containers/{id}/json
@@ -250,6 +300,10 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 
 	state, _ := h.mgr.State(id)
 	running := state == "running"
+	paused := state == "paused"
+	if paused {
+		running = true // Docker reports Running=true and Paused=true when frozen.
+	}
 
 	// A container that was never started should report "created", not "exited".
 	// Docker uses "created" for containers that exist but have never been started.
@@ -278,13 +332,45 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// Split entrypoint[0] as Path and the rest as Args, matching what Docker
+	// does for `docker inspect`. Portainer renders these on the detail page.
+	path := ""
+	args := []string{}
+	combined := append([]string{}, rec.Entrypoint...)
+	combined = append(combined, rec.Cmd...)
+	if len(combined) > 0 {
+		path = combined[0]
+		args = combined[1:]
+	}
+
+	ports := map[string][]PortBinding{}
+	for _, pb := range rec.PortBindings {
+		key := fmt.Sprintf("%d/%s", pb.ContainerPort, pb.Proto)
+		ports[key] = append(ports[key], PortBinding{
+			HostIP:   "0.0.0.0",
+			HostPort: strconv.Itoa(pb.HostPort),
+		})
+	}
+
 	resp := ContainerJSON{
-		ID:      rec.ID,
-		Created: rec.Created.Format(time.RFC3339),
-		Name:    "/" + rec.Name,
+		ID:             rec.ID,
+		Created:        rec.Created.Format(time.RFC3339),
+		Path:           path,
+		Args:           args,
+		Name:           "/" + rec.Name,
+		ResolvConfPath: "",
+		HostnamePath:   "",
+		LogPath:        h.mgr.LogPath(id),
+		Driver:         "lxc",
+		Platform:       "linux",
+		GraphDriver: GraphDriver{
+			Name: "lxc",
+			Data: map[string]string{},
+		},
 		State: ContainerState{
 			Status:     state,
 			Running:    running,
+			Paused:     paused,
 			StartedAt:  startedAt,
 			FinishedAt: "0001-01-01T00:00:00Z",
 		},
@@ -297,17 +383,16 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Entrypoint: rec.Entrypoint,
 			Env:        rec.Env,
 			Labels:     rec.Labels,
+			WorkingDir: "",
 		},
 		HostConfig: buildHostConfig(rec),
 		NetworkSettings: NetworkSettings{
-			IPAddress: rec.IPAddress,
-			Networks: map[string]EndpointSettings{
-				"gow": {
-					IPAddress: rec.IPAddress,
-					Gateway:   lxc.BridgeGW,
-					NetworkID: "gow",
-				},
-			},
+			Bridge:      lxc.BridgeName,
+			IPAddress:   rec.IPAddress,
+			IPPrefixLen: 24,
+			Gateway:     lxc.BridgeGW,
+			Ports:       ports,
+			Networks:    networkSettingsFor(rec),
 		},
 	}
 	jsonResponse(w, http.StatusOK, resp)
@@ -342,6 +427,7 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	h.emitContainer("start", h.store.GetContainer(id))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -356,6 +442,9 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	rec := h.store.GetContainer(id)
+	h.emitContainer("stop", rec)
+	h.emitContainer("die", rec)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -397,6 +486,9 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	rec := h.store.GetContainer(id)
+	h.emitContainer("kill", rec)
+	h.emitContainer("die", rec)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -417,8 +509,11 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Snapshot the record before removing so the emitted event carries a name.
+	rec := h.store.GetContainer(id)
+
 	// Remove port forwarding rules before destroying the container.
-	if rec := h.store.GetContainer(id); rec != nil && rec.IPAddress != "" {
+	if rec != nil && rec.IPAddress != "" {
 		if err := lxc.RemovePortForwards(rec.IPAddress); err != nil {
 			log.Printf("warning: removing port forwards for %s: %v", rec.IPAddress, err)
 		}
@@ -428,6 +523,7 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusConflict, err.Error())
 		return
 	}
+	h.emitContainer("destroy", rec)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -516,6 +612,7 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.emitContainer("restart", h.store.GetContainer(id))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -542,6 +639,7 @@ func (h *Handler) renameContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.emitContainer("rename", rec)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -814,7 +912,9 @@ func (h *Handler) resolveID(idOrName string) string {
 
 // buildHostConfig reconstructs a HostConfig from the stored container record.
 func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
-	hc := &HostConfig{}
+	hc := &HostConfig{
+		NetworkMode: networkModeFor(rec),
+	}
 	if len(rec.PortBindings) > 0 {
 		hc.PortBindings = make(map[string][]PortBinding)
 		for _, pb := range rec.PortBindings {

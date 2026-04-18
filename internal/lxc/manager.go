@@ -948,6 +948,39 @@ func (m *Manager) RemoveImage(ref string) error {
 	return m.store.RemoveImage(ref)
 }
 
+// PauseContainer freezes the container's processes. Uses pct suspend for PVE
+// CTs (which writes the freezer cgroup) and lxc-freeze for legacy containers.
+func (m *Manager) PauseContainer(id string) error {
+	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+		out, err := exec.Command("pct", "suspend", fmt.Sprintf("%d", rec.VMID)).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("manager: pct suspend %d: %s: %w", rec.VMID, out, err)
+		}
+		return nil
+	}
+	out, err := exec.Command("lxc-freeze", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("manager: freeze %s: %s: %w", id, out, err)
+	}
+	return nil
+}
+
+// UnpauseContainer resumes a frozen container.
+func (m *Manager) UnpauseContainer(id string) error {
+	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+		out, err := exec.Command("pct", "resume", fmt.Sprintf("%d", rec.VMID)).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("manager: pct resume %d: %s: %w", rec.VMID, out, err)
+		}
+		return nil
+	}
+	out, err := exec.Command("lxc-unfreeze", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("manager: unfreeze %s: %s: %w", id, out, err)
+	}
+	return nil
+}
+
 // State returns the Docker-compatible state string for a container.
 // For PVE CTs uses pct status; otherwise lxc-info.
 func (m *Manager) State(id string) (string, error) {
@@ -977,6 +1010,8 @@ func (m *Manager) State(id string) (string, error) {
 	switch lxcState {
 	case "running":
 		return "running", nil
+	case "frozen":
+		return "paused", nil
 	case "stopped":
 		return "exited", nil
 	default:
