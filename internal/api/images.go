@@ -1,15 +1,18 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
 	"github.com/games-on-whales/docker-lxc-daemon/internal/oci"
 	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
 	"github.com/gorilla/mux"
@@ -17,119 +20,134 @@ import (
 
 // GET /images/json
 func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
-	filters, err := parseListFilters(r.URL.Query().Get("filters"))
-	if err != nil {
-		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
-		return
-	}
-	// Docker's `dangling` image filter is the odd one out: images without
-	// tags. We never produce untagged images, so `dangling=true` yields an
-	// empty list and `dangling=false` is a no-op.
-	if vals := filters["dangling"]; len(vals) > 0 {
-		onlyDangling := false
-		for _, v := range vals {
-			if v == "true" || v == "1" {
-				onlyDangling = true
-			}
-		}
-		if onlyDangling {
-			jsonResponse(w, http.StatusOK, []ImageSummary{})
-			return
-		}
+	filt := parseFilters(r)
+	records := h.store.ListImages()
+
+	usage := map[string]int{}
+	for _, c := range h.store.ListContainers() {
+		usage[normalizeImageRef(c.Image)]++
 	}
 
-	records := h.store.ListImages()
-	out := make([]ImageSummary, 0, len(records))
+	cutoff := parsePruneUntil(filt["until"])
+	wantDangling := danglingWant(filt["dangling"])
+
+	grouped := map[string]*ImageSummary{}
+	ids := []string{}
 	for _, rec := range records {
-		if !matchesImageFilters(rec, filters) {
+		if !filt.matchImageReference(rec.Ref) {
 			continue
 		}
-		size := h.imageSize(rec)
-		out = append(out, ImageSummary{
+		if !cutoff.IsZero() && rec.Created.After(cutoff) {
+			continue
+		}
+		if !filt.matchLabel(rec.OCILabels) {
+			continue
+		}
+		if wantDangling != nil && *wantDangling != imageIsDangling(rec) {
+			continue
+		}
+		key := rec.ID
+		if cur, ok := grouped[key]; ok {
+			cur.RepoTags = append(cur.RepoTags, rec.Ref)
+			for _, d := range digestRefs(rec) {
+				cur.RepoDigests = append(cur.RepoDigests, d)
+			}
+			cur.Containers += usage[rec.Ref]
+			continue
+		}
+		labels := rec.OCILabels
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		grouped[key] = &ImageSummary{
 			ID:          "sha256:" + rec.ID,
 			RepoTags:    []string{rec.Ref},
-			RepoDigests: repoDigestsFor(rec),
+			RepoDigests: digestRefs(rec),
 			Created:     rec.Created.Unix(),
-			Size:        size,
-			VirtualSize: size,
-			Labels:      copyLabels(rec.OCILabels),
-		})
+			Size:        imageSize(h.mgr.LXCPath(), rec),
+			VirtualSize: imageSize(h.mgr.LXCPath(), rec),
+			Labels:      labels,
+			Containers:  usage[rec.Ref],
+		}
+		ids = append(ids, key)
 	}
+	out := make([]ImageSummary, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, *grouped[id])
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Created > out[j].Created
+	})
 	jsonResponse(w, http.StatusOK, out)
 }
 
-func copyLabels(in map[string]string) map[string]string {
-	if len(in) == 0 {
-		return map[string]string{}
+// digestRefs returns RepoDigests in Docker's "<repo>@<digest>" shape. If
+// we captured a manifest digest at pull time (OCI pulls only), we emit one
+// entry; otherwise the array is empty. Portainer's image detail page shows
+// these under "Digests".
+func digestRefs(rec *store.ImageRecord) []string {
+	if rec.RepoDigest == "" {
+		return []string{}
 	}
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
+	bare := rec.Ref
+	if i := strings.Index(bare, ":"); i != -1 {
+		bare = bare[:i]
 	}
-	return out
+	return []string{bare + "@" + rec.RepoDigest}
 }
 
-// matchesImageFilters applies Docker's /images/json filter keys we support
-// (reference, label). `reference` does a substring/prefix match on the tag
-// — Docker's globbing support is richer, but Portainer only uses exact and
-// prefix matches today.
-func matchesImageFilters(rec *store.ImageRecord, f listFilters) bool {
-	if vals := f["reference"]; len(vals) > 0 {
-		ref := normalizeImageRef(rec.Ref)
-		matched := false
-		for _, v := range vals {
-			v = strings.TrimRight(v, "*")
-			if v == "" {
-				matched = true
-				break
-			}
-			if strings.Contains(ref, v) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return false
-		}
+// imageSize returns the on-disk size of an image template's rootfs. For
+// legacy LXC templates it walks the rootfs; for Proxmox CT templates it
+// asks ZFS for the dataset's `used` property so the /images/json response
+// stays fast even on large ZFS pools.
+func imageSize(lxcPath string, rec *store.ImageRecord) int64 {
+	if rec.TemplateVMID > 0 {
+		// PVE template — ask ZFS. Form: <pool>/basevol-<vmid>-disk-0.
+		// We infer the pool from the rec's template vs the daemon's
+		// configured storage; callers pass lxcPath but not storage. A
+		// storage-name lookup would require threading the Manager through,
+		// so we fall back to 0 when we can't determine the dataset.
+		return zfsDatasetSize(rec)
 	}
-	if !matchesLabelFilter(f["label"], rec.OCILabels) {
-		return false
+	if rec.TemplateName == "" {
+		return 0
 	}
-	return true
+	return rootfsSize(filepath.Join(lxcPath, rec.TemplateName, "rootfs"))
 }
 
-// POST /images/create  (docker pull, or docker import when fromSrc is set)
-// Query params: fromImage=<name>, tag=<tag>, fromSrc=<url-or-dash>
+// zfsDatasetSize runs `zfs list -H -p -o used` to pull the template dataset
+// size. The caller provides the image record; we derive the dataset name
+// using the VMID and a small whitelist of common PVE storage names. If ZFS
+// isn't present or the dataset can't be found, returns 0.
+func zfsDatasetSize(rec *store.ImageRecord) int64 {
+	// Without a direct reference to the daemon's pveStorage string we'd
+	// have to grep for matching datasets; that's costly and unnecessary.
+	// Try a simple `zfs get` against each known pool name.
+	for _, pool := range []string{"large", "rpool", "tank"} {
+		dataset := fmt.Sprintf("%s/basevol-%d-disk-0", pool, rec.TemplateVMID)
+		out, err := exec.Command("zfs", "get", "-H", "-p", "-o", "value", "used", dataset).Output()
+		if err == nil {
+			n, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+			if err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// POST /images/create  (docker pull)
+// Query params: fromImage=<name>, tag=<tag>
+// Headers: X-Registry-Auth — base64-encoded JSON credentials (Portainer
+// sets this when the user has a registry configured for the image ref).
 func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
-	fromImage := r.URL.Query().Get("fromImage")
-	fromSrc := r.URL.Query().Get("fromSrc")
+	fromImage := strings.TrimSpace(r.URL.Query().Get("fromImage"))
 	tag := r.URL.Query().Get("tag")
 	if tag == "" {
 		tag = "latest"
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	enc := json.NewEncoder(w)
-	send := func(v any) {
-		_ = enc.Encode(v)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-	}
-
-	// Portainer's "Import image" UI calls /images/create with fromSrc
-	// instead of fromImage. We don't ingest rootfs tarballs into the LXC
-	// template store yet, but returning a framed JSON error (with the
-	// same envelope pull uses) keeps Portainer's progress dialog from
-	// hanging on an empty stream.
-	if fromSrc != "" && fromImage == "" {
-		msg := "image import via fromSrc is not supported by docker-lxc-daemon; pull the image from a registry instead"
-		send(map[string]any{
-			"error":       msg,
-			"errorDetail": map[string]string{"message": msg},
-		})
+	if fromImage == "" {
+		errResponse(w, http.StatusBadRequest, "fromImage query parameter is required")
 		return
 	}
 
@@ -138,335 +156,262 @@ func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 		ref = fromImage + ":" + tag
 	}
 
-	send(map[string]string{"status": fmt.Sprintf("Pulling from %s", fromImage)})
+	creds := decodeRegistryAuth(r.Header.Get("X-Registry-Auth"))
 
-	if recovered, err := h.recoverImageRecord(ref); err != nil {
-		send(map[string]any{
-			"error":       err.Error(),
-			"errorDetail": map[string]string{"message": err.Error()},
-		})
-		return
-	} else if recovered {
-		send(map[string]string{"status": fmt.Sprintf("Status: Image is up to date for %s", ref)})
-		return
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	enc := json.NewEncoder(w)
+	flush := func() {
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+	sendStatus := func(status string) {
+		enc.Encode(map[string]string{"status": status})
+		flush()
+	}
+	sendEvent := func(ev oci.ProgressEvent) {
+		frame := map[string]any{
+			"status": ev.Status,
+		}
+		if ev.ID != "" {
+			frame["id"] = ev.ID
+		}
+		if ev.Total > 0 || ev.Current > 0 {
+			frame["progressDetail"] = map[string]int64{
+				"current": ev.Current,
+				"total":   ev.Total,
+			}
+			// Docker also includes a human-readable progress string;
+			// Portainer renders the bar from progressDetail regardless,
+			// so we skip the redundant text.
+		}
+		enc.Encode(frame)
+		flush()
 	}
 
-	err := h.mgr.PullImage(ref, "amd64", func(msg string) {
-		send(map[string]string{"status": msg})
+	sendStatus(fmt.Sprintf("Pulling from %s", fromImage))
+
+	alreadyPresent := h.store.GetImage(ref) != nil
+
+	err := h.mgr.PullImageWith(ref, "amd64", lxc.PullOpts{
+		Credentials: creds,
+		OnStatus:    sendStatus,
+		OnEvent:     sendEvent,
 	})
+	if err == nil {
+		h.emitImage("pull", ref)
+	}
 	if err != nil {
-		send(map[string]any{
-			"error":       err.Error(),
-			"errorDetail": map[string]string{"message": err.Error()},
+		enc.Encode(map[string]any{
+			"error": err.Error(),
+			"errorDetail": map[string]string{
+				"message": err.Error(),
+			},
 		})
+		flush()
 		return
 	}
 
-	send(map[string]string{"status": fmt.Sprintf("Status: Downloaded newer image for %s", ref)})
-	h.publishEvent("image", "pull", ref, map[string]string{"name": ref})
+	if alreadyPresent {
+		sendStatus(fmt.Sprintf("Status: Image is up to date for %s", ref))
+	} else {
+		sendStatus(fmt.Sprintf("Status: Downloaded newer image for %s", ref))
+	}
+}
+
+// decodeRegistryAuth parses Docker's X-Registry-Auth header, a base64url JSON
+// object. When the header is empty or malformed we return "" — skopeo then
+// does an anonymous pull, which matches the behavior before credentials
+// support was added.
+//
+// Docker's client sets the base64 with no padding; skopeo wants
+// "username:password", so we collapse identitytoken to token form when
+// that's the only credential present.
+func decodeRegistryAuth(header string) string {
+	if header == "" {
+		return ""
+	}
+	// Docker uses URL-safe base64 without padding. The stdlib strict decoder
+	// rejects both — try the permissive ones in order.
+	raw, err := base64.RawURLEncoding.DecodeString(header)
+	if err != nil {
+		if raw, err = base64.StdEncoding.DecodeString(header); err != nil {
+			if raw, err = base64.URLEncoding.DecodeString(header); err != nil {
+				return ""
+			}
+		}
+	}
+	var cfg struct {
+		Username      string `json:"username"`
+		Password      string `json:"password"`
+		Auth          string `json:"auth"` // base64("user:pass")
+		IdentityToken string `json:"identitytoken"`
+	}
+	if json.Unmarshal(raw, &cfg) != nil {
+		return ""
+	}
+	if cfg.Username != "" && cfg.Password != "" {
+		return cfg.Username + ":" + cfg.Password
+	}
+	// `auth` is pre-encoded "user:pass"; skopeo accepts the decoded form.
+	if cfg.Auth != "" {
+		if dec, err := base64.StdEncoding.DecodeString(cfg.Auth); err == nil {
+			return string(dec)
+		}
+	}
+	if cfg.IdentityToken != "" {
+		// Bearer tokens are passed to skopeo as "<oauth>:<token>" — most
+		// OCI registries accept this shape. Callers using identity tokens
+		// probably want to configure registries separately anyway.
+		return "<token>:" + cfg.IdentityToken
+	}
+	return ""
 }
 
 // GET /images/{name}/json  (docker image inspect)
+//
+// Same handler services HEAD /images/{name}/json — Portainer's "is this
+// image present?" check. We skip body writes when the request is HEAD but
+// otherwise return the identical payload.
 func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 	rec := h.store.GetImage(normalizeImageRef(name))
 	if rec == nil {
+		rec = h.findImageByID(name)
+	}
+	if rec == nil {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
 		return
 	}
-	size := h.imageSize(rec)
-	id := "sha256:" + rec.ID
-	config := imageConfigFromRecord(rec)
-	jsonResponse(w, http.StatusOK, ImageInspect{
-		ID:              id,
+	// The embedded Config mirrors the OCI image config so Portainer's
+	// "Duplicate" and "Run from image" modals pre-populate with the correct
+	// entrypoint/cmd/env. Distro and App images don't have OCI configs; we
+	// emit an empty Config so the shape is still correct.
+	labels := rec.OCILabels
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	cfg := &ContainerConfig{
+		Env:        rec.OCIEnv,
+		Cmd:        rec.OCICmd,
+		Entrypoint: rec.OCIEntrypoint,
+		WorkingDir: rec.OCIWorkingDir,
+		Labels:     labels,
+	}
+	if cfg.Env == nil {
+		cfg.Env = []string{}
+	}
+
+	resp := ImageInspect{
+		ID:              "sha256:" + rec.ID,
 		RepoTags:        []string{rec.Ref},
-		RepoDigests:     repoDigestsFor(rec),
+		RepoDigests:     digestRefs(rec),
 		Created:         rec.Created.Format(time.RFC3339),
 		Architecture:    rec.Arch,
 		Os:              "linux",
-		Size:            size,
-		VirtualSize:     size,
-		Labels:          copyLabels(rec.OCILabels),
-		DockerVersion:   "24.0.0",
-		Author:          "docker-lxc-daemon",
-		Config:          config,
-		ContainerConfig: config,
-		RootFS: ImageRootFS{
-			Type:   "layers",
-			Layers: []string{id},
-		},
-		GraphDriver: ImageGraphDriver{
+		OsVersion:       rec.Release,
+		Size:            imageSize(h.mgr.LXCPath(), rec),
+		VirtualSize:     imageSize(h.mgr.LXCPath(), rec),
+		Config:          cfg,
+		ContainerConfig: cfg,
+		GraphDriver: GraphDriver{
 			Name: "lxc",
 			Data: map[string]string{},
 		},
-	})
+		RootFS: ImageRootFS{
+			Type:   "layers",
+			Layers: []string{"sha256:" + rec.ID},
+		},
+		Metadata: ImageMetadata{
+			LastTagTime: rec.Created.Format(time.RFC3339),
+		},
+		Labels:        labels,
+		Author:        "docker-lxc-daemon",
+		DockerVersion: "24.0.0-lxc",
+	}
+
+	if r.Method == http.MethodHead {
+		body, _ := json.Marshal(resp)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	jsonResponse(w, http.StatusOK, resp)
 }
 
 // DELETE /images/{name}  (docker rmi)
 func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 	ref := normalizeImageRef(name)
+	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
+	if h.store.GetImage(ref) == nil {
+		if byID := h.findImageByID(name); byID != nil {
+			ref = byID.Ref
+		} else {
+			if force {
+				jsonResponse(w, http.StatusOK, []map[string]string{})
+				return
+			}
+			errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
+			return
+		}
+	}
+	img := h.store.GetImage(ref)
 	if err := h.mgr.RemoveImage(ref); err != nil {
+		if force {
+			jsonResponse(w, http.StatusOK, []map[string]string{})
+			return
+		}
 		errResponse(w, http.StatusConflict, err.Error())
 		return
 	}
-	h.publishEvent("image", "delete", ref, map[string]string{"name": ref})
-	jsonResponse(w, http.StatusOK, []map[string]string{
-		{"Untagged": ref},
-	})
+	h.emitImage("delete", ref)
+	out := []map[string]string{{"Untagged": ref}}
+	if img != nil {
+		out = append(out, map[string]string{"Deleted": "sha256:" + img.ID})
+	}
+	jsonResponse(w, http.StatusOK, out)
 }
 
-func (h *Handler) imageHistory(w http.ResponseWriter, r *http.Request) {
-	name := mux.Vars(r)["name"]
-	rec := h.store.GetImage(normalizeImageRef(name))
-	if rec == nil {
-		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
-		return
+func danglingWant(vals []string) *bool {
+	for _, v := range vals {
+		switch v {
+		case "1", "true":
+			t := true
+			return &t
+		case "0", "false":
+			f := false
+			return &f
+		}
 	}
-	size := h.imageSize(rec)
-	history := synthesizeImageHistory(rec, size)
-	jsonResponse(w, http.StatusOK, history)
+	return nil
 }
 
-// synthesizeImageHistory reconstructs a Dockerfile-style history list from
-// the OCI config we captured at pull time. Portainer's image "History" tab
-// shows the CreatedBy column, so one row per OCI directive (ENV/WORKDIR/
-// EXPOSE/ENTRYPOINT/CMD) is much more informative than a single "import"
-// row. The top entry carries the size; intermediate entries are marked 0.
-func synthesizeImageHistory(rec *store.ImageRecord, size int64) []ImageHistoryItem {
-	created := rec.Created.Unix()
-	id := "sha256:" + rec.ID
-	tags := []string{rec.Ref}
-	items := []ImageHistoryItem{{
-		ID:        id,
-		Created:   created,
-		CreatedBy: "docker-lxc-daemon import",
-		Tags:      tags,
-		Size:      size,
-		Comment:   "Imported into LXC template store",
-	}}
-	for _, env := range rec.OCIEnv {
-		items = append(items, ImageHistoryItem{
-			ID:        "<missing>",
-			Created:   created,
-			CreatedBy: "/bin/sh -c #(nop)  ENV " + env,
-		})
-	}
-	if rec.OCIWorkingDir != "" {
-		items = append(items, ImageHistoryItem{
-			ID:        "<missing>",
-			Created:   created,
-			CreatedBy: "/bin/sh -c #(nop) WORKDIR " + rec.OCIWorkingDir,
-		})
-	}
-	for _, port := range rec.OCIPorts {
-		items = append(items, ImageHistoryItem{
-			ID:        "<missing>",
-			Created:   created,
-			CreatedBy: "/bin/sh -c #(nop)  EXPOSE " + port,
-		})
-	}
-	if len(rec.OCIEntrypoint) > 0 {
-		items = append(items, ImageHistoryItem{
-			ID:        "<missing>",
-			Created:   created,
-			CreatedBy: "/bin/sh -c #(nop)  ENTRYPOINT " + dockerJSONList(rec.OCIEntrypoint),
-		})
-	}
-	if len(rec.OCICmd) > 0 {
-		items = append(items, ImageHistoryItem{
-			ID:        "<missing>",
-			Created:   created,
-			CreatedBy: "/bin/sh -c #(nop)  CMD " + dockerJSONList(rec.OCICmd),
-		})
-	}
-	return items
+func imageIsDangling(rec *store.ImageRecord) bool {
+	return rec.Ref == "" || strings.HasSuffix(rec.Ref, "<none>:<none>")
 }
 
-// dockerJSONList renders a slice the way Docker's history column does:
-// ["/bin/sh","-c","..."] with quoted members. Kept tiny and self-contained
-// — the real encoding/json would add escaping we don't need here.
-func dockerJSONList(xs []string) string {
-	parts := make([]string, 0, len(xs))
-	for _, x := range xs {
-		parts = append(parts, `"`+strings.ReplaceAll(x, `"`, `\"`)+`"`)
+func (h *Handler) findImageByID(id string) *store.ImageRecord {
+	id = strings.TrimPrefix(id, "sha256:")
+	if id == "" {
+		return nil
 	}
-	return "[" + strings.Join(parts, ",") + "]"
-}
-
-func (h *Handler) tagImage(w http.ResponseWriter, r *http.Request) {
-	name := mux.Vars(r)["name"]
-	src := h.store.GetImage(normalizeImageRef(name))
-	if src == nil {
-		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
-		return
-	}
-	repo := r.URL.Query().Get("repo")
-	tag := r.URL.Query().Get("tag")
-	if repo == "" {
-		errResponse(w, http.StatusBadRequest, "repo is required")
-		return
-	}
-	dstRef := repo
-	if tag != "" && !strings.Contains(repo, ":") {
-		dstRef += ":" + tag
-	}
-	dup := *src
-	dup.Ref = normalizeImageRef(dstRef)
-	if err := h.store.AddImage(&dup); err != nil {
-		errResponse(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	h.publishEvent("image", "tag", dup.Ref, map[string]string{"name": dup.Ref})
-	w.WriteHeader(http.StatusCreated)
-}
-
-func (h *Handler) searchImages(w http.ResponseWriter, r *http.Request) {
-	term := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("term")))
-	index := map[string]ImageSearchResult{}
 	for _, rec := range h.store.ListImages() {
-		name := imageSearchName(rec.Ref)
-		addImageSearchResult(index, ImageSearchResult{
-			Name:        name,
-			Description: "Image available locally in docker-lxc-daemon",
-			IsOfficial:  strings.Count(name, "/") == 0,
-		}, term)
-	}
-	for _, candidate := range curatedImageSearchResults() {
-		addImageSearchResult(index, candidate, term)
-	}
-	results := make([]ImageSearchResult, 0, len(index))
-	for _, candidate := range index {
-		results = append(results, candidate)
-	}
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].StarCount != results[j].StarCount {
-			return results[i].StarCount > results[j].StarCount
+		if rec.ID == id {
+			return rec
 		}
-		return results[i].Name < results[j].Name
-	})
-	jsonResponse(w, http.StatusOK, results)
-}
-
-func (h *Handler) pushImage(w http.ResponseWriter, r *http.Request) {
-	name := mux.Vars(r)["name"]
-	ref := normalizeImageRef(name)
-	if h.store.GetImage(ref) == nil {
-		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	enc := json.NewEncoder(w)
-	send := func(v any) {
-		_ = enc.Encode(v)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
+		if len(id) >= 4 && strings.HasPrefix(rec.ID, id) {
+			return rec
 		}
 	}
-
-	send(map[string]string{"status": "The push refers to repository [" + ref + "]"})
-	send(map[string]any{
-		"error":       "image push is not supported",
-		"errorDetail": map[string]string{"message": "image push is not supported"},
-	})
-}
-
-// repoDigestsFor returns the RepoDigests slice for an image record. Docker
-// formats it as "<repo>@<digest>" so Portainer's image detail surfaces a
-// pin-able digest reference. Returns an empty slice when the image was
-// loaded from a non-registry source (no digest captured).
-func repoDigestsFor(rec *store.ImageRecord) []string {
-	if rec == nil || rec.OCIDigest == "" {
-		return []string{}
-	}
-	repo, _ := splitImageRef(rec.Ref)
-	if repo == "" {
-		return []string{}
-	}
-	return []string{repo + "@" + rec.OCIDigest}
-}
-
-// imageConfigFromRecord materialises an ImageConfig from the OCI metadata
-// captured during pull. ExposedPorts is built from OCIPorts (strings like
-// "80/tcp") using the map-of-empty-struct shape Docker returns.
-func imageConfigFromRecord(rec *store.ImageRecord) *ImageConfig {
-	exposed := map[string]struct{}{}
-	for _, p := range rec.OCIPorts {
-		if p != "" {
-			exposed[p] = struct{}{}
-		}
-	}
-	volumes := map[string]struct{}{}
-	for _, v := range rec.OCIVolumes {
-		if v != "" {
-			volumes[v] = struct{}{}
-		}
-	}
-	var volumesMap map[string]struct{}
-	if len(volumes) > 0 {
-		volumesMap = volumes
-	}
-	return &ImageConfig{
-		Hostname:     "",
-		Image:        rec.Ref,
-		Env:          append([]string{}, rec.OCIEnv...),
-		Cmd:          append([]string{}, rec.OCICmd...),
-		Entrypoint:   append([]string{}, rec.OCIEntrypoint...),
-		WorkingDir:   rec.OCIWorkingDir,
-		Labels:       copyLabels(rec.OCILabels),
-		ExposedPorts: exposed,
-		Volumes:      volumesMap,
-		User:         rec.OCIUser,
-		StopSignal:   rec.OCIStopSignal,
-		Shell:        append([]string{}, rec.OCIShell...),
-		Healthcheck:  healthcheckFromRecord(rec.OCIHealthcheck),
-	}
-}
-
-// imageSize returns a best-effort on-disk size for an image. ZFS-backed
-// templates use `zfs get logicalreferenced` on the @tmpl snapshot; directory-
-// backed templates fall back to walking the rootfs. On failure we return 0
-// rather than an error because Portainer still renders the row usefully.
-func (h *Handler) imageSize(rec *store.ImageRecord) int64 {
-	if rec == nil {
-		return 0
-	}
-	if rec.TemplateDataset != "" {
-		if n, ok := zfsLogicalReferenced(rec.TemplateDataset); ok {
-			return n
-		}
-	}
-	if root := h.mgr.ImageRootfsPath(rec.Ref); root != "" {
-		if n, err := dirSize(root); err == nil && n > 0 {
-			return n
-		}
-	}
-	// Legacy OCI records store only TemplateName even when their data lives
-	// in ZFS. Mirror the recoverImageRecord logic and probe the guessed
-	// dataset path so those rows don't render as 0 B forever.
-	if storage := h.mgr.PVEStorage(); storage != "" {
-		guess := fmt.Sprintf("%s/dld-templates/%s", storage, oci.SafeDirName(rec.Ref))
-		if n, ok := zfsLogicalReferenced(guess); ok {
-			return n
-		}
-	}
-	return 0
-}
-
-func zfsLogicalReferenced(dataset string) (int64, bool) {
-	out, err := exec.Command("zfs", "get", "-Hpo", "value",
-		"logicalreferenced", dataset+"@tmpl").Output()
-	if err != nil {
-		return 0, false
-	}
-	n, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-	if err != nil {
-		return 0, false
-	}
-	return n, true
+	return nil
 }
 
 func normalizeImageRef(name string) string {
@@ -474,117 +419,4 @@ func normalizeImageRef(name string) string {
 		return name + ":latest"
 	}
 	return name
-}
-
-func addImageSearchResult(index map[string]ImageSearchResult, candidate ImageSearchResult, term string) {
-	nameKey := strings.ToLower(candidate.Name)
-	if term != "" {
-		haystack := strings.ToLower(candidate.Name + " " + candidate.Description)
-		if !strings.Contains(haystack, term) {
-			return
-		}
-	}
-	if existing, ok := index[nameKey]; ok {
-		index[nameKey] = mergeImageSearchResult(existing, candidate)
-		return
-	}
-	index[nameKey] = candidate
-}
-
-func mergeImageSearchResult(a, b ImageSearchResult) ImageSearchResult {
-	out := a
-	aLocal := strings.Contains(strings.ToLower(a.Description), "available locally")
-	bLocal := strings.Contains(strings.ToLower(b.Description), "available locally")
-	if b.StarCount > out.StarCount {
-		out.StarCount = b.StarCount
-	}
-	out.IsOfficial = out.IsOfficial || b.IsOfficial
-	out.IsAutomated = out.IsAutomated || b.IsAutomated
-	if aLocal && !bLocal {
-		out.Description = b.Description
-	} else if !aLocal && bLocal {
-		// Keep the richer non-local description already present.
-	} else if len(b.Description) > len(out.Description) {
-		out.Description = b.Description
-	}
-	if aLocal || bLocal {
-		if !strings.Contains(strings.ToLower(out.Description), "available locally") {
-			out.Description += "; available locally"
-		}
-	}
-	return out
-}
-
-func imageSearchName(ref string) string {
-	lastSlash := strings.LastIndex(ref, "/")
-	lastColon := strings.LastIndex(ref, ":")
-	if lastColon > lastSlash {
-		return ref[:lastColon]
-	}
-	return ref
-}
-
-func curatedImageSearchResults() []ImageSearchResult {
-	return []ImageSearchResult{
-		{Name: "alpine", Description: "Minimal Alpine Linux base image", StarCount: 9000, IsOfficial: true},
-		{Name: "ubuntu", Description: "Ubuntu base image", StarCount: 15000, IsOfficial: true},
-		{Name: "debian", Description: "Debian base image", StarCount: 5000, IsOfficial: true},
-		{Name: "nginx", Description: "Official build of Nginx", StarCount: 20000, IsOfficial: true},
-		{Name: "redis", Description: "Official build of Redis", StarCount: 19000, IsOfficial: true},
-		{Name: "postgres", Description: "Official PostgreSQL image", StarCount: 17000, IsOfficial: true},
-		{Name: "mariadb", Description: "Official MariaDB server image", StarCount: 6000, IsOfficial: true},
-		{Name: "mysql", Description: "Official MySQL server image", StarCount: 14000, IsOfficial: true},
-		{Name: "busybox", Description: "BusyBox base image", StarCount: 3500, IsOfficial: true},
-		{Name: "portainer/portainer-ce", Description: "Portainer Community Edition", StarCount: 3500, IsOfficial: false},
-		{Name: "hello-world", Description: "Hello from Docker", StarCount: 3000, IsOfficial: true},
-		{Name: "traefik", Description: "Cloud native edge router", StarCount: 12000, IsOfficial: true},
-		{Name: "grafana/grafana", Description: "Grafana observability platform", StarCount: 4500, IsOfficial: false},
-		{Name: "prom/prometheus", Description: "Prometheus monitoring server", StarCount: 2800, IsOfficial: false},
-	}
-}
-
-func (h *Handler) recoverImageRecord(ref string) (bool, error) {
-	if !h.mgr.UsePVE() {
-		return h.store.GetImage(ref) != nil, nil
-	}
-	rec := h.store.GetImage(ref)
-	if rec != nil && imageTemplateReady(h.mgr.PVEStorage(), rec) {
-		return true, nil
-	}
-	dataset := fmt.Sprintf("%s/dld-templates/%s", h.mgr.PVEStorage(), oci.SafeDirName(ref))
-	if exec.Command("zfs", "list", "-t", "snapshot", "-o", "name", "-H", dataset+"@tmpl").Run() != nil {
-		return false, nil
-	}
-	if rec == nil {
-		rec = &store.ImageRecord{
-			ID:      "oci_" + oci.SafeDirName(ref),
-			Ref:     ref,
-			Arch:    "amd64",
-			Created: time.Now(),
-		}
-	}
-	rec.TemplateDataset = dataset
-	if err := h.store.AddImage(rec); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func imageTemplateReady(pveStorage string, rec *store.ImageRecord) bool {
-	if rec == nil {
-		return false
-	}
-	switch {
-	case rec.TemplateDataset != "":
-		return exec.Command("zfs", "list", "-t", "snapshot", "-o", "name", "-H", rec.TemplateDataset+"@tmpl").Run() == nil
-	case rec.TemplateVMID > 0:
-		return true
-	case rec.TemplateName != "":
-		return true
-	default:
-		if pveStorage == "" {
-			return false
-		}
-		return false
-	}
 }

@@ -26,10 +26,40 @@ type ContainerConfig struct {
 	DeviceCgroupRules []string     // e.g. ["c 13:* rwm"]
 	NetworkMode       string       // "host" or "" (bridge)
 	IpcMode           string       // "host" or "" (private)
+	UTSMode           string       // "host" or "" (private)
+	PidMode           string       // "host" or "" (private)
 	MemoryBytes       int64        // 0 = unlimited
 	CPUShares         int64        // 0 = unlimited (relative weight)
 	CPUQuota          int64        // microseconds per 100ms period, 0 = unlimited
+	NanoCPUs          int64        // Docker's CPU limit in units of 1e-9 CPU; 1.5 CPU = 1.5e9
+	CpusetCpus        string       // Docker's --cpuset-cpus (e.g. "0-3", "0,2")
+	CpusetMems        string       // Docker's --cpuset-mems (e.g. "0")
+	PidsLimit         int64        // Maximum PIDs in the container (0 = unlimited)
+	Ulimits           []Ulimit     // Docker-style ulimits (lxc.prlimit.<name>)
+	ShmSize           int64        // /dev/shm tmpfs size in bytes (0 = kernel default)
+	BlkioWeight       uint16       // Block I/O weight (10-1000, mapped to io.weight)
 	WorkingDir        string       // container cwd; maps to lxc.init.cwd
+	// Security. Privileged grants full capabilities + unrestricted device
+	// access; equivalent to Docker's --privileged. CapAdd/CapDrop extend
+	// or restrict the default set when not privileged.
+	Privileged  bool
+	CapAdd      []string // Docker-style names e.g. "NET_ADMIN"; CAP_ prefix optional
+	CapDrop     []string
+	SecurityOpt []string // Docker's --security-opt; e.g. "no-new-privileges:true"
+	// Sysctls maps kernel parameter name → value. Written as
+	// lxc.sysctl.<key> = <val>. LXC only applies the subset that's
+	// namespaced (net.*, kernel.*); host-wide keys are rejected at start.
+	Sysctls map[string]string
+	// Tmpfs maps in-container destination path → mount options
+	// (e.g. "/run" → "rw,nosuid,size=65536k"). Empty options use
+	// reasonable Docker-compatible defaults.
+	Tmpfs map[string]string
+	// ExtraHosts is a list of "name:ip" pairs appended to /etc/hosts in
+	// the container rootfs at create time. Docker's --add-host.
+	ExtraHosts []string
+	DNS        []string
+	DNSSearch  []string
+	DNSOptions []string
 	// LogFile is where the container console output is written.
 	// Set automatically by the manager.
 	LogFile string
@@ -74,6 +104,14 @@ type ISOMount struct {
 	Storage     string // PVE storage name (e.g. "isos")
 	VolumeID    string // path within storage (e.g. "iso/Win11.iso")
 	Destination string // path inside the container (e.g. "/mnt/win11.iso")
+}
+
+// Ulimit describes a single rlimit pair. Name matches Docker's convention
+// (nofile, nproc, stack, etc.).
+type Ulimit struct {
+	Name string
+	Soft int64
+	Hard int64
 }
 
 // MountSpec describes a single bind mount.
@@ -270,7 +308,7 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 
 	// Docker-compatible default mounts: /dev/shm (shared memory) is required
 	// by most graphical apps (Wayland/wlroots), IPC, and many libraries.
-	items = append(items, configItem{"lxc.mount.entry", "tmpfs dev/shm tmpfs rw,nosuid,nodev,create=dir 0 0"})
+	items = append(items, configItem{"lxc.mount.entry", shmMountEntry(cfg.ShmSize)})
 
 	// Network configuration.
 	if cfg.LANBridge != "" {
@@ -284,14 +322,20 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	// Namespace sharing: lxc.namespace.clone lists which namespaces to
 	// CREATE (clone). Omitting a namespace means the container shares the
 	// host's instance. We only set this when at least one namespace should
-	// be shared (Docker's NetworkMode:"host" or IpcMode:"host").
-	if cfg.NetworkMode == "host" || cfg.IpcMode == "host" {
-		ns := []string{"mnt", "pid", "uts"}
+	// be shared (Docker's NetworkMode/IpcMode/UTSMode/PidMode "host").
+	if cfg.NetworkMode == "host" || cfg.IpcMode == "host" || cfg.UTSMode == "host" || cfg.PidMode == "host" {
+		ns := []string{"mnt"}
 		if cfg.NetworkMode != "host" {
 			ns = append(ns, "net")
 		}
 		if cfg.IpcMode != "host" {
 			ns = append(ns, "ipc")
+		}
+		if cfg.UTSMode != "host" {
+			ns = append(ns, "uts")
+		}
+		if cfg.PidMode != "host" {
+			ns = append(ns, "pid")
 		}
 		items = append(items, configItem{"lxc.namespace.clone", strings.Join(ns, " ")})
 	}
@@ -439,13 +483,190 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 			"lxc.cgroup2.cpu.max",
 			fmt.Sprintf("%d 100000", cfg.CPUQuota),
 		})
+	} else if cfg.NanoCPUs > 0 {
+		// NanoCPUs (Docker's --cpus flag) — 1 CPU = 1e9 NanoCPUs. Convert
+		// to cgroup v2 quota µs at the default 100 ms period. Used only
+		// when an explicit CPUQuota hasn't already pinned the value.
+		quota := cfg.NanoCPUs * 100000 / 1_000_000_000
+		if quota < 1000 {
+			quota = 1000
+		}
+		items = append(items, configItem{
+			"lxc.cgroup2.cpu.max",
+			fmt.Sprintf("%d 100000", quota),
+		})
 	}
+	if cfg.CpusetCpus != "" {
+		items = append(items, configItem{"lxc.cgroup2.cpuset.cpus", cfg.CpusetCpus})
+	}
+	if cfg.CpusetMems != "" {
+		items = append(items, configItem{"lxc.cgroup2.cpuset.mems", cfg.CpusetMems})
+	}
+	if cfg.PidsLimit > 0 {
+		items = append(items, configItem{"lxc.cgroup2.pids.max", fmt.Sprintf("%d", cfg.PidsLimit)})
+	}
+	if cfg.BlkioWeight > 0 {
+		items = append(items, configItem{"lxc.cgroup2.io.weight", fmt.Sprintf("default %d", cfg.BlkioWeight)})
+	}
+
+	// Privileged + capability handling. Docker's --privileged maps to two
+	// LXC side-effects: all capabilities are kept (we clear lxc.cap.drop)
+	// and unrestricted device access is allowed. Non-privileged CapAdd /
+	// CapDrop translate to lxc.cap.keep / lxc.cap.drop entries.
+	items = append(items, capabilityItems(cfg)...)
+	items = append(items, securityOptItems(cfg)...)
+
+	// Sysctls and Tmpfs: translated directly to LXC directives. Docker's
+	// --sysctl / --tmpfs forms both map cleanly without extra runtime work.
+	items = append(items, sysctlItems(cfg)...)
+	items = append(items, tmpfsItems(cfg)...)
+	items = append(items, ulimitItems(cfg)...)
 
 	// Console log so we can serve it via the logs API
 	if cfg.LogFile != "" {
 		items = append(items, configItem{"lxc.console.logfile", cfg.LogFile})
 	}
 
+	return items
+}
+
+// capabilityItems translates Docker's Privileged / CapAdd / CapDrop into LXC
+// config lines. Privileged wins — when set we clear all drops and grant
+// full device cgroup access. Otherwise CapDrop/CapAdd produce matching
+// lxc.cap.drop / lxc.cap.keep entries, one capability per line.
+func capabilityItems(cfg *ContainerConfig) []configItem {
+	var items []configItem
+	if cfg.Privileged {
+		// Clear any inherited drops from common.conf and allow all devices.
+		items = append(items,
+			configItem{"lxc.cap.drop", ""},
+			configItem{"lxc.cgroup2.devices.allow", "a"},
+		)
+		return items
+	}
+	for _, c := range cfg.CapDrop {
+		items = append(items, configItem{"lxc.cap.drop", normalizeCap(c)})
+	}
+	for _, c := range cfg.CapAdd {
+		items = append(items, configItem{"lxc.cap.keep", normalizeCap(c)})
+	}
+	return items
+}
+
+// normalizeCap converts Docker's capability name ("NET_ADMIN", "CAP_NET_ADMIN")
+// to LXC's form (lowercase, no CAP_ prefix).
+func normalizeCap(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.TrimPrefix(name, "cap_")
+	return name
+}
+
+// securityOptItems translates Docker --security-opt entries into LXC
+// directives. Currently only "no-new-privileges[:true|false]" is wired
+// through; other opts (seccomp profile overrides, apparmor) would require
+// custom profile plumbing outside the scope of this translation layer.
+func securityOptItems(cfg *ContainerConfig) []configItem {
+	var items []configItem
+	for _, opt := range cfg.SecurityOpt {
+		opt = strings.TrimSpace(opt)
+		key, val, _ := strings.Cut(opt, "=")
+		if val == "" {
+			key, val, _ = strings.Cut(opt, ":")
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "no-new-privileges":
+			v := strings.ToLower(strings.TrimSpace(val))
+			if v == "" || v == "true" || v == "1" {
+				items = append(items, configItem{"lxc.no_new_privs", "1"})
+			}
+		}
+	}
+	return items
+}
+
+// sysctlItems emits one lxc.sysctl.<key> = <value> per configured sysctl.
+// LXC applies these in the container's namespaces at start; keys it can't
+// set (non-namespaced, like kernel.pid_max) cause the container to fail
+// fast with a clear error, which matches Docker's behavior.
+func sysctlItems(cfg *ContainerConfig) []configItem {
+	if len(cfg.Sysctls) == 0 {
+		return nil
+	}
+	items := make([]configItem, 0, len(cfg.Sysctls))
+	for k, v := range cfg.Sysctls {
+		// Reject injection via newlines/equals in the key — LXC would
+		// otherwise parse a value as a second config directive.
+		if strings.ContainsAny(k, "\n\r=") || strings.ContainsAny(v, "\n\r") {
+			continue
+		}
+		items = append(items, configItem{"lxc.sysctl." + k, v})
+	}
+	return items
+}
+
+func shmMountEntry(size int64) string {
+	opts := "rw,nosuid,nodev,create=dir"
+	if size > 0 {
+		opts += fmt.Sprintf(",size=%d", size)
+	}
+	return "tmpfs dev/shm tmpfs " + opts + " 0 0"
+}
+
+// ulimitItems maps HostConfig.Ulimits onto lxc.prlimit.<name> directives.
+// LXC's format is `soft[:hard]`; when Hard equals Soft or is zero we emit
+// just the soft value.
+func ulimitItems(cfg *ContainerConfig) []configItem {
+	if len(cfg.Ulimits) == 0 {
+		return nil
+	}
+	items := make([]configItem, 0, len(cfg.Ulimits))
+	for _, u := range cfg.Ulimits {
+		name := strings.ToLower(strings.TrimSpace(u.Name))
+		if name == "" || strings.ContainsAny(name, "\r\n=") {
+			continue
+		}
+		val := formatUlimitValue(u.Soft, u.Hard)
+		items = append(items, configItem{"lxc.prlimit." + name, val})
+	}
+	return items
+}
+
+func formatUlimitValue(soft, hard int64) string {
+	softStr := "unlimited"
+	if soft >= 0 {
+		softStr = fmt.Sprintf("%d", soft)
+	}
+	if hard == 0 || hard == soft {
+		return softStr
+	}
+	hardStr := "unlimited"
+	if hard > 0 {
+		hardStr = fmt.Sprintf("%d", hard)
+	}
+	return softStr + ":" + hardStr
+}
+
+// tmpfsItems emits one lxc.mount.entry per requested tmpfs. Docker's
+// HostConfig.Tmpfs value is a mount option string (e.g. "size=64m,noexec");
+// LXC's fstab-style entry wants flags in the 4th column. When the caller
+// gave no options we default to the same set Docker uses
+// (rw,nosuid,nodev,noexec).
+func tmpfsItems(cfg *ContainerConfig) []configItem {
+	if len(cfg.Tmpfs) == 0 {
+		return nil
+	}
+	items := make([]configItem, 0, len(cfg.Tmpfs))
+	for dest, options := range cfg.Tmpfs {
+		if options == "" {
+			options = "rw,nosuid,nodev,noexec"
+		}
+		// The LXC entry is fstab-style. `create=dir` makes LXC mkdir the
+		// target if it doesn't exist, matching Docker's behavior for
+		// paths that aren't in the image.
+		rel := strings.TrimPrefix(dest, "/")
+		entry := fmt.Sprintf("tmpfs %s tmpfs %s,create=dir 0 0", rel, options)
+		items = append(items, configItem{"lxc.mount.entry", entry})
+	}
 	return items
 }
 
@@ -658,7 +879,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	items = append(items, configItem{"lxc.mount.auto", "proc:mixed sys:mixed"})
 
 	// /dev/shm
-	items = append(items, configItem{"lxc.mount.entry", "tmpfs dev/shm tmpfs rw,nosuid,nodev,create=dir 0 0"})
+	items = append(items, configItem{"lxc.mount.entry", shmMountEntry(cfg.ShmSize)})
 
 	// Network configuration.
 	if cfg.LANBridge != "" {
@@ -784,7 +1005,35 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 			"lxc.cgroup2.cpu.max",
 			fmt.Sprintf("%d 100000", cfg.CPUQuota),
 		})
+	} else if cfg.NanoCPUs > 0 {
+		quota := cfg.NanoCPUs * 100000 / 1_000_000_000
+		if quota < 1000 {
+			quota = 1000
+		}
+		items = append(items, configItem{
+			"lxc.cgroup2.cpu.max",
+			fmt.Sprintf("%d 100000", quota),
+		})
 	}
+	if cfg.CpusetCpus != "" {
+		items = append(items, configItem{"lxc.cgroup2.cpuset.cpus", cfg.CpusetCpus})
+	}
+	if cfg.CpusetMems != "" {
+		items = append(items, configItem{"lxc.cgroup2.cpuset.mems", cfg.CpusetMems})
+	}
+	if cfg.PidsLimit > 0 {
+		items = append(items, configItem{"lxc.cgroup2.pids.max", fmt.Sprintf("%d", cfg.PidsLimit)})
+	}
+	if cfg.BlkioWeight > 0 {
+		items = append(items, configItem{"lxc.cgroup2.io.weight", fmt.Sprintf("default %d", cfg.BlkioWeight)})
+	}
+
+	// Capabilities / privileged: same rules as the legacy path.
+	items = append(items, capabilityItems(cfg)...)
+	items = append(items, securityOptItems(cfg)...)
+	items = append(items, sysctlItems(cfg)...)
+	items = append(items, tmpfsItems(cfg)...)
+	items = append(items, ulimitItems(cfg)...)
 
 	// Console log.
 	if cfg.LogFile != "" {

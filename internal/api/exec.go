@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +65,10 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
+	if state, _ := h.mgr.State(containerID); state != "running" && state != "paused" {
+		errResponse(w, http.StatusConflict, "Container is not running")
+		return
+	}
 
 	var req ExecCreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -78,69 +81,28 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Merge the exec's explicit env with the container's env so PATH,
+	// HOME, and other image-level defaults are available to the session.
+	// Request vars win over container vars, matching `docker exec` behavior.
+	var mergedEnv []string
+	if c := h.store.GetContainer(containerID); c != nil {
+		mergedEnv = mergeEnv(c.Env, req.Env)
+	} else {
+		mergedEnv = req.Env
+	}
+
 	rec := &execRecord{
 		ID:          generateID(),
 		ContainerID: containerID,
 		Cmd:         req.Cmd,
 		Tty:         req.Tty,
-		Env:         req.Env,
+		Env:         mergedEnv,
 		WorkingDir:  req.WorkingDir,
 		User:        req.User,
 	}
 	h.execs.add(rec)
-	h.publishExecEvent("exec_create", containerID, rec)
 
 	jsonResponse(w, http.StatusCreated, ExecCreateResponse{ID: rec.ID})
-}
-
-// publishExecEvent emits a Docker-style container exec_{create,start,die}
-// event. Docker encodes the action as `exec_create: <cmd>` so subscribers
-// can match against the command text; we do the same.
-func (h *Handler) publishExecEvent(action, containerID string, rec *execRecord) {
-	cmdText := strings.Join(rec.Cmd, " ")
-	attrs := map[string]string{
-		"execID": rec.ID,
-	}
-	if name := h.containerName(containerID); name != "" {
-		attrs["name"] = name
-	}
-	if image := h.containerImage(containerID); image != "" {
-		attrs["image"] = image
-	}
-	if cmdText != "" {
-		action = action + ": " + cmdText
-	}
-	h.publishEvent("container", action, containerID, attrs)
-}
-
-// publishExecDieEvent is the exec_die counterpart and carries the final
-// exit code as an attribute, matching Docker's event body.
-func (h *Handler) publishExecDieEvent(containerID string, rec *execRecord) {
-	attrs := map[string]string{
-		"execID":   rec.ID,
-		"exitCode": strconv.Itoa(rec.ExitCode),
-	}
-	if name := h.containerName(containerID); name != "" {
-		attrs["name"] = name
-	}
-	if image := h.containerImage(containerID); image != "" {
-		attrs["image"] = image
-	}
-	h.publishEvent("container", "exec_die", containerID, attrs)
-}
-
-func (h *Handler) containerName(id string) string {
-	if rec := h.store.GetContainer(id); rec != nil {
-		return rec.Name
-	}
-	return ""
-}
-
-func (h *Handler) containerImage(id string) string {
-	if rec := h.store.GetContainer(id); rec != nil {
-		return normalizeImageRef(rec.Image)
-	}
-	return ""
 }
 
 // POST /exec/{id}/start
@@ -158,11 +120,19 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Honor WorkingDir by wrapping the user's argv in `sh -c "cd <dir>
+	// && exec <cmd>"`. Docker's exec honors -w this way when the base
+	// runtime doesn't expose chdir-before-exec directly; lxc-attach and
+	// pct exec both start at the container's default cwd, so the wrap
+	// is the simplest reliable implementation.
+	execCmd := rec.Cmd
+	if rec.WorkingDir != "" {
+		execCmd = wrapCmdWithCwd(rec.Cmd, rec.WorkingDir)
+	}
+
 	if req.Detach {
 		// Fire-and-forget: run the command, don't stream output.
-		cmdArgs, env := prepareExecInvocation(rec)
-		cmd := h.mgr.Exec(rec.ContainerID, cmdArgs, env)
-		h.publishExecEvent("exec_start", rec.ContainerID, rec)
+		cmd := h.mgr.ExecAs(rec.ContainerID, execCmd, rec.Env, rec.User)
 		go func() {
 			err := cmd.Run()
 			code := 0
@@ -175,54 +145,52 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 				r.Running = false
 				r.ExitCode = code
 			})
-			h.publishExecDieEvent(rec.ContainerID, rec)
 		}()
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	h.execs.update(rec.ID, func(r *execRecord) { r.Running = true; r.StartedAt = time.Now() })
-	h.publishExecEvent("exec_start", rec.ContainerID, rec)
-
-	cmdArgs, env := prepareExecInvocation(rec)
-	cmd := h.mgr.Exec(rec.ContainerID, cmdArgs, env)
-
+	// Hijack the connection for streaming.
 	hj, ok := w.(http.Hijacker)
-	if ok {
-		conn, buf, err := hj.Hijack()
-		if err != nil {
-			return
+	if !ok {
+		errResponse(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+	conn, buf, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	// conn is closed by runExecTTY/runExecMux or deferred below for non-TTY.
+	closeConn := true
+	defer func() {
+		if closeConn {
+			conn.Close()
 		}
-		closeConn := true
-		defer func() {
-			if closeConn {
-				conn.Close()
-			}
-		}()
+	}()
 
-		buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
-		buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
-		buf.WriteString("Connection: Upgrade\r\n")
-		buf.WriteString("Upgrade: tcp\r\n")
-		buf.WriteString("\r\n")
-		buf.Flush()
+	// Write HTTP response preamble manually.
+	buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
+	buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
+	buf.WriteString("Connection: Upgrade\r\n")
+	buf.WriteString("Upgrade: tcp\r\n")
+	buf.WriteString("\r\n")
+	buf.Flush()
 
-		if rec.Tty {
-			closeConn = false
-			runExecTTY(cmd, conn, func(p *os.File) {
-				h.execs.update(rec.ID, func(r *execRecord) { r.pty = p })
-			})
-		} else {
-			runExecMux(cmd, conn)
-		}
+	h.execs.update(rec.ID, func(r *execRecord) { r.Running = true; r.StartedAt = time.Now() })
+
+	cmd := h.mgr.ExecAs(rec.ContainerID, execCmd, rec.Env, rec.User)
+
+	if rec.Tty {
+		closeConn = false // runExecTTY closes conn itself
+		// Register the PTY on the record as soon as it's available so a
+		// concurrent /resize request can forward the ioctl. runExecTTY
+		// clears it before returning.
+		runExecTTY(cmd, conn, func(ptmx *os.File) {
+			h.execs.update(rec.ID, func(r *execRecord) { r.Pty = ptmx })
+		})
+		h.execs.update(rec.ID, func(r *execRecord) { r.Pty = nil })
 	} else {
-		w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
-		w.WriteHeader(http.StatusOK)
-		if rec.Tty {
-			runExecTTYOutput(cmd, w)
-		} else {
-			runExecMuxOutput(cmd, w)
-		}
+		runExecMux(cmd, conn)
 	}
 
 	code := 0
@@ -233,11 +201,6 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		r.Running = false
 		r.ExitCode = code
 	})
-	// Re-read the record so ExitCode is the just-written value; the
-	// publishExecDieEvent helper reads rec.ExitCode directly.
-	if final := h.execs.get(rec.ID); final != nil {
-		h.publishExecDieEvent(rec.ContainerID, final)
-	}
 }
 
 // GET /exec/{id}/json
@@ -265,23 +228,27 @@ func (h *Handler) execInspect(w http.ResponseWriter, r *http.Request) {
 			Tty:        rec.Tty,
 			Entrypoint: entrypoint,
 			Arguments:  args,
-			User:       rec.User,
 		},
+		OpenStdin:  rec.Tty,
+		OpenStdout: true,
+		OpenStderr: !rec.Tty,
+		CanRemove:  !rec.Running,
 	})
 }
 
 // runExecTTY runs cmd with a PTY attached and proxies raw bytes between the
-// PTY master and the hijacked connection. Used when Tty=true. If onPTY is
-// non-nil it is called with the PTY master once the command has started so
-// callers (e.g. /exec/{id}/resize) can issue ioctls against it.
-func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter, onPTY func(*os.File)) {
+// PTY master and the hijacked connection. Used when Tty=true.
+//
+// onReady is called with the PTY master as soon as it's available so
+// callers can register it for resize-forwarding. It may be nil.
+func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter, onReady func(*os.File)) {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		fmt.Fprintf(conn, "error starting pty: %s\n", err)
 		return
 	}
-	if onPTY != nil {
-		onPTY(ptmx)
+	if onReady != nil {
+		onReady(ptmx)
 	}
 
 	var wg sync.WaitGroup
@@ -300,11 +267,6 @@ func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter, onPTY func(*os.File)) {
 	}()
 
 	cmd.Wait()
-	// Clear the handle before closing so a late resize ioctl can't race with
-	// ptmx.Close and hit a reused fd.
-	if onPTY != nil {
-		onPTY(nil)
-	}
 	// Close the PTY master to unblock the io.Copy goroutines. If we defer
 	// this, wg.Wait below deadlocks because the copies never see EOF.
 	ptmx.Close()
@@ -318,17 +280,13 @@ func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter, onPTY func(*os.File)) {
 // runExecMux runs cmd with pipes and multiplexes stdout/stderr into the
 // Docker raw-stream format. Used when Tty=false.
 func runExecMux(cmd *exec.Cmd, conn io.ReadWriter) {
-	runExecMuxOutput(cmd, conn)
-}
-
-func runExecMuxOutput(cmd *exec.Cmd, w io.Writer) {
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
 
 	if err := cmd.Start(); err != nil {
-		writeLogFrame(w, 2, []byte("error: "+err.Error()+"\n"))
+		writeLogFrame(conn, 2, []byte("error: "+err.Error()+"\n"))
 		return
 	}
 
@@ -341,7 +299,7 @@ func runExecMuxOutput(cmd *exec.Cmd, w io.Writer) {
 		for {
 			n, err := stdoutR.Read(b)
 			if n > 0 {
-				writeLogFrame(w, 1, b[:n])
+				writeLogFrame(conn, 1, b[:n])
 			}
 			if err != nil {
 				return
@@ -355,7 +313,7 @@ func runExecMuxOutput(cmd *exec.Cmd, w io.Writer) {
 		for {
 			n, err := stderrR.Read(b)
 			if n > 0 {
-				writeLogFrame(w, 2, b[:n])
+				writeLogFrame(conn, 2, b[:n])
 			}
 			if err != nil {
 				return
@@ -370,47 +328,25 @@ func runExecMuxOutput(cmd *exec.Cmd, w io.Writer) {
 	wg.Wait()
 }
 
-func runExecTTYOutput(cmd *exec.Cmd, w io.Writer) {
-	ptmx, err := pty.Start(cmd)
-	if err != nil {
-		fmt.Fprintf(w, "error starting pty: %s\n", err)
-		return
+// wrapCmdWithCwd turns argv into `sh -c "cd <dir> && exec <argv>"` so the
+// command runs in the requested directory. Arguments are single-quoted for
+// POSIX safety; embedded single quotes are escaped by closing the quote,
+// inserting a backslash-quoted quote, and re-opening.
+func wrapCmdWithCwd(argv []string, dir string) []string {
+	var b strings.Builder
+	b.WriteString("cd ")
+	b.WriteString(shellQuote(dir))
+	b.WriteString(" && exec")
+	for _, a := range argv {
+		b.WriteByte(' ')
+		b.WriteString(shellQuote(a))
 	}
-	defer ptmx.Close()
-	_, _ = io.Copy(w, ptmx)
-	_ = cmd.Wait()
+	return []string{"sh", "-c", b.String()}
 }
 
-func prepareExecInvocation(rec *execRecord) ([]string, []string) {
-	env := append(os.Environ(), rec.Env...)
-	if rec.WorkingDir == "" && rec.User == "" {
-		return rec.Cmd, env
-	}
-	script := ""
-	if rec.WorkingDir != "" {
-		script = "cd " + shellQuote(rec.WorkingDir) + " && "
-	}
-	script += "exec"
-	for _, arg := range rec.Cmd {
-		script += " " + shellQuote(arg)
-	}
-	if rec.User != "" {
-		// Wrap in su so the payload runs as the chosen user inside the
-		// container. su -s /bin/sh keeps the shell predictable when the
-		// target account's login shell is something weird; -c runs the
-		// whole script. Falls back to root gracefully if the user does
-		// not exist in the container (su exits non-zero, which the
-		// caller's exit code reflects).
-		script = "su -s /bin/sh -c " + shellQuote(script) + " " + shellQuote(rec.User)
-	}
-	return []string{"/bin/sh", "-lc", script}, env
-}
-
+// shellQuote wraps s in single quotes with embedded quotes escaped.
 func shellQuote(s string) string {
-	if s == "" {
-		return "''"
-	}
-	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // generateID returns a 64-character hex ID matching Docker's container ID length.

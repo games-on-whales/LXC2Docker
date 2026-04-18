@@ -4,40 +4,49 @@
 package oci
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
 // ImageConfig holds the fields extracted from an OCI image configuration
 // that are needed to run a container.
 type ImageConfig struct {
-	Entrypoint  []string
-	Cmd         []string
-	Env         []string
-	WorkingDir  string
-	Ports       []string // e.g. ["80/tcp", "443/tcp"]
-	Labels      map[string]string
-	User        string
-	StopSignal  string
-	Healthcheck *ImageHealthcheck
-	Volumes     []string // e.g. ["/var/lib/postgresql/data"]
-	Shell       []string // default shell for RUN shell form, e.g. ["/bin/bash","-c"]
-	Digest      string   // sha256:... of the registry manifest (for RepoDigests)
+	Entrypoint []string
+	Cmd        []string
+	Env        []string
+	WorkingDir string
+	Ports      []string          // e.g. ["80/tcp", "443/tcp"]
+	Labels     map[string]string // OCI image labels (rendered in Portainer's image detail)
+	Digest     string            // manifest digest, "sha256:..." (empty if unknown)
 }
 
-// ImageHealthcheck is the subset of the OCI image healthcheck block we
-// carry through. Fields match Docker's JSON naming so the container-create
-// flow can mirror them verbatim.
-type ImageHealthcheck struct {
-	Test        []string `json:"Test,omitempty"`
-	Interval    int64    `json:"Interval,omitempty"`
-	Timeout     int64    `json:"Timeout,omitempty"`
-	StartPeriod int64    `json:"StartPeriod,omitempty"`
-	Retries     int      `json:"Retries,omitempty"`
+// ProgressEvent represents a single line of pull progress emitted to the
+// Docker API client. The fields mirror what `docker pull` streams so the
+// real Docker CLI, Portainer's pull modal, and compose renderers all work
+// without special-casing.
+type ProgressEvent struct {
+	Status  string // e.g. "Pulling fs layer", "Downloading"
+	ID      string // layer digest (short form) when applicable
+	Current int64  // bytes transferred for the layer
+	Total   int64  // total bytes for the layer (0 if unknown)
+}
+
+// PullOpts configures a Pull. Credentials, when non-empty, is passed to
+// skopeo as --src-creds so private registries work. OnEvent receives
+// structured progress events; callers that only want a status message
+// can wrap their simple callback.
+type PullOpts struct {
+	Credentials string              // "user:password" form
+	OnEvent     func(ProgressEvent) // structured progress (may be nil)
+	OnStatus    func(string)        // plain status lines (for backward compat)
 }
 
 // Pull downloads an OCI image from a registry and unpacks it to a rootfs
@@ -45,8 +54,17 @@ type ImageHealthcheck struct {
 //
 // storeDir is the base directory for OCI storage (e.g. /var/lib/oci).
 // ref is the image reference (e.g. "nginx:latest", "ghcr.io/org/app:v1").
-// progress is called with status messages.
-func Pull(storeDir, ref string, progress func(string)) (*ImageConfig, string, error) {
+func Pull(storeDir, ref string, opts PullOpts) (*ImageConfig, string, error) {
+	emitStatus := func(s string) {
+		if opts.OnStatus != nil {
+			opts.OnStatus(s)
+		}
+	}
+	emitEvent := func(e ProgressEvent) {
+		if opts.OnEvent != nil {
+			opts.OnEvent(e)
+		}
+	}
 	if err := os.MkdirAll(storeDir, 0o755); err != nil {
 		return nil, "", fmt.Errorf("oci: mkdir %s: %w", storeDir, err)
 	}
@@ -60,39 +78,62 @@ func Pull(storeDir, ref string, progress func(string)) (*ImageConfig, string, er
 	tag := tagFromRef(ref)
 
 	// 1. Pull image via skopeo.
-	progress(fmt.Sprintf("Pulling OCI image %s", dockerRef))
+	emitStatus(fmt.Sprintf("Pulling OCI image %s", dockerRef))
 	if err := os.MkdirAll(filepath.Dir(ociDir), 0o755); err != nil {
 		return nil, "", err
 	}
 	// Remove stale OCI dir if exists (re-pull).
 	os.RemoveAll(ociDir)
 
-	skopeoArgs := []string{
-		"copy",
-		"docker://" + dockerRef,
-		"oci:" + ociDir + ":" + tag,
+	skopeoArgs := []string{"copy"}
+	if opts.Credentials != "" {
+		// Credentials only apply to the source (the registry we're pulling
+		// from). The OCI layout destination is local. Using --src-creds on
+		// anonymous pulls is harmless; skopeo ignores it when the registry
+		// doesn't require auth.
+		skopeoArgs = append(skopeoArgs, "--src-creds", opts.Credentials)
 	}
-	out, err := exec.Command("skopeo", skopeoArgs...).CombinedOutput()
+	skopeoArgs = append(skopeoArgs,
+		"docker://"+dockerRef,
+		"oci:"+ociDir+":"+tag,
+	)
+
+	// Stream skopeo's stderr so we can report layer progress in real time.
+	// skopeo prints one line per blob: "Copying blob <digest>" followed by
+	// updates like "123.4 MB / 456.7 MB". Parsing these into ProgressEvents
+	// lets Portainer's pull modal render per-layer bars instead of sitting
+	// at 0% for minutes.
+	cmd := exec.Command("skopeo", skopeoArgs...)
+	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, "", fmt.Errorf("oci: skopeo copy: %s: %w", out, err)
+		return nil, "", fmt.Errorf("oci: pipe stderr: %w", err)
+	}
+	cmd.Stdout = io.Discard
+	if err := cmd.Start(); err != nil {
+		return nil, "", fmt.Errorf("oci: skopeo start: %w", err)
+	}
+	var stderrBuf strings.Builder
+	go parseSkopeoProgress(stderr, &stderrBuf, emitEvent)
+	if err := cmd.Wait(); err != nil {
+		return nil, "", fmt.Errorf("oci: skopeo copy: %s: %w", stderrBuf.String(), err)
 	}
 
 	// 2. Parse image config from OCI layout.
-	progress("Extracting image config")
+	emitStatus("Extracting image config")
 	cfg, err := parseImageConfig(ociDir, tag)
 	if err != nil {
 		return nil, "", fmt.Errorf("oci: parse config: %w", err)
 	}
 
 	// 3. Unpack to rootfs via umoci.
-	progress("Unpacking image layers")
+	emitStatus("Unpacking image layers")
 	os.RemoveAll(bundleDir)
 	umociArgs := []string{
 		"unpack",
 		"--image", ociDir + ":" + tag,
 		bundleDir,
 	}
-	out, err = exec.Command("umoci", umociArgs...).CombinedOutput()
+	out, err := exec.Command("umoci", umociArgs...).CombinedOutput()
 	if err != nil {
 		return nil, "", fmt.Errorf("oci: umoci unpack: %s: %w", out, err)
 	}
@@ -102,7 +143,152 @@ func Pull(storeDir, ref string, progress func(string)) (*ImageConfig, string, er
 		return nil, "", fmt.Errorf("oci: rootfs not found at %s", rootfs)
 	}
 
+	// Extract the manifest digest from index.json so the caller can persist
+	// a RepoDigest. We already have index.json parsed in parseImageConfig,
+	// but reading it again here keeps the public API simple.
+	cfg.Digest = manifestDigest(ociDir, tag)
+
 	return cfg, rootfs, nil
+}
+
+// manifestDigest returns the top-level manifest digest recorded in the
+// OCI layout's index.json. Matches what `docker pull` prints and what
+// `docker inspect` exposes as RepoDigests. Empty on any error.
+func manifestDigest(ociDir, tag string) string {
+	data, err := os.ReadFile(filepath.Join(ociDir, "index.json"))
+	if err != nil {
+		return ""
+	}
+	var index struct {
+		Manifests []struct {
+			Digest      string            `json:"digest"`
+			Annotations map[string]string `json:"annotations"`
+		} `json:"manifests"`
+	}
+	if err := json.Unmarshal(data, &index); err != nil {
+		return ""
+	}
+	for _, m := range index.Manifests {
+		if m.Annotations["org.opencontainers.image.ref.name"] == tag {
+			return m.Digest
+		}
+	}
+	if len(index.Manifests) > 0 {
+		return index.Manifests[0].Digest
+	}
+	return ""
+}
+
+// parseSkopeoProgress reads skopeo's stderr line-by-line, translates the
+// most useful lines into ProgressEvents, and mirrors the raw text into tee
+// so the caller can surface the full error output when the command fails.
+//
+// skopeo's stderr format (v1.13+):
+//
+//	Getting image source signatures
+//	Copying blob sha256:abc123 123.4 MB / 456.7 MB [========>  ]  27.03%
+//	Copying blob sha256:abc123 done
+//	Copying config sha256:def456
+//	Writing manifest to image destination
+//	Storing signatures
+//
+// The size line is updated in-place with \r for real skopeo; we still see
+// both forms depending on TTY detection. Be permissive.
+func parseSkopeoProgress(r io.Reader, tee *strings.Builder, emit func(ProgressEvent)) {
+	scanner := bufio.NewScanner(r)
+	// Handle both \n and \r (progress updates) as delimiters so the
+	// percent-complete refreshes land as individual lines.
+	scanner.Split(scanLinesCR)
+	re := regexp.MustCompile(`^Copying blob\s+(sha256:[0-9a-f]+)(?:\s+(\S+)\s+(\S+)\s+/\s+(\S+)\s+(\S+))?`)
+	for scanner.Scan() {
+		line := scanner.Text()
+		tee.WriteString(line)
+		tee.WriteByte('\n')
+		switch {
+		case strings.HasPrefix(line, "Copying blob") && strings.Contains(line, " done"):
+			// Final "Copying blob <digest> done"
+			parts := strings.Fields(line)
+			if len(parts) >= 3 {
+				emit(ProgressEvent{
+					Status: "Download complete",
+					ID:     shortDigest(parts[2]),
+				})
+			}
+		case strings.HasPrefix(line, "Copying blob"):
+			if m := re.FindStringSubmatch(line); m != nil {
+				ev := ProgressEvent{
+					Status: "Downloading",
+					ID:     shortDigest(m[1]),
+				}
+				if m[2] != "" {
+					ev.Current = parseSize(m[2], m[3])
+					ev.Total = parseSize(m[4], m[5])
+				}
+				emit(ev)
+			}
+		case strings.HasPrefix(line, "Copying config"):
+			parts := strings.Fields(line)
+			if len(parts) >= 3 {
+				emit(ProgressEvent{
+					Status: "Pulling image config",
+					ID:     shortDigest(parts[2]),
+				})
+			}
+		case strings.HasPrefix(line, "Writing manifest"):
+			emit(ProgressEvent{Status: "Writing manifest"})
+		}
+	}
+}
+
+// scanLinesCR is a bufio.SplitFunc that treats either \n or \r as the line
+// terminator. skopeo rewrites progress in-place with \r so we have to break
+// on either to capture each update.
+func scanLinesCR(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	for i, b := range data {
+		if b == '\n' || b == '\r' {
+			return i + 1, data[:i], nil
+		}
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
+// shortDigest returns the first 12 hex chars after the "sha256:" prefix,
+// matching the IDs that Docker emits in its pull-progress stream.
+func shortDigest(d string) string {
+	d = strings.TrimPrefix(d, "sha256:")
+	if len(d) > 12 {
+		return d[:12]
+	}
+	return d
+}
+
+// parseSize converts a ("123.4", "MB") pair to bytes. skopeo uses
+// go-humanize-compatible suffixes, so we only need the common SI set.
+func parseSize(num, unit string) int64 {
+	v, err := strconv.ParseFloat(num, 64)
+	if err != nil {
+		return 0
+	}
+	switch strings.ToUpper(strings.TrimSuffix(unit, ",")) {
+	case "B":
+		return int64(v)
+	case "KB":
+		return int64(v * 1000)
+	case "KIB":
+		return int64(v * 1024)
+	case "MB":
+		return int64(v * 1000 * 1000)
+	case "MIB":
+		return int64(v * 1024 * 1024)
+	case "GB":
+		return int64(v * 1000 * 1000 * 1000)
+	case "GIB":
+		return int64(v * 1024 * 1024 * 1024)
+	}
+	return 0
 }
 
 // Cleanup removes the OCI layout and bundle for a given image ref.
@@ -123,8 +309,8 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 
 	var index struct {
 		Manifests []struct {
-			Digest    string `json:"digest"`
-			MediaType string `json:"mediaType"`
+			Digest      string            `json:"digest"`
+			MediaType   string            `json:"mediaType"`
 			Annotations map[string]string `json:"annotations"`
 		} `json:"manifests"`
 	}
@@ -176,17 +362,6 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 			WorkingDir   string              `json:"WorkingDir"`
 			ExposedPorts map[string]struct{} `json:"ExposedPorts"`
 			Labels       map[string]string   `json:"Labels"`
-			User         string              `json:"User"`
-			StopSignal   string              `json:"StopSignal"`
-			Volumes      map[string]struct{} `json:"Volumes"`
-			Shell        []string            `json:"Shell"`
-			Healthcheck  *struct {
-				Test        []string `json:"Test"`
-				Interval    int64    `json:"Interval"`
-				Timeout     int64    `json:"Timeout"`
-				StartPeriod int64    `json:"StartPeriod"`
-				Retries     int      `json:"Retries"`
-			} `json:"Healthcheck"`
 		} `json:"config"`
 	}
 	if err := json.Unmarshal(configData, &imgCfg); err != nil {
@@ -198,33 +373,14 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 		ports = append(ports, p)
 	}
 
-	var volumes []string
-	for v := range imgCfg.Config.Volumes {
-		volumes = append(volumes, v)
-	}
-	out := &ImageConfig{
+	return &ImageConfig{
 		Entrypoint: imgCfg.Config.Entrypoint,
 		Cmd:        imgCfg.Config.Cmd,
 		Env:        imgCfg.Config.Env,
 		WorkingDir: imgCfg.Config.WorkingDir,
 		Ports:      ports,
 		Labels:     imgCfg.Config.Labels,
-		User:       imgCfg.Config.User,
-		StopSignal: imgCfg.Config.StopSignal,
-		Volumes:    volumes,
-		Shell:      imgCfg.Config.Shell,
-		Digest:     manifestDigest,
-	}
-	if hc := imgCfg.Config.Healthcheck; hc != nil && len(hc.Test) > 0 {
-		out.Healthcheck = &ImageHealthcheck{
-			Test:        hc.Test,
-			Interval:    hc.Interval,
-			Timeout:     hc.Timeout,
-			StartPeriod: hc.StartPeriod,
-			Retries:     hc.Retries,
-		}
-	}
-	return out, nil
+	}, nil
 }
 
 // digestToPath converts "sha256:abc123..." to "sha256/abc123...".

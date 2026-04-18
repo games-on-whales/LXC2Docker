@@ -3,7 +3,6 @@ package api
 import (
 	"archive/tar"
 	"bufio"
-	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -12,13 +11,10 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/games-on-whales/docker-lxc-daemon/internal/image"
@@ -29,9 +25,11 @@ import (
 
 // POST /containers/create
 func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("name")
-	if strings.HasPrefix(name, "/") {
-		name = name[1:]
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	name = strings.TrimPrefix(name, "/")
+	if name != "" && !isValidContainerName(name) {
+		errResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid container name (%s), only [a-zA-Z0-9][a-zA-Z0-9_.-]+ are allowed", name))
+		return
 	}
 
 	var req ContainerCreateRequest
@@ -48,12 +46,58 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, "Image is required")
 		return
 	}
+	if !isValidRestartPolicy(req.HostConfig.RestartPolicy.Name) {
+		errResponse(w, http.StatusBadRequest,
+			fmt.Sprintf("invalid restart policy %q; expected one of no, always, unless-stopped, on-failure", req.HostConfig.RestartPolicy.Name))
+		return
+	}
+	if req.HostConfig.RestartPolicy.MaximumRetryCount != 0 &&
+		req.HostConfig.RestartPolicy.Name != "on-failure" {
+		errResponse(w, http.StatusBadRequest,
+			"maximum retry count cannot be used with restart policies other than on-failure")
+		return
+	}
+	if req.HostConfig.MemorySwap > 0 &&
+		req.HostConfig.Memory > 0 &&
+		req.HostConfig.MemorySwap < req.HostConfig.Memory {
+		errResponse(w, http.StatusBadRequest,
+			"Minimum memoryswap limit should be larger than memory limit, see usage")
+		return
+	}
+	if req.HostConfig.Memory < 0 {
+		errResponse(w, http.StatusBadRequest, "Memory limit cannot be negative")
+		return
+	}
+	if req.HostConfig.AutoRemove &&
+		req.HostConfig.RestartPolicy.Name != "" &&
+		req.HostConfig.RestartPolicy.Name != "no" {
+		errResponse(w, http.StatusBadRequest,
+			"can't create 'AutoRemove' container with restart policy")
+		return
+	}
 
-	// Auto-pull if image not present.
+	// Name conflict: Docker returns 409 rather than silently clobbering
+	// the existing container's record. Portainer relies on this to detect
+	// duplicate-create attempts (e.g. after a partially-failed deploy) and
+	// surface a clear error to the user.
+	if name != "" && h.store.FindContainerByName(name) != nil {
+		errResponse(w, http.StatusConflict,
+			fmt.Sprintf("Conflict. The container name %q is already in use.", "/"+name))
+		return
+	}
+
+	// Auto-pull if image not present. Portainer's deploy flow POSTs
+	// /containers/create with an image that hasn't been pulled yet; when
+	// the registry is private the user's credentials arrive in
+	// X-Registry-Auth on this request (same decoder as /images/create).
 	if rec := h.store.GetImage(normalizeImageRef(req.Image)); rec == nil {
-		if err := h.mgr.PullImage(req.Image, "amd64", func(_ string) {}); err != nil {
+		creds := decodeRegistryAuth(r.Header.Get("X-Registry-Auth"))
+		pullErr := h.mgr.PullImageWith(req.Image, "amd64", lxc.PullOpts{
+			Credentials: creds,
+		})
+		if pullErr != nil {
 			errResponse(w, http.StatusNotFound,
-				fmt.Sprintf("No such image: %s — and pull failed: %s", req.Image, err))
+				fmt.Sprintf("No such image: %s — and pull failed: %s", req.Image, pullErr))
 			return
 		}
 	}
@@ -82,7 +126,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		// App registry defaults (if no OCI config and no user-provided cmd).
 		if len(entrypoint) == 0 && len(cmd) == 0 {
-			if resolved, err := image.Resolve(imgRec.Ref, "amd64", false); err == nil && resolved.App != nil && resolved.App.DefaultCmd != "" {
+			if resolved, err := image.Resolve(imgRec.Ref, "amd64"); err == nil && resolved.App != nil && resolved.App.DefaultCmd != "" {
 				cmd = []string{"/bin/sh", "-c", resolved.App.DefaultCmd}
 			}
 		}
@@ -96,32 +140,6 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Labels: inherit from the image then overlay request labels so user
-	// overrides win — same semantics Docker uses. Portainer's stack grouping
-	// reads com.docker.compose.* labels on the resulting container, which
-	// were previously dropped whenever the Compose file set them via the
-	// image rather than the service block.
-	labels := map[string]string{}
-	if imgRec := h.store.GetImage(normalizeImageRef(req.Image)); imgRec != nil {
-		for k, v := range imgRec.OCILabels {
-			labels[k] = v
-		}
-	}
-	for k, v := range req.Labels {
-		labels[k] = v
-	}
-
-	// Default mode is PERMANENT (PVE CT, visible in the PVE UI). Opt out
-	// of permanence — making the container ephemeral, reapable by the GC
-	// after it exits — via Docker's --rm (HostConfig.AutoRemove) or the
-	// vendor-neutral "dld.ephemeral=true" label. The legacy "dld.pve=true"
-	// / "gow.pve=true" labels still force permanence (a no-op now since
-	// permanence is the default, but kept so existing manifests work).
-	ephemeral := req.HostConfig.AutoRemove || labelBool(req.Labels, "dld.ephemeral")
-	if labelBool(req.Labels, "dld.pve", "gow.pve") {
-		ephemeral = false
-	}
-
 	cfg := lxc.ContainerConfig{
 		Entrypoint:        entrypoint,
 		Cmd:               cmd,
@@ -130,13 +148,30 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		DeviceCgroupRules: req.HostConfig.DeviceCgroupRules,
 		NetworkMode:       req.HostConfig.NetworkMode,
 		IpcMode:           req.HostConfig.IpcMode,
+		UTSMode:           req.HostConfig.UTSMode,
+		PidMode:           req.HostConfig.PidMode,
 		MemoryBytes:       req.HostConfig.Memory,
 		CPUShares:         req.HostConfig.CPUShares,
-		ProxmoxCT:         !ephemeral,
-		LAN:               labelBool(req.Labels, "dld.lan", "gow.lan"),
-		Bridge:            labelString(req.Labels, "dld.bridge"),
-		Storage:           labelString(req.Labels, "dld.storage"),
-		ISOs:              parseISOLabel(req.Labels["dld.iso"]),
+		CPUQuota:          req.HostConfig.CPUQuota,
+		NanoCPUs:          req.HostConfig.NanoCPUs,
+		CpusetCpus:        req.HostConfig.CpusetCpus,
+		CpusetMems:        req.HostConfig.CpusetMems,
+		PidsLimit:         req.HostConfig.PidsLimit,
+		Ulimits:           apiToLXCUlimits(req.HostConfig.Ulimits),
+		ShmSize:           req.HostConfig.ShmSize,
+		BlkioWeight:       req.HostConfig.BlkioWeight,
+		Privileged:        req.HostConfig.Privileged,
+		CapAdd:            req.HostConfig.CapAdd,
+		CapDrop:           req.HostConfig.CapDrop,
+		SecurityOpt:       req.HostConfig.SecurityOpt,
+		Sysctls:           req.HostConfig.Sysctls,
+		Tmpfs:             req.HostConfig.Tmpfs,
+		ExtraHosts:        req.HostConfig.ExtraHosts,
+		DNS:               req.HostConfig.DNS,
+		DNSSearch:         req.HostConfig.DNSSearch,
+		DNSOptions:        req.HostConfig.DNSOptions,
+		ProxmoxCT:         req.Labels["gow.pve"] == "true",
+		LAN:               req.Labels["gow.lan"] == "true",
 	}
 	// LAN bridge replaces host networking: the container gets its own network
 	// namespace with dual NICs (internal + LAN) instead of sharing the host's.
@@ -144,7 +179,11 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		cfg.NetworkMode = ""
 	}
 
-	// Parse bind mounts ("host:container[:ro]")
+	// Mount collection. We assemble one list keyed by type so the store
+	// record can echo the original semantic back on inspect (Portainer's
+	// Mounts tab distinguishes bind/volume/tmpfs by a colored badge).
+	var storeMounts []store.MountSpec
+	// Parse legacy Binds ("host:container[:ro]").
 	for _, bind := range req.HostConfig.Binds {
 		parts := strings.SplitN(bind, ":", 3)
 		if len(parts) < 2 {
@@ -156,33 +195,12 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			ReadOnly:    len(parts) == 3 && parts[2] == "ro",
 		}
 		cfg.Mounts = append(cfg.Mounts, m)
-	}
-	for _, m := range req.Mounts {
-		if m.Target == "" {
-			continue
-		}
-		switch m.Type {
-		case "", "bind":
-			if m.Source == "" {
-				continue
-			}
-			cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
-				Source:      m.Source,
-				Destination: m.Target,
-				ReadOnly:    m.ReadOnly,
-			})
-		case "volume":
-			vol, err := h.ensureVolume(m.Source)
-			if err != nil {
-				errResponse(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
-				Source:      vol.Mountpoint,
-				Destination: m.Target,
-				ReadOnly:    m.ReadOnly,
-			})
-		}
+		storeMounts = append(storeMounts, store.MountSpec{
+			Type:        "bind",
+			Source:      m.Source,
+			Destination: m.Destination,
+			ReadOnly:    m.ReadOnly,
+		})
 	}
 
 	// Device mappings
@@ -193,81 +211,112 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	var restart *store.RestartPolicy
-	if req.HostConfig.RestartPolicy.Name != "" {
-		restart = &store.RestartPolicy{
-			Name:              req.HostConfig.RestartPolicy.Name,
-			MaximumRetryCount: req.HostConfig.RestartPolicy.MaximumRetryCount,
+	// Anonymous volumes declared in Config.Volumes. Docker's runtime
+	// creates a fresh named volume with a generated name per entry and
+	// bind-mounts it at the requested path. Compose-style database
+	// containers (`VOLUME /var/lib/postgresql/data` in the Dockerfile)
+	// rely on this so state persists across container rebuilds even
+	// without an explicit --mount flag.
+	for path := range req.Volumes {
+		if hasMountAt(storeMounts, path) {
+			continue
 		}
+		volName := generateID()[:12] + "_anon"
+		mountpoint, err := h.ensureVolumeOwned(volName, id, true)
+		if err != nil {
+			continue
+		}
+		storeMounts = append(storeMounts, store.MountSpec{
+			Type:        "volume",
+			Source:      mountpoint,
+			Destination: path,
+		})
+		cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
+			Source:      mountpoint,
+			Destination: path,
+		})
 	}
 
-	var health *store.HealthcheckConfig
-	if req.Healthcheck != nil && len(req.Healthcheck.Test) > 0 {
-		health = &store.HealthcheckConfig{
-			Test:          append([]string{}, req.Healthcheck.Test...),
-			Interval:      req.Healthcheck.Interval,
-			Timeout:       req.Healthcheck.Timeout,
-			StartPeriod:   req.Healthcheck.StartPeriod,
-			StartInterval: req.Healthcheck.StartInterval,
-			Retries:       req.Healthcheck.Retries,
+	// New-style Mounts (Portainer emits these alongside or instead of Binds).
+	// Bind mounts use the source path directly. Volume mounts resolve the
+	// named volume to its backing directory (auto-creating it so anonymous
+	// volumes and compose stacks with declared volumes both work). Tmpfs
+	// mounts fall through to HostConfig.Tmpfs and are handled there.
+	for _, m := range req.HostConfig.Mounts {
+		mType := m.Type
+		if mType == "" {
+			mType = "bind"
 		}
-	}
-	// Inherit image-declared User/StopSignal/Healthcheck when the request
-	// didn't specify them (matches Docker's create semantics).
-	user := req.User
-	stopSignal := req.StopSignal
-	if imgRec := h.store.GetImage(normalizeImageRef(req.Image)); imgRec != nil {
-		if user == "" {
-			user = imgRec.OCIUser
+		source := m.Source
+		if mType == "volume" {
+			if resolved, err := h.ensureVolume(m.Source); err == nil {
+				source = resolved
+			} else {
+				continue
+			}
 		}
-		if stopSignal == "" {
-			stopSignal = imgRec.OCIStopSignal
+		storeMounts = append(storeMounts, store.MountSpec{
+			Type:        mType,
+			Source:      source,
+			Destination: m.Target,
+			ReadOnly:    m.ReadOnly,
+			Propagation: propagationFromBindOptions(m.BindOptions),
+		})
+		if mType == "tmpfs" {
+			if cfg.Tmpfs == nil {
+				cfg.Tmpfs = map[string]string{}
+			}
+			if _, already := cfg.Tmpfs[m.Target]; !already {
+				cfg.Tmpfs[m.Target] = tmpfsOptionsString(m.TmpfsOptions, m.ReadOnly)
+			}
+			continue
 		}
-		if health == nil && imgRec.OCIHealthcheck != nil {
-			hc := *imgRec.OCIHealthcheck
-			health = &hc
-		}
+		cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
+			Source:      source,
+			Destination: m.Target,
+			ReadOnly:    m.ReadOnly,
+		})
 	}
 
-	extras := hostConfigExtrasFromRequest(req.HostConfig)
+	// Preserve the full HostConfig as JSON so inspect can echo exactly what
+	// the client posted, including fields the LXC runtime doesn't honor.
+	rawHC, _ := json.Marshal(req.HostConfig)
 
 	// Persist record before creating so the IP is allocated.
 	rec := &store.ContainerRecord{
-		ID:            id,
-		Name:          name,
-		Image:         req.Image,
-		ImageID:       normalizeImageRef(req.Image),
-		Created:       time.Now(),
-		Entrypoint:    entrypoint,
-		Cmd:           cmd,
-		Env:           env,
-		Labels:        labels,
-		RestartPolicy:    restart,
-		Healthcheck:      health,
-		StopSignal:       stopSignal,
-		HostConfigExtras: extras,
-		WorkingDir:       workingDir,
-		User:             user,
-		Domainname:       req.Domainname,
-		Hostname:         req.Hostname,
-		Tty:              req.Tty,
-		OpenStdin:        req.OpenStdin,
-		StdinOnce:        req.StdinOnce,
-		RequestedVolumes: sortedKeys(req.Volumes),
+		ID:              id,
+		Name:            name,
+		Image:           req.Image,
+		ImageID:         normalizeImageRef(req.Image),
+		Created:         time.Now(),
+		Entrypoint:      entrypoint,
+		Cmd:             cmd,
+		Env:             env,
+		Labels:          req.Labels,
+		Hostname:        req.Hostname,
+		Domainname:      req.Domainname,
+		User:            req.User,
+		Tty:             req.Tty,
+		OpenStdin:       req.OpenStdin,
+		WorkingDir:      workingDir,
+		StopSignal:      req.StopSignal,
+		ExposedPorts:    req.ExposedPorts,
+		Volumes:         req.Volumes,
+		StopTimeout:     stopTimeoutValue(req.StopTimeout),
+		OomScoreAdj:     req.HostConfig.OomScoreAdj,
+		RawHostConfig:   rawHC,
+		Mounts:          storeMounts,
+		RestartPolicy:   req.HostConfig.RestartPolicy.Name,
+		RestartMaxRetry: req.HostConfig.RestartPolicy.MaximumRetryCount,
+		AutoRemove:      req.HostConfig.AutoRemove,
 	}
-	rec.Networks = defaultContainerNetworks(rec)
-	if err := attachRequestedNetworks(h.store, rec, req.NetworkingConfig); err != nil {
-		errResponse(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	for _, m := range cfg.Mounts {
-		rec.Mounts = append(rec.Mounts, store.MountSpec{
-			Type:        mountTypeForSource(h.store, m.Source),
-			Name:        volumeNameForSource(h.store, m.Source),
-			Source:      m.Source,
-			Destination: m.Destination,
-			ReadOnly:    m.ReadOnly,
-		})
+	if hc := req.Healthcheck; hc != nil && len(hc.Test) > 0 {
+		rec.HealthcheckTest = hc.Test
+		rec.HealthcheckInterval = hc.Interval
+		rec.HealthcheckTimeout = hc.Timeout
+		rec.HealthcheckRetries = hc.Retries
+		rec.HealthcheckStartPeriod = hc.StartPeriod
+		rec.HealthStatus = "starting"
 	}
 	// Parse port bindings from HostConfig (e.g. "80/tcp" -> [{HostPort:8080, ContainerPort:80, Proto:"tcp"}])
 	for containerPortProto, bindings := range req.HostConfig.PortBindings {
@@ -306,10 +355,8 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("createContainer: success %s", id[:12])
-	h.publishEvent("container", "create", id, map[string]string{
-		"name":  name,
-		"image": normalizeImageRef(req.Image),
-	})
+
+	h.emitContainer("create", h.store.GetContainer(id))
 
 	jsonResponse(w, http.StatusCreated, ContainerCreateResponse{
 		ID:       id,
@@ -320,15 +367,15 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 // GET /containers/json
 func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
-	includeSize := r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true"
-	filters, err := parseListFilters(r.URL.Query().Get("filters"))
-	if err != nil {
-		errResponse(w, http.StatusBadRequest, "invalid filters: "+err.Error())
-		return
+	withSize := r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true"
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
 	}
-	// Use Manager.ListContainers so adopted (operator-tagged) PVE CTs
-	// surface alongside daemon-created records.
-	records := h.mgr.ListContainers()
+	filt := parseFilters(r)
+	records := h.store.ListContainers()
 
 	out := make([]ContainerSummary, 0, len(records))
 	for _, rec := range records {
@@ -339,8 +386,46 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		if !all && state != "running" {
 			continue
 		}
-		if !matchesContainerFilters(rec, state, filters) {
+		// Filter evaluation. The "status" filter accepts the same state
+		// strings returned in the list response. "label" supports both
+		// existence ("com.docker.compose.project") and equality
+		// ("com.docker.compose.project=foo") checks.
+		if !filt.matchAny("status", state) {
 			continue
+		}
+		if !filt.matchLabel(rec.Labels) {
+			continue
+		}
+		if !filt.matchNamePrefix([]string{rec.Name, "/" + rec.Name}) {
+			continue
+		}
+		if !filt.matchID(rec.ID) {
+			continue
+		}
+		if !filt.matchAncestor(rec.Image, rec.ImageID) {
+			continue
+		}
+		if filt.has("volume") && !containerUsesVolume(rec, h.store, filt["volume"]) {
+			continue
+		}
+		if filt.has("network") && !containerOnNetwork(rec, filt["network"]) {
+			continue
+		}
+		if filt.has("expose") && !containerExposes(h.exposedPortsFor(rec), filt["expose"]) {
+			continue
+		}
+		// The "health" filter matches HealthStatus ("starting"/"healthy"/
+		// "unhealthy") or the special value "none" for containers without
+		// a configured healthcheck. Portainer's "Unhealthy" dashboard
+		// widget relies on this.
+		if filt.has("health") {
+			hs := rec.HealthStatus
+			if hs == "" {
+				hs = "none"
+			}
+			if !filt.matchAny("health", hs) {
+				continue
+			}
 		}
 		cmd := strings.Join(append(rec.Entrypoint, rec.Cmd...), " ")
 		ports := make([]Port, 0, len(rec.PortBindings))
@@ -354,29 +439,11 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		}
 		mounts := make([]MountJSON, 0, len(rec.Mounts))
 		for _, m := range rec.Mounts {
-			mode := "rw"
-			if m.ReadOnly {
-				mode = "ro"
-			}
-			mountType := m.Type
-			if mountType == "" {
-				mountType = "bind"
-			}
-			mounts = append(mounts, MountJSON{
-				Type:        mountType,
-				Name:        m.Name,
-				Driver:      volumeDriverFor(h.store, mountType, m.Name),
-				Source:      m.Source,
-				Destination: m.Destination,
-				Mode:        mode,
-				RW:          !m.ReadOnly,
-			})
+			mounts = append(mounts, h.mountJSONFrom(m))
 		}
-		networkMode := "bridge"
-		for name := range rec.Networks {
-			networkMode = name
-			break
-		}
+		sort.SliceStable(mounts, func(i, j int) bool {
+			return mounts[i].Destination < mounts[j].Destination
+		})
 		summary := ContainerSummary{
 			ID:      rec.ID,
 			Names:   []string{"/" + rec.Name},
@@ -385,21 +452,105 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			Command: cmd,
 			Created: rec.Created.Unix(),
 			State:   state,
-			Status:  stateToStatus(state, rec.Created),
+			Status:  stateToStatusFull(state, rec.Created, rec.HealthStatus, rec.ExitCode, rec.FinishedAt),
 			Ports:   ports,
 			Labels:  rec.Labels,
 			Mounts:  mounts,
-			NetworkSettings: &SummaryNetworkSetting{
-				Networks: buildContainerEndpoints(rec),
+			HostConfig: &ContainerSummaryHostConfig{
+				NetworkMode: networkModeFor(rec),
 			},
-			HostConfig: &SummaryHostConfig{NetworkMode: networkMode},
+			NetworkSettings: &ContainerSummaryNetSettings{
+				Networks: networkSettingsFor(rec),
+			},
 		}
-		if includeSize {
-			summary.SizeRootFs, _ = dirSize(h.mgr.RootfsPath(rec.ID))
+		if withSize {
+			sz := rootfsSize(h.mgr.RootfsPath(rec.ID))
+			summary.SizeRw = sz
+			summary.SizeRootFs = sz
 		}
 		out = append(out, summary)
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Created > out[j].Created
+	})
+	if before := filt["before"]; len(before) > 0 {
+		out = trimBefore(out, before, h.store)
+	}
+	if since := filt["since"]; len(since) > 0 {
+		out = trimSince(out, since, h.store)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
 	jsonResponse(w, http.StatusOK, out)
+}
+
+func trimBefore(list []ContainerSummary, refs []string, st *store.Store) []ContainerSummary {
+	cutoff := refCutoff(refs, st)
+	if cutoff == 0 {
+		return list
+	}
+	out := list[:0]
+	for _, c := range list {
+		if c.Created < cutoff {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func trimSince(list []ContainerSummary, refs []string, st *store.Store) []ContainerSummary {
+	cutoff := refCutoff(refs, st)
+	if cutoff == 0 {
+		return list
+	}
+	out := list[:0]
+	for _, c := range list {
+		if c.Created > cutoff {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func refCutoff(refs []string, st *store.Store) int64 {
+	for _, r := range refs {
+		id := st.ResolveID(r)
+		if id == "" {
+			continue
+		}
+		if rec := st.GetContainer(id); rec != nil {
+			return rec.Created.Unix()
+		}
+	}
+	return 0
+}
+
+// networkModeFor returns the NetworkMode string Portainer displays in the list
+// view. Matches the resolution in the create handler.
+func networkModeFor(rec *store.ContainerRecord) string {
+	if rec.Labels["gow.lan"] == "true" {
+		return "lan"
+	}
+	return "gow"
+}
+
+// networkSettingsFor builds the per-network endpoint map for a container.
+// One entry per attached network ("gow" is the daemon's managed bridge).
+func networkSettingsFor(rec *store.ContainerRecord) map[string]EndpointSettings {
+	if rec.IPAddress == "" {
+		return map[string]EndpointSettings{}
+	}
+	return map[string]EndpointSettings{
+		"gow": {
+			NetworkID:   "gow",
+			EndpointID:  rec.ID,
+			Gateway:     lxc.BridgeGW,
+			IPAddress:   rec.IPAddress,
+			IPPrefixLen: 24,
+			Aliases:     []string{rec.Name},
+		},
+	}
 }
 
 // GET /containers/{id}/json
@@ -409,9 +560,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	// Inspect goes through the Manager so adopted CTs (tagged but not in
-	// the store) are also inspectable.
-	rec := h.mgr.GetContainer(id)
+	rec := h.store.GetContainer(id)
 	if rec == nil {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
@@ -419,6 +568,10 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 
 	state, _ := h.mgr.State(id)
 	running := state == "running"
+	paused := state == "paused"
+	if paused {
+		running = true // Docker reports Running=true and Paused=true when frozen.
+	}
 
 	// A container that was never started should report "created", not "exited".
 	// Docker uses "created" for containers that exist but have never been started.
@@ -426,336 +579,122 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		state = "created"
 	}
 
-	startedAt := rec.Created.Format(time.RFC3339)
+	startedAt := "0001-01-01T00:00:00Z"
 	if rec.StartedAt != nil {
-		startedAt = rec.StartedAt.Format(time.RFC3339)
+		startedAt = rec.StartedAt.Format(time.RFC3339Nano)
 	}
 	finishedAt := "0001-01-01T00:00:00Z"
 	if rec.FinishedAt != nil {
-		finishedAt = rec.FinishedAt.Format(time.RFC3339)
+		finishedAt = rec.FinishedAt.Format(time.RFC3339Nano)
 	}
 
 	// Build Mounts array from stored mount specs.
 	mounts := make([]MountJSON, 0, len(rec.Mounts))
 	for _, m := range rec.Mounts {
-		mode := "rw"
-		if m.ReadOnly {
-			mode = "ro"
-		}
-		mountType := m.Type
-		if mountType == "" {
-			mountType = "bind"
-		}
-		mounts = append(mounts, MountJSON{
-			Type:        mountType,
-			Name:        m.Name,
-			Driver:      volumeDriverFor(h.store, mountType, m.Name),
-			Source:      m.Source,
-			Destination: m.Destination,
-			Mode:        mode,
-			RW:          !m.ReadOnly,
+		mounts = append(mounts, h.mountJSONFrom(m))
+	}
+	sort.SliceStable(mounts, func(i, j int) bool {
+		return mounts[i].Destination < mounts[j].Destination
+	})
+
+	// Split entrypoint[0] as Path and the rest as Args, matching what Docker
+	// does for `docker inspect`. Portainer renders these on the detail page.
+	path := ""
+	args := []string{}
+	combined := append([]string{}, rec.Entrypoint...)
+	combined = append(combined, rec.Cmd...)
+	if len(combined) > 0 {
+		path = combined[0]
+		args = combined[1:]
+	}
+
+	ports := map[string][]PortBinding{}
+	for _, pb := range rec.PortBindings {
+		key := fmt.Sprintf("%d/%s", pb.ContainerPort, pb.Proto)
+		ports[key] = append(ports[key], PortBinding{
+			HostIP:   "0.0.0.0",
+			HostPort: strconv.Itoa(pb.HostPort),
 		})
 	}
 
-	// Path/Args derive from the effective process that was launched. Docker
-	// reports Entrypoint when set, falling back to Cmd[0]. Portainer reads
-	// these to render the "Command" row in the inspect tab.
-	path, args := splitPathArgs(rec.Entrypoint, rec.Cmd)
+	hostname := rec.Hostname
+	if hostname == "" {
+		hostname = rec.ID[:12]
+	}
 
+	// Grab the container's init PID (0 if stopped) so Portainer can display it.
 	pid := 0
 	if running {
-		if p, err := h.mgr.InitPID(id); err == nil {
-			pid = p
-		}
+		pid = containerPID(id)
 	}
 
-	hostConfig := buildHostConfig(rec)
-	if hostConfig.NetworkMode == "" {
-		for name := range rec.Networks {
-			hostConfig.NetworkMode = name
-			break
-		}
-		if hostConfig.NetworkMode == "" {
-			hostConfig.NetworkMode = "bridge"
-		}
-	}
-
-	includeSize := r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true"
-
+	rootfs := h.mgr.RootfsPath(id)
 	resp := ContainerJSON{
-		ID:           rec.ID,
-		Created:      rec.Created.Format(time.RFC3339),
-		Path:         path,
-		Args:         args,
-		Name:         "/" + rec.Name,
-		Driver:       "lxc",
-		Platform:     "linux",
-		RestartCount: rec.RestartCount,
-		Image:        rec.Image,
-		ImageID:      rec.ImageID,
-		LogPath:      h.mgr.LogPath(id),
+		ID:             rec.ID,
+		Created:        rec.Created.Format(time.RFC3339Nano),
+		Path:           path,
+		Args:           args,
+		Name:           "/" + rec.Name,
+		ResolvConfPath: filepath.Join(rootfs, "etc", "resolv.conf"),
+		HostnamePath:   filepath.Join(rootfs, "etc", "hostname"),
+		LogPath:        h.mgr.LogPath(id),
+		RestartCount:   rec.RestartCount,
+		Driver:         "lxc",
+		Platform:       "linux",
+		GraphDriver: GraphDriver{
+			Name: "lxc",
+			Data: map[string]string{
+				"LxcPath": h.mgr.LXCPath(),
+				"Rootfs":  rootfs,
+			},
+		},
 		State: ContainerState{
 			Status:     state,
 			Running:    running,
+			Paused:     paused,
 			Pid:        pid,
 			ExitCode:   rec.ExitCode,
+			Error:      rec.StartError,
 			StartedAt:  startedAt,
 			FinishedAt: finishedAt,
+			Health:     healthStateFrom(rec),
 		},
+		Image:  rec.Image,
 		Mounts: mounts,
 		Config: &ContainerConfig{
-			Hostname:     orDefault(rec.Hostname, rec.ID[:12]),
+			Hostname:     hostname,
 			Domainname:   rec.Domainname,
 			User:         rec.User,
-			Image:        rec.Image,
-			Cmd:          rec.Cmd,
-			Entrypoint:   rec.Entrypoint,
-			Env:          rec.Env,
-			Labels:       rec.Labels,
-			WorkingDir:   rec.WorkingDir,
-			ExposedPorts: imageExposedPorts(h.store, rec),
-			Volumes:      containerVolumesSet(h.store, rec),
-			StopSignal:   rec.StopSignal,
-			Shell:        containerShell(h.store, rec),
-			Healthcheck:  healthcheckFromRecord(rec.Healthcheck),
 			Tty:          rec.Tty,
 			OpenStdin:    rec.OpenStdin,
-			StdinOnce:    rec.StdinOnce,
+			ExposedPorts: h.exposedPortsFor(rec),
+			Image:        rec.Image,
+			Volumes:      ensureStructMap(rec.Volumes),
+			Cmd:          ensureSlice(rec.Cmd),
+			Entrypoint:   ensureSlice(rec.Entrypoint),
+			Env:          ensureSlice(rec.Env),
+			Labels:       ensureMap(rec.Labels),
+			WorkingDir:   rec.WorkingDir,
+			StopSignal:   rec.StopSignal,
+			StopTimeout:  stopTimeoutPtr(rec.StopTimeout),
+			Healthcheck:  healthcheckFrom(rec),
 		},
-		HostConfig: hostConfig,
-		NetworkSettings: containerNetworkSettings(h.mgr, rec, hostConfig.PortBindings),
+		HostConfig: buildHostConfig(rec),
+		NetworkSettings: NetworkSettings{
+			Bridge:      lxc.BridgeName,
+			IPAddress:   rec.IPAddress,
+			IPPrefixLen: 24,
+			Gateway:     lxc.BridgeGW,
+			Ports:       ports,
+			Networks:    networkSettingsFor(rec),
+		},
 	}
-	if includeSize {
-		size, _ := dirSize(h.mgr.RootfsPath(id))
-		zero := int64(0)
-		resp.SizeRw = &zero
-		resp.SizeRootFs = &size
+	if r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true" {
+		sz := rootfsSize(h.mgr.RootfsPath(id))
+		resp.SizeRw = sz
+		resp.SizeRootFs = sz
 	}
 	jsonResponse(w, http.StatusOK, resp)
-}
-
-// hostConfigExtrasFromRequest extracts the HostConfig fields we roundtrip
-// through inspect without enforcing. Returns nil when nothing meaningful was
-// set so older persisted records stay untouched by the new field.
-func hostConfigExtrasFromRequest(hc HostConfig) *store.HostConfigExtras {
-	if !hc.Privileged && len(hc.CapAdd) == 0 && len(hc.CapDrop) == 0 &&
-		len(hc.ExtraHosts) == 0 && len(hc.Dns) == 0 && len(hc.DnsSearch) == 0 &&
-		len(hc.DnsOptions) == 0 && hc.Memory == 0 && hc.CPUShares == 0 &&
-		hc.NanoCPUs == 0 && len(hc.Tmpfs) == 0 && !hc.ReadonlyRootfs &&
-		hc.PidMode == "" && hc.UTSMode == "" && len(hc.Devices) == 0 &&
-		len(hc.DeviceCgroupRules) == 0 && hc.UsernsMode == "" &&
-		len(hc.GroupAdd) == 0 && len(hc.SecurityOpt) == 0 &&
-		len(hc.Sysctls) == 0 && hc.PidsLimit == 0 && hc.OomScoreAdj == 0 &&
-		hc.LogConfig == nil {
-		return nil
-	}
-	tmpfs := map[string]string{}
-	for k, v := range hc.Tmpfs {
-		tmpfs[k] = v
-	}
-	if len(tmpfs) == 0 {
-		tmpfs = nil
-	}
-	devices := make([]store.DeviceMapping, 0, len(hc.Devices))
-	for _, d := range hc.Devices {
-		devices = append(devices, store.DeviceMapping{
-			PathOnHost:        d.PathOnHost,
-			PathInContainer:   d.PathInContainer,
-			CgroupPermissions: d.CgroupPermissions,
-		})
-	}
-	if len(devices) == 0 {
-		devices = nil
-	}
-	sysctls := copyStringMap(hc.Sysctls)
-	logDriver := ""
-	logOptions := map[string]string(nil)
-	if hc.LogConfig != nil {
-		logDriver = hc.LogConfig.Type
-		logOptions = copyStringMap(hc.LogConfig.Config)
-	}
-	return &store.HostConfigExtras{
-		Privileged:        hc.Privileged,
-		CapAdd:            append([]string{}, hc.CapAdd...),
-		CapDrop:           append([]string{}, hc.CapDrop...),
-		ExtraHosts:        append([]string{}, hc.ExtraHosts...),
-		Dns:               append([]string{}, hc.Dns...),
-		DnsSearch:         append([]string{}, hc.DnsSearch...),
-		DnsOptions:        append([]string{}, hc.DnsOptions...),
-		Memory:            hc.Memory,
-		CPUShares:         hc.CPUShares,
-		NanoCPUs:          hc.NanoCPUs,
-		Tmpfs:             tmpfs,
-		ReadonlyRootfs:    hc.ReadonlyRootfs,
-		PidMode:           hc.PidMode,
-		UTSMode:           hc.UTSMode,
-		Devices:           devices,
-		DeviceCgroupRules: append([]string{}, hc.DeviceCgroupRules...),
-		UsernsMode:        hc.UsernsMode,
-		GroupAdd:          append([]string{}, hc.GroupAdd...),
-		SecurityOpt:       append([]string{}, hc.SecurityOpt...),
-		Sysctls:           sysctls,
-		PidsLimit:         hc.PidsLimit,
-		OomScoreAdj:       hc.OomScoreAdj,
-		LogDriver:         logDriver,
-		LogOptions:        logOptions,
-	}
-}
-
-// healthcheckFromRecord lifts a stored healthcheck into the API shape that
-// Portainer reads from Config.Healthcheck on inspect. nil in / nil out.
-func healthcheckFromRecord(h *store.HealthcheckConfig) *HealthConfig {
-	if h == nil {
-		return nil
-	}
-	return &HealthConfig{
-		Test:          append([]string{}, h.Test...),
-		Interval:      h.Interval,
-		Timeout:       h.Timeout,
-		StartPeriod:   h.StartPeriod,
-		StartInterval: h.StartInterval,
-		Retries:       h.Retries,
-	}
-}
-
-// containerNetworkSettings builds the NetworkSettings block for inspect.
-// Pulls top-level Bridge from the LXC bridge name, top-level IP/Gateway/
-// MAC from the first attached endpoint (matching Docker's behaviour for
-// containers with one network), and SandboxKey from the container's init
-// PID's net namespace path so Portainer's Network tab can deep-link.
-func containerNetworkSettings(mgr *lxc.Manager, rec *store.ContainerRecord, ports map[string][]PortBinding) NetworkSettings {
-	endpoints := buildContainerEndpoints(rec)
-	out := NetworkSettings{
-		Bridge:    lxc.BridgeName,
-		IPAddress: rec.IPAddress,
-		Networks:  endpoints,
-		Ports:     ports,
-	}
-	// Pick a primary endpoint to expose at the top level — prefer "gow"
-	// when present, otherwise the first one encountered.
-	var primary *EndpointSettings
-	if e, ok := endpoints["gow"]; ok {
-		primary = &e
-	} else {
-		for k := range endpoints {
-			e := endpoints[k]
-			primary = &e
-			break
-		}
-	}
-	if primary != nil {
-		if out.IPAddress == "" {
-			out.IPAddress = primary.IPAddress
-		}
-		out.Gateway = primary.Gateway
-		out.MacAddress = primary.MacAddress
-		out.EndpointID = primary.EndpointID
-		if primary.IPAddress != "" {
-			// Default LXC bridge subnet is /24.
-			out.IPPrefixLen = 24
-		}
-	}
-	if pid, err := mgr.InitPID(rec.ID); err == nil && pid > 0 {
-		out.SandboxKey = fmt.Sprintf("/proc/%d/ns/net", pid)
-		out.SandboxID = fmt.Sprintf("sandbox-%d", pid)
-	}
-	return out
-}
-
-// containerShell returns the shell that should appear on Config.Shell for
-// inspect — inherited from the image's OCIShell metadata. Returns nil when
-// the image didn't declare one so omitempty hides the field.
-func containerShell(st *store.Store, rec *store.ContainerRecord) []string {
-	if img := st.GetImage(normalizeImageRef(rec.Image)); img != nil && len(img.OCIShell) > 0 {
-		return append([]string{}, img.OCIShell...)
-	}
-	return nil
-}
-
-// volumeDriverFor returns the driver to report on a mount entry. Named
-// volume mounts (Type=="volume") inherit the driver from the volume
-// record; bind mounts have no driver.
-func volumeDriverFor(st *store.Store, mountType, name string) string {
-	if mountType != "volume" || name == "" {
-		return ""
-	}
-	if v := st.GetVolume(name); v != nil {
-		return orDefault(v.Driver, "local")
-	}
-	return ""
-}
-
-// containerVolumesSet computes the union of image-declared volumes
-// (OCIVolumes on the image record) and request-declared volumes
-// (Config.Volumes). Returns nil when both sides are empty so inspect's
-// omitempty hides the field from the response.
-func containerVolumesSet(st *store.Store, rec *store.ContainerRecord) map[string]struct{} {
-	out := map[string]struct{}{}
-	if img := st.GetImage(normalizeImageRef(rec.Image)); img != nil {
-		for _, v := range img.OCIVolumes {
-			if v != "" {
-				out[v] = struct{}{}
-			}
-		}
-	}
-	for _, v := range rec.RequestedVolumes {
-		if v != "" {
-			out[v] = struct{}{}
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-// sortedKeys returns the keys of m as a sorted slice. Used to persist
-// the Config.Volumes request map in a deterministic order.
-func sortedKeys(m map[string]struct{}) []string {
-	if len(m) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// imageExposedPorts returns the ExposedPorts map Docker surfaces on
-// container inspect's Config block — derived from the image's OCI Ports.
-// Portainer reads this alongside HostConfig.PortBindings to show "exposed
-// but not published" ports in the detail view. Also merges any container
-// port from the existing port bindings so manually-published ports appear
-// even when the image didn't declare them.
-func imageExposedPorts(st *store.Store, rec *store.ContainerRecord) map[string]struct{} {
-	out := map[string]struct{}{}
-	if img := st.GetImage(normalizeImageRef(rec.Image)); img != nil {
-		for _, p := range img.OCIPorts {
-			if p != "" {
-				out[p] = struct{}{}
-			}
-		}
-	}
-	for _, pb := range rec.PortBindings {
-		out[fmt.Sprintf("%d/%s", pb.ContainerPort, pb.Proto)] = struct{}{}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-// splitPathArgs reproduces Docker's Path/Args split: the entrypoint (or first
-// element of cmd when no entrypoint) is Path, everything after is Args.
-func splitPathArgs(entrypoint, cmd []string) (string, []string) {
-	combined := append([]string{}, entrypoint...)
-	combined = append(combined, cmd...)
-	if len(combined) == 0 {
-		return "", []string{}
-	}
-	return combined[0], combined[1:]
 }
 
 // POST /containers/{id}/start
@@ -765,34 +704,40 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	// Docker returns 304 Not Modified when the target is already running.
-	// Portainer uses that to keep its optimistic UI state instead of
-	// flashing an error when the user double-clicks start.
-	if state, _ := h.mgr.State(id); state == "running" {
+	if s, _ := h.mgr.State(id); s == "running" {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	if err := h.mgr.StartContainer(id); err != nil {
+		// Persist the failure on the record so inspect shows it in
+		// State.Error. Portainer's detail page renders this alongside
+		// the red "failed to start" toast, and the user can see the
+		// underlying reason without chasing daemon logs.
+		if rec := h.store.GetContainer(id); rec != nil {
+			rec.StartError = err.Error()
+			h.store.AddContainer(rec)
+		}
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Clear any stale error from a previous failed start.
+	if rec := h.store.GetContainer(id); rec != nil && rec.StartError != "" {
+		rec.StartError = ""
+		h.store.AddContainer(rec)
+	}
 
-	// Reset runtime state on each successful start.
+	// Refresh StartedAt (Docker updates it on every start, not just the
+	// first), clear the user-stopped flag so the restart watcher enforces
+	// the policy again on subsequent exits, and clear FinishedAt now that
+	// the container is running again.
 	if rec := h.store.GetContainer(id); rec != nil {
 		now := time.Now()
 		rec.StartedAt = &now
+		rec.StoppedByUser = false
 		rec.FinishedAt = nil
-		rec.ExitCode = 0
 		h.store.AddContainer(rec)
 	}
-	if rec := h.store.GetContainer(id); rec != nil {
-		h.publishEvent("container", "start", id, map[string]string{
-			"name":  rec.Name,
-			"image": normalizeImageRef(rec.Image),
-		})
-	}
 
-	// Set up port forwarding rules after successful start.
 	if rec := h.store.GetContainer(id); rec != nil && rec.IPAddress != "" {
 		for _, pb := range rec.PortBindings {
 			if err := lxc.AddPortForward(rec.IPAddress, pb.HostPort, pb.ContainerPort, pb.Proto); err != nil {
@@ -802,6 +747,16 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if rec := h.store.GetContainer(id); rec != nil && rec.OomScoreAdj != 0 {
+		if pid := containerPID(id); pid > 0 {
+			if err := os.WriteFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid),
+				[]byte(strconv.Itoa(rec.OomScoreAdj)), 0o644); err != nil {
+				log.Printf("warning: set oom_score_adj for %s: %v", id[:12], err)
+			}
+		}
+	}
+
+	h.emitContainer("start", h.store.GetContainer(id))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -812,48 +767,75 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	// Mirror Docker's 304 for already-stopped targets.
-	if state, _ := h.mgr.State(id); state != "running" {
+	if s, _ := h.mgr.State(id); s != "running" && s != "paused" {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	timeout, err := parseStopTimeout(r.URL.Query().Get("t"), 10*time.Second)
-	if err != nil {
-		errResponse(w, http.StatusBadRequest, err.Error())
-		return
+	stopSig := ""
+	defaultTO := 0
+	if rec := h.store.GetContainer(id); rec != nil {
+		stopSig = rec.StopSignal
+		defaultTO = rec.StopTimeout
 	}
-	// If the container declared a custom StopSignal (postgres runs with
-	// SIGINT, for example), deliver that to PID 1 first and wait the
-	// user-supplied timeout for graceful shutdown. Fall through to
-	// Manager.StopContainer for the SIGKILL backstop.
-	if rec := h.store.GetContainer(id); rec != nil && nonDefaultStopSignal(rec.StopSignal) {
-		if err := h.mgr.KillContainer(id, rec.StopSignal); err == nil {
-			waitUntilExited(h.mgr, id, timeout)
-		}
-	}
-	if state, _ := h.mgr.State(id); state != "running" {
-		if rec := h.store.GetContainer(id); rec != nil {
-			h.markContainerExited(rec, 0)
-			h.publishEvent("container", "stop", id, map[string]string{
-				"name":  rec.Name,
-				"image": normalizeImageRef(rec.Image),
-			})
-		}
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if err := h.mgr.StopContainer(id, timeout); err != nil {
+	if err := h.mgr.StopContainerWithSignal(id, stopTimeoutWithDefault(r, defaultTO), stopSig); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if rec := h.store.GetContainer(id); rec != nil {
-		h.markContainerExited(rec, 0)
-		h.publishEvent("container", "stop", id, map[string]string{
-			"name":  rec.Name,
-			"image": normalizeImageRef(rec.Image),
-		})
+	rec := h.store.GetContainer(id)
+	if rec != nil {
+		rec.StoppedByUser = true
+		now := time.Now()
+		rec.FinishedAt = &now
+		sig := stopSig
+		if sig == "" {
+			sig = "SIGTERM"
+		}
+		rec.ExitCode = exitCodeForSignal(sig)
+		h.store.AddContainer(rec)
 	}
+	h.emitContainer("stop", rec)
+	h.emitContainer("die", rec)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// stopTimeout reads the Docker-standard `t` query param (seconds before
+// SIGKILL). Missing / malformed falls back to 10 s, matching Docker's
+// default. Negative values disable the timeout — we translate that to an
+// effectively unbounded wait (1 hour) rather than block forever.
+func stopTimeout(r *http.Request) time.Duration {
+	return stopTimeoutWithDefault(r, 0)
+}
+
+func stopTimeoutWithDefault(r *http.Request, defaultSec int) time.Duration {
+	v := r.URL.Query().Get("t")
+	if v == "" {
+		if defaultSec > 0 {
+			return time.Duration(defaultSec) * time.Second
+		}
+		return 10 * time.Second
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 10 * time.Second
+	}
+	if n < 0 {
+		return time.Hour
+	}
+	return time.Duration(n) * time.Second
+}
+
+func stopTimeoutValue(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+func stopTimeoutPtr(v int) *int {
+	if v <= 0 {
+		return nil
+	}
+	return &v
 }
 
 // POST /containers/{id}/wait
@@ -863,59 +845,42 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	condition := strings.TrimSpace(r.URL.Query().Get("condition"))
+	condition := r.URL.Query().Get("condition")
 	if condition == "" {
 		condition = "not-running"
 	}
-	switch condition {
-	case "not-running", "next-exit", "removed":
-	default:
-		errResponse(w, http.StatusBadRequest, "unsupported wait condition")
-		return
+	wasRunning := false
+	if state, _ := h.mgr.State(id); state == "running" {
+		wasRunning = true
 	}
-	lastExitCode := 0
-	if rec := h.store.GetContainer(id); rec != nil {
-		lastExitCode = rec.ExitCode
-	}
-
 	ctx := r.Context()
 	for {
-		if condition == "removed" {
-			if h.mgr.GetContainer(id) == nil {
-				jsonResponse(w, http.StatusOK, map[string]any{
-					"StatusCode": lastExitCode,
-					"Error":      nil,
-				})
-				return
-			}
-		}
-
-		state, _ := h.mgr.State(id)
-		if state != "running" {
-			if rec := h.store.GetContainer(id); rec != nil && rec.StartedAt != nil && rec.FinishedAt == nil {
-				h.markContainerExited(rec, rec.ExitCode)
-			}
-			if rec := h.store.GetContainer(id); rec != nil {
-				lastExitCode = rec.ExitCode
-			}
-			if condition == "removed" {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(500 * time.Millisecond):
-				}
-				continue
-			}
-			jsonResponse(w, http.StatusOK, map[string]any{
-				"StatusCode": lastExitCode,
-				"Error":      nil,
-			})
-			return
-		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(500 * time.Millisecond):
+		}
+		switch condition {
+		case "removed":
+			if h.store.GetContainer(id) == nil {
+				jsonResponse(w, http.StatusOK, map[string]any{"StatusCode": 0, "Error": nil})
+				return
+			}
+		case "next-exit":
+			state, _ := h.mgr.State(id)
+			if !wasRunning && state == "running" {
+				wasRunning = true
+			}
+			if wasRunning && state != "running" {
+				jsonResponse(w, http.StatusOK, map[string]any{"StatusCode": 0, "Error": nil})
+				return
+			}
+		default:
+			state, _ := h.mgr.State(id)
+			if state != "running" {
+				jsonResponse(w, http.StatusOK, map[string]any{"StatusCode": 0, "Error": nil})
+				return
+			}
 		}
 	}
 }
@@ -928,18 +893,32 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	signal := r.URL.Query().Get("signal")
+	if signal != "" && !isValidSignal(signal) {
+		errResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid signal: %s", signal))
+		return
+	}
+	if s, _ := h.mgr.State(id); s != "running" && s != "paused" {
+		errResponse(w, http.StatusConflict, "Container is not running")
+		return
+	}
 	if err := h.mgr.KillContainer(id, signal); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if rec := h.store.GetContainer(id); rec != nil {
-		h.markContainerExited(rec, exitCodeForSignal(signal))
-		h.publishEvent("container", "kill", id, map[string]string{
-			"name":   rec.Name,
-			"image":  normalizeImageRef(rec.Image),
-			"signal": signal,
-		})
+	rec := h.store.GetContainer(id)
+	if rec != nil {
+		rec.StoppedByUser = true
+		now := time.Now()
+		rec.FinishedAt = &now
+		sig := signal
+		if sig == "" {
+			sig = "SIGKILL"
+		}
+		rec.ExitCode = exitCodeForSignal(sig)
+		h.store.AddContainer(rec)
 	}
+	h.emitContainer("kill", rec)
+	h.emitContainer("die", rec)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -950,18 +929,33 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
+	if r.URL.Query().Get("link") == "1" || r.URL.Query().Get("link") == "true" {
+		errResponse(w, http.StatusBadRequest, "container links are not supported by docker-lxc-daemon")
+		return
+	}
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
 
-	// Force: stop the container first if running.
 	if force {
 		state, _ := h.mgr.State(id)
+		if state == "paused" {
+			h.mgr.UnpauseContainer(id)
+			state, _ = h.mgr.State(id)
+		}
 		if state == "running" {
 			h.mgr.StopContainer(id, 5*time.Second)
 		}
+	} else {
+		if state, _ := h.mgr.State(id); state == "running" || state == "paused" {
+			errResponse(w, http.StatusConflict,
+				"You cannot remove a running container. Stop the container before attempting removal or use force")
+			return
+		}
 	}
 
-	// Remove port forwarding rules before destroying the container.
+	// Snapshot the record before removing so the emitted event carries a name.
 	rec := h.store.GetContainer(id)
+
+	// Remove port forwarding rules before destroying the container.
 	if rec != nil && rec.IPAddress != "" {
 		if err := lxc.RemovePortForwards(rec.IPAddress); err != nil {
 			log.Printf("warning: removing port forwards for %s: %v", rec.IPAddress, err)
@@ -972,16 +966,39 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusConflict, err.Error())
 		return
 	}
-	if rec != nil {
-		h.publishEvent("container", "destroy", id, map[string]string{
-			"name":  rec.Name,
-			"image": normalizeImageRef(rec.Image),
-		})
+	os.Remove(h.mgr.LogPath(id))
+	os.Remove(h.mgr.LogPath(id) + ".1")
+	if r.URL.Query().Get("v") == "1" || r.URL.Query().Get("v") == "true" {
+		h.removeAnonVolumesOf(id)
 	}
+	h.emitContainer("destroy", rec)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *Handler) removeAnonVolumesOf(id string) {
+	for _, v := range h.store.ListVolumes() {
+		if !v.Anonymous || v.OwnerID != id {
+			continue
+		}
+		os.RemoveAll(v.Mountpoint)
+		h.store.RemoveVolume(v.Name)
+	}
+}
+
 // GET /containers/{id}/logs
+//
+// Query params honored (matching Docker Engine):
+//   - stdout=1 / stderr=1  — which streams to return (default both)
+//   - tail=N | tail=all    — last N lines of the pre-existing log
+//   - since=<unix-ts>      — drop lines older than the timestamp
+//   - until=<unix-ts>      — drop lines newer than the timestamp
+//   - timestamps=1         — prefix each line with RFC3339Nano
+//   - follow=1             — keep the connection open and stream new lines
+//
+// LXC writes a single interleaved console log (stdout+stderr merged), so we
+// emit every line as frame type 1 (stdout) regardless of the stderr flag.
+// Portainer accepts this gracefully; the real Docker daemon also can't
+// separate the streams for containers started with a TTY.
 func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
 	if id == "" {
@@ -989,36 +1006,22 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stdout := r.URL.Query().Get("stdout") == "1" || r.URL.Query().Get("stdout") == "true"
-	stderr := r.URL.Query().Get("stderr") == "1" || r.URL.Query().Get("stderr") == "true"
-	follow := r.URL.Query().Get("follow") == "1" || r.URL.Query().Get("follow") == "true"
-	timestamps := r.URL.Query().Get("timestamps") == "1" || r.URL.Query().Get("timestamps") == "true"
-	tailLines, err := parseTailLines(r.URL.Query().Get("tail"))
-	if err != nil {
-		errResponse(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	since, err := parseLogSince(r.URL.Query().Get("since"))
-	if err != nil {
-		errResponse(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	until, err := parseLogTimestamp(r.URL.Query().Get("until"), "until")
-	if err != nil {
-		errResponse(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
+	q := r.URL.Query()
+	stdout := q.Get("stdout") == "1" || q.Get("stdout") == "true"
+	stderr := q.Get("stderr") == "1" || q.Get("stderr") == "true"
+	follow := q.Get("follow") == "1" || q.Get("follow") == "true"
+	timestamps := q.Get("timestamps") == "1" || q.Get("timestamps") == "true"
 	if !stdout && !stderr {
-		stdout = true
-		stderr = true
+		stdout, stderr = true, true
 	}
+	tail := parseTail(q.Get("tail")) // -1 means "all"
+	since := parseUnixTS(q.Get("since"))
+	until := parseUnixTS(q.Get("until"))
 
 	logPath := h.mgr.LogPath(id)
 	f, err := os.Open(logPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// No log yet — return empty OK
 			w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 			w.WriteHeader(http.StatusOK)
 			return
@@ -1031,176 +1034,179 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 	w.WriteHeader(http.StatusOK)
 
-	lines := make([]logLine, 0, 128)
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := parseLogLine(scanner.Text())
-		if since != nil && line.Timestamp != nil && line.Timestamp.Before(*since) {
-			continue
-		}
-		if until != nil && line.Timestamp != nil && line.Timestamp.After(*until) {
-			continue
-		}
-		if tailLines < 0 {
-			lines = append(lines, line)
-			continue
-		}
-		if tailLines == 0 {
-			continue
-		}
-		if len(lines) < tailLines {
-			lines = append(lines, line)
-			continue
-		}
-		copy(lines, lines[1:])
-		lines[len(lines)-1] = line
+	streamID := byte(1)
+	if !stdout && stderr {
+		streamID = 2
 	}
-	if err := scanner.Err(); err != nil {
+
+	// When since/until are active we gate every line through the current
+	// wall clock — the console.log has no per-line timestamps, so the best
+	// we can do is accept lines when "now" is inside the window. For a
+	// live-tailing session (follow=1) this filters out nothing initially
+	// but correctly clips when until fires.
+	inWindow := func() bool {
+		t := time.Now()
+		if !since.IsZero() && t.Before(since) {
+			return false
+		}
+		if !until.IsZero() && t.After(until) {
+			return false
+		}
+		return true
+	}
+	emit := func(line []byte) {
+		if timestamps {
+			prefix := time.Now().UTC().Format(time.RFC3339Nano) + " "
+			line = append([]byte(prefix), line...)
+		}
+		writeLogFrame(w, streamID, line)
+	}
+
+	// Backfill phase. When tail is set we collect the last N lines into a
+	// ring buffer instead of streaming everything — the default Portainer
+	// log view requests tail=100 and otherwise the UI would download the
+	// full console log for every open. If the live log was recently
+	// rotated we may need to pull older lines from <log>.1 to satisfy the
+	// request; otherwise tail=100 returns mostly-empty output right after
+	// a rotation.
+	if tail != 0 {
+		var lines [][]byte
+		liveLines, _ := readTail(f, tail)
+		// Rotation preserves the previous tail as <log>.1. Read it when
+		// the live file doesn't cover the requested window.
+		if tail < 0 || len(liveLines) < tail {
+			if older, err := readRotatedTail(logPath+".1", tail-len(liveLines)); err == nil {
+				lines = append(lines, older...)
+			}
+		}
+		lines = append(lines, liveLines...)
+		for _, line := range lines {
+			if !inWindow() {
+				continue
+			}
+			emit(line)
+		}
+	}
+
+	if !follow {
 		return
 	}
-	for _, line := range lines {
-		writeLogFrame(w, 1, append([]byte(formatLogLine(line, timestamps)), '\n'))
-	}
-	if fl, ok := w.(http.Flusher); ok {
-		fl.Flush()
-	}
 
-	if follow {
-		// Tail: poll for new content until client disconnects or until
-		// the caller-supplied `until` cutoff is reached.
-		ctx := r.Context()
-		pending := make([]byte, 0, 4096)
-		for {
-			if until != nil && time.Now().After(*until) {
-				return
+	// Seek to end so the tail loop only picks up new writes.
+	f.Seek(0, io.SeekEnd)
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+		buf := make([]byte, 32*1024)
+		n, err := f.Read(buf)
+		if n > 0 && inWindow() {
+			if timestamps {
+				emit(buf[:n])
+			} else {
+				writeLogFrame(w, streamID, buf[:n])
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(200 * time.Millisecond):
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
 			}
-			buf := make([]byte, 32*1024)
-			n, err := f.Read(buf)
-			if n > 0 {
-				pending = append(pending, buf[:n]...)
-				for {
-					idx := bytes.IndexByte(pending, '\n')
-					if idx < 0 {
-						break
-					}
-					line := parseLogLine(strings.TrimSuffix(string(pending[:idx]), "\r"))
-					if until != nil && line.Timestamp != nil && line.Timestamp.After(*until) {
-						return
-					}
-					writeLogFrame(w, 1, append([]byte(formatLogLine(line, timestamps)), '\n'))
-					pending = pending[idx+1:]
-				}
-				if fl, ok := w.(http.Flusher); ok {
-					fl.Flush()
-				}
-			}
-			if err == io.EOF {
-				continue
-			}
-			if err != nil {
-				return
-			}
+		}
+		if !until.IsZero() && time.Now().After(until) {
+			return
+		}
+		if err == io.EOF {
+			continue
+		}
+		if err != nil {
+			return
 		}
 	}
 }
 
-func parseTailLines(raw string) (int, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" || raw == "all" {
-		return -1, nil
+// parseTail interprets the Docker `tail` query value. "all" (or empty) means
+// stream the whole backlog, a positive integer caps the backfill, and 0
+// suppresses backfill entirely. Returns -1 for "all".
+func parseTail(v string) int {
+	if v == "" || v == "all" {
+		return -1
 	}
-	n, err := strconv.Atoi(raw)
+	n, err := strconv.Atoi(v)
 	if err != nil || n < 0 {
-		return 0, fmt.Errorf("invalid tail value %q", raw)
+		return -1
 	}
-	return n, nil
+	return n
 }
 
-type logLine struct {
-	Timestamp *time.Time
-	Text      string
-}
-
-var ansiRegexp = regexp.MustCompile(`\x1b\[[0-9;]*m`)
-
-func parseLogSince(raw string) (*time.Time, error) {
-	return parseLogTimestamp(raw, "since")
-}
-
-func parseLogTimestamp(raw, paramName string) (*time.Time, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, nil
+// parseUnixTS parses the Docker log `since`/`until` values. Accepts integer
+// seconds; nanosecond or RFC3339 forms are uncommon from Portainer and
+// aren't worth the extra handling.
+func parseUnixTS(v string) time.Time {
+	if v == "" {
+		return time.Time{}
 	}
-	if secs, err := strconv.ParseInt(raw, 10, 64); err == nil {
-		t := time.Unix(secs, 0).UTC()
-		return &t, nil
+	if ts, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return time.Unix(ts, 0)
 	}
-	if f, err := strconv.ParseFloat(raw, 64); err == nil {
-		secs := int64(f)
-		nanos := int64((f - float64(secs)) * float64(time.Second))
-		t := time.Unix(secs, nanos).UTC()
-		return &t, nil
+	if ts, err := strconv.ParseFloat(v, 64); err == nil {
+		sec := int64(ts)
+		nsec := int64((ts - float64(sec)) * 1e9)
+		return time.Unix(sec, nsec)
 	}
 	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
-		if t, err := time.Parse(layout, raw); err == nil {
-			utc := t.UTC()
-			return &utc, nil
+		if t, err := time.Parse(layout, v); err == nil {
+			return t
 		}
 	}
-	return nil, fmt.Errorf("invalid %s value %q", paramName, raw)
+	return time.Time{}
 }
 
-func parseLogLine(raw string) logLine {
-	clean := strings.TrimSpace(ansiRegexp.ReplaceAllString(raw, ""))
-	for _, layout := range []string{
-		"2006/01/02 03:04PM",
-		"2006/01/02 15:04:05",
-		time.RFC3339Nano,
-		time.RFC3339,
-	} {
-		parts := strings.SplitN(clean, " ", 3)
-		switch layout {
-		case "2006/01/02 03:04PM", "2006/01/02 15:04:05":
-			if len(parts) < 2 {
-				continue
-			}
-			if ts, err := time.ParseInLocation(layout, parts[0]+" "+parts[1], time.Local); err == nil {
-				text := raw
-				if len(parts) == 3 {
-					text = parts[2]
-				}
-				utc := ts.UTC()
-				return logLine{Timestamp: &utc, Text: text}
-			}
-		default:
-			if len(parts) < 1 {
-				continue
-			}
-			if ts, err := time.Parse(layout, parts[0]); err == nil {
-				text := raw
-				if len(parts) >= 2 {
-					text = strings.Join(parts[1:], " ")
-				}
-				utc := ts.UTC()
-				return logLine{Timestamp: &utc, Text: text}
-			}
+// readRotatedTail opens a rotated log file (<log>.1) and returns up to n
+// trailing lines. Missing file is not an error — rotation is lazy, so the
+// rotated file is often absent. n < 0 requests all lines.
+func readRotatedTail(path string, n int) ([][]byte, error) {
+	if n == 0 {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil // missing is fine
+	}
+	defer f.Close()
+	return readTail(f, n)
+}
+
+// readTail returns up to n trailing lines of f. n < 0 returns all lines. The
+// ring buffer keeps memory bounded to n; the file is read sequentially from
+// the beginning (reading from the tail would need os.Seek + reverse scan,
+// which bufio doesn't do well with multi-byte lines).
+func readTail(f *os.File, n int) ([][]byte, error) {
+	scanner := bufio.NewScanner(f)
+	// Console log lines are usually short, but allow up to 1 MiB per line so
+	// a long warning doesn't bufio.ErrTooLong us out.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	if n < 0 {
+		var all [][]byte
+		for scanner.Scan() {
+			line := append([]byte{}, scanner.Bytes()...)
+			all = append(all, append(line, '\n'))
 		}
+		return all, scanner.Err()
 	}
-	return logLine{Text: raw}
-}
-
-func formatLogLine(line logLine, timestamps bool) string {
-	if !timestamps || line.Timestamp == nil {
-		return line.Text
+	if n == 0 {
+		return nil, nil
 	}
-	return line.Timestamp.Format(time.RFC3339Nano) + " " + line.Text
+	ring := make([][]byte, 0, n)
+	for scanner.Scan() {
+		line := append([]byte{}, scanner.Bytes()...)
+		line = append(line, '\n')
+		if len(ring) == n {
+			ring = ring[1:]
+		}
+		ring = append(ring, line)
+	}
+	return ring, scanner.Err()
 }
 
 // POST /containers/{id}/restart
@@ -1210,85 +1216,27 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	timeout, err := parseStopTimeout(r.URL.Query().Get("t"), 10*time.Second)
-	if err != nil {
-		errResponse(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	state, _ := h.mgr.State(id)
 	if state == "running" {
-		if err := h.mgr.StopContainer(id, timeout); err != nil {
+		defaultTO := 0
+		if rec := h.store.GetContainer(id); rec != nil {
+			defaultTO = rec.StopTimeout
+		}
+		if err := h.mgr.StopContainer(id, stopTimeoutWithDefault(r, defaultTO)); err != nil {
 			errResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		if rec := h.store.GetContainer(id); rec != nil {
-			h.markContainerExited(rec, 0)
-		}
+		rec := h.store.GetContainer(id)
+		h.emitContainer("die", rec)
 	}
 	if err := h.mgr.StartContainer(id); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if rec := h.store.GetContainer(id); rec != nil {
-		now := time.Now()
-		rec.StartedAt = &now
-		rec.FinishedAt = nil
-		rec.ExitCode = 0
-		rec.RestartCount++
-		h.store.AddContainer(rec)
-		h.publishEvent("container", "restart", id, map[string]string{
-			"name":  rec.Name,
-			"image": normalizeImageRef(rec.Image),
-		})
-	}
+	rec := h.store.GetContainer(id)
+	h.emitContainer("start", rec)
+	h.emitContainer("restart", rec)
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// nonDefaultStopSignal reports whether the caller asked for a StopSignal
-// other than SIGTERM/TERM/15 (all names for the default init-killing
-// signal that lxc-stop and pct shutdown already use).
-func nonDefaultStopSignal(sig string) bool {
-	s := strings.ToUpper(strings.TrimSpace(sig))
-	if s == "" {
-		return false
-	}
-	s = strings.TrimPrefix(s, "SIG")
-	switch s {
-	case "TERM", "15":
-		return false
-	}
-	return true
-}
-
-// waitUntilExited polls the container's state up to timeout. Used after
-// sending a custom StopSignal so we give the process a chance to exit
-// before falling back to SIGKILL.
-func waitUntilExited(mgr *lxc.Manager, id string, timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if state, _ := mgr.State(id); state != "running" {
-			return
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
-// parseStopTimeout interprets Docker's ?t=<seconds> query param. Missing or
-// empty returns the caller's default; negative values mean "no timeout" in
-// Docker (kill immediately), so clamp to zero.
-func parseStopTimeout(raw string, fallback time.Duration) (time.Duration, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return fallback, nil
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, fmt.Errorf("invalid t value %q", raw)
-	}
-	if n < 0 {
-		return 0, nil
-	}
-	return time.Duration(n) * time.Second, nil
 }
 
 // POST /containers/{id}/rename
@@ -1303,19 +1251,32 @@ func (h *Handler) renameContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	newName = strings.TrimPrefix(newName, "/")
+	newName = strings.TrimSpace(strings.TrimPrefix(newName, "/"))
+	if !isValidContainerName(newName) {
+		errResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid container name (%s)", newName))
+		return
+	}
 	rec := h.store.GetContainer(id)
 	if rec == nil {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
+	if other := h.store.FindContainerByName(newName); other != nil && other.ID != id {
+		errResponse(w, http.StatusConflict,
+			fmt.Sprintf("Conflict. The container name %q is already in use.", "/"+newName))
+		return
+	}
+	oldName := rec.Name
 	rec.Name = newName
 	if err := h.store.AddContainer(rec); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	h.publishEvent("container", "rename", id, map[string]string{
-		"name": rec.Name,
+	// The rename event carries an oldName attribute so Portainer's event
+	// feed can render "foo renamed to bar". Docker prefixes names with a
+	// leading slash on the wire.
+	h.emitContainerWithAttrs("rename", rec, map[string]string{
+		"oldName": "/" + oldName,
 	})
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1332,39 +1293,119 @@ func (h *Handler) topContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusConflict, "container is not running")
 		return
 	}
-
-	psArgs := strings.TrimSpace(r.URL.Query().Get("ps_args"))
-	candidates := [][]string{}
-	if psArgs != "" {
-		candidates = append(candidates, append([]string{"ps"}, strings.Fields(psArgs)...))
+	psArgs := r.URL.Query().Get("ps_args")
+	if psArgs == "" {
+		psArgs = "-ef"
 	}
-	candidates = append(candidates,
-		[]string{"ps", "-eo", "pid,user,time,comm"},
-		[]string{"ps"},
-	)
-
-	var out []byte
-	var err error
-	for _, argv := range candidates {
-		out, err = h.mgr.Exec(id, argv, nil).Output()
-		if err == nil && strings.TrimSpace(string(out)) != "" {
-			break
+	psCmd := append([]string{"ps"}, strings.Fields(psArgs)...)
+	cmd := h.mgr.Exec(id, psCmd, nil)
+	out, err := cmd.Output()
+	if err != nil {
+		if titles, procs, ok := procTop(containerPID(id)); ok {
+			jsonResponse(w, http.StatusOK, map[string]any{
+				"Titles":    titles,
+				"Processes": procs,
+			})
+			return
 		}
-	}
-	if err != nil {
-		out, err = h.topViaNsenter(id, psArgs)
-	}
-	if err != nil {
 		errResponse(w, http.StatusInternalServerError, fmt.Sprintf("ps: %v", err))
 		return
 	}
-
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	titles, processes := parseTopOutput(lines)
+	if len(lines) == 0 {
+		jsonResponse(w, http.StatusOK, map[string]any{
+			"Titles":    []string{},
+			"Processes": [][]string{},
+		})
+		return
+	}
+	titles := strings.Fields(lines[0])
+	processes := make([][]string, 0, len(lines)-1)
+	cols := len(titles)
+	for _, line := range lines[1:] {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < cols {
+			continue
+		}
+		row := append([]string{}, fields[:cols-1]...)
+		row = append(row, strings.Join(fields[cols-1:], " "))
+		processes = append(processes, row)
+	}
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"Titles":    titles,
 		"Processes": processes,
 	})
+}
+
+func procTop(initPID int) ([]string, [][]string, bool) {
+	if initPID <= 0 {
+		return nil, nil, false
+	}
+	pids := map[int]bool{initPID: true}
+	pids = walkChildren(initPID, pids)
+	titles := []string{"UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"}
+	var rows [][]string
+	for pid := range pids {
+		row := readProcRow(pid)
+		if row != nil {
+			rows = append(rows, row)
+		}
+	}
+	if len(rows) == 0 {
+		return nil, nil, false
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i][1] < rows[j][1] })
+	return titles, rows, true
+}
+
+func walkChildren(pid int, seen map[int]bool) map[int]bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid))
+	if err != nil {
+		return seen
+	}
+	for _, f := range strings.Fields(string(data)) {
+		child, err := strconv.Atoi(f)
+		if err != nil || seen[child] {
+			continue
+		}
+		seen[child] = true
+		walkChildren(child, seen)
+	}
+	return seen
+}
+
+func readProcRow(pid int) []string {
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return nil
+	}
+	var uid, ppid, name string
+	for _, line := range strings.Split(string(status), "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		switch k {
+		case "Uid":
+			if fields := strings.Fields(v); len(fields) > 0 {
+				uid = fields[0]
+			}
+		case "PPid":
+			ppid = v
+		case "Name":
+			name = v
+		}
+	}
+	cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	cmd := name
+	if len(cmdline) > 0 {
+		cmd = strings.ReplaceAll(strings.TrimRight(string(cmdline), "\x00"), "\x00", " ")
+	}
+	return []string{uid, strconv.Itoa(pid), ppid, "0", "00:00", "?", "00:00:00", cmd}
 }
 
 // POST /containers/{id}/attach
@@ -1375,30 +1416,71 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cmd := h.mgr.Exec(id, []string{"/bin/sh"}, nil)
-	if hj, ok := w.(http.Hijacker); ok {
-		conn, buf, err := hj.Hijack()
-		if err != nil {
-			return
+	q := r.URL.Query()
+	logsFlag := q.Get("logs") == "1" || q.Get("logs") == "true"
+	streamFlag := q.Get("stream") != "0" && q.Get("stream") != "false"
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		errResponse(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+	conn, buf, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
+	buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
+	buf.WriteString("Connection: Upgrade\r\n")
+	buf.WriteString("Upgrade: tcp\r\n")
+	buf.WriteString("\r\n")
+	buf.Flush()
+
+	logPath := h.mgr.LogPath(id)
+	if logsFlag {
+		if f, err := os.Open(logPath); err == nil {
+			io.Copy(conn, f)
+			f.Close()
 		}
-		defer conn.Close()
-
-		buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
-		buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
-		buf.WriteString("Connection: Upgrade\r\n")
-		buf.WriteString("Upgrade: tcp\r\n")
-		buf.WriteString("\r\n")
-		buf.Flush()
-
-		runExecTTY(cmd, conn, func(p *os.File) {
-			h.setAttachPTY(id, p)
-		})
+	}
+	if !streamFlag {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
-	w.WriteHeader(http.StatusOK)
-	runAttachFallback(cmd, r.Body, w)
+	f, err := os.OpenFile(logPath, os.O_RDONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.Seek(0, io.SeekEnd)
+
+	ctx := r.Context()
+	buffer := make([]byte, 32*1024)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if s, _ := h.mgr.State(id); s != "running" && s != "paused" {
+			return
+		}
+		n, readErr := f.Read(buffer)
+		if n > 0 {
+			if _, err := conn.Write(buffer[:n]); err != nil {
+				return
+			}
+		}
+		if readErr == io.EOF || n == 0 {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		if readErr != nil {
+			return
+		}
+	}
 }
 
 // safeJoin joins base and untrusted path, returning an error if the result
@@ -1518,9 +1600,6 @@ func (h *Handler) getArchive(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Docker-Container-Path-Stat", base64.StdEncoding.EncodeToString(statJSON))
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.WriteHeader(http.StatusOK)
-	if r.Method == http.MethodHead {
-		return
-	}
 	tw := tar.NewWriter(w)
 	defer tw.Close()
 
@@ -1577,224 +1656,42 @@ func writeLogFrame(w io.Writer, streamType byte, data []byte) {
 	w.Write(data)
 }
 
-func (h *Handler) markContainerExited(rec *store.ContainerRecord, exitCode int) {
-	// Only emit the `die` event on the first transition from running to
-	// exited. markContainerExited is called from every lifecycle path —
-	// stop, kill, wait, GC — so guard on FinishedAt to avoid publishing
-	// duplicate events.
-	alreadyExited := rec.FinishedAt != nil
-	now := time.Now()
-	rec.FinishedAt = &now
-	rec.ExitCode = exitCode
-	_ = h.store.AddContainer(rec)
-	if !alreadyExited {
-		h.publishEvent("container", "die", rec.ID, map[string]string{
-			"name":     rec.Name,
-			"image":    normalizeImageRef(rec.Image),
-			"exitCode": strconv.Itoa(exitCode),
-		})
-	}
-}
-
-func exitCodeForSignal(signal string) int {
-	signal = strings.TrimSpace(strings.ToUpper(signal))
-	switch signal {
-	case "", "KILL", "SIGKILL", "9":
-		return 137
-	case "TERM", "SIGTERM", "15":
-		return 143
-	}
-	if n, err := strconv.Atoi(signal); err == nil && n > 0 {
-		return 128 + n
-	}
-	return 137
-}
-
-func parseTopOutput(lines []string) ([]string, [][]string) {
-	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
-		return []string{}, [][]string{}
-	}
-
-	titles := strings.Fields(lines[0])
-	processes := make([][]string, 0, maxInt(len(lines)-1, 0))
-	for _, line := range lines[1:] {
-		fields := splitFieldsWithTail(line, len(titles))
-		if len(fields) == len(titles) {
-			processes = append(processes, fields)
-		}
-	}
-	return titles, processes
-}
-
-func (h *Handler) topViaNsenter(id, psArgs string) ([]byte, error) {
-	pid, err := h.mgr.InitPID(id)
-	if err != nil {
-		return nil, err
-	}
-	allowed, err := processTreeSet(pid)
-	if err != nil {
-		return nil, err
-	}
-	candidates := [][]string{}
-	if psArgs != "" {
-		candidates = append(candidates, append([]string{"ps"}, strings.Fields(psArgs)...))
-	}
-	candidates = append(candidates,
-		[]string{"ps", "-eo", "pid,user,time,comm"},
-		[]string{"ps", "-ef"},
-		[]string{"ps", "aux"},
-	)
-	for _, argv := range candidates {
-		cmd := exec.Command("nsenter", append([]string{
-			"-t", strconv.Itoa(pid),
-			"-p",
-		}, argv...)...)
-		out, err := cmd.Output()
-		if err == nil && strings.TrimSpace(string(out)) != "" {
-			filtered := filterTopOutputByPIDSet(out, allowed)
-			if strings.TrimSpace(string(filtered)) != "" {
-				return filtered, nil
-			}
-		}
-	}
-	return nil, fmt.Errorf("no usable ps variant found")
-}
-
-func filterTopOutputByPIDSet(out []byte, allowed map[int]struct{}) []byte {
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) == 0 {
-		return nil
-	}
-	titles := strings.Fields(lines[0])
-	pidIdx := -1
-	for i, title := range titles {
-		if strings.EqualFold(title, "PID") {
-			pidIdx = i
-			break
-		}
-	}
-	if pidIdx < 0 {
-		return out
-	}
-
-	filtered := []string{lines[0]}
-	for _, line := range lines[1:] {
-		fields := splitFieldsWithTail(line, len(titles))
-		if len(fields) != len(titles) {
-			continue
-		}
-		pid, err := strconv.Atoi(fields[pidIdx])
-		if err != nil {
-			continue
-		}
-		if _, ok := allowed[pid]; ok {
-			filtered = append(filtered, line)
-		}
-	}
-	return []byte(strings.Join(filtered, "\n"))
-}
-
-func processTreeSet(root int) (map[int]struct{}, error) {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil, err
-	}
-	ppids := make(map[int]int)
-	for _, entry := range entries {
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
-		if err != nil {
-			continue
-		}
-		ppids[pid] = parsePPIDFromStatus(data)
-	}
-	allowed := map[int]struct{}{root: {}}
-	for {
-		changed := false
-		for pid, ppid := range ppids {
-			if _, ok := allowed[pid]; ok {
-				continue
-			}
-			if _, ok := allowed[ppid]; ok {
-				allowed[pid] = struct{}{}
-				changed = true
-			}
-		}
-		if !changed {
-			break
-		}
-	}
-	return allowed, nil
-}
-
-func parsePPIDFromStatus(data []byte) int {
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "PPid:") {
-			ppid, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "PPid:")))
-			return ppid
-		}
-	}
-	return -1
-}
-
-func splitFieldsWithTail(line string, want int) []string {
-	if want <= 0 {
-		return nil
-	}
-	fields := strings.Fields(line)
-	if len(fields) < want {
-		return nil
-	}
-	if len(fields) == want {
-		return fields
-	}
-	head := append([]string{}, fields[:want-1]...)
-	head = append(head, strings.Join(fields[want-1:], " "))
-	return head
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func runAttachFallback(cmd *exec.Cmd, stdin io.Reader, w http.ResponseWriter) {
-	cmd.Stdin = stdin
-	fw := flushWriter{w: w}
-	cmd.Stdout = fw
-	cmd.Stderr = fw
-	_ = cmd.Run()
-}
-
-type flushWriter struct {
-	w http.ResponseWriter
-}
-
-func (f flushWriter) Write(p []byte) (int, error) {
-	n, err := f.w.Write(p)
-	if fl, ok := f.w.(http.Flusher); ok {
-		fl.Flush()
-	}
-	return n, err
-}
-
 // stateToStatus returns a human-readable status string like Docker's "Up 2 hours".
 func stateToStatus(state string, created time.Time) string {
+	return stateToStatusFull(state, created, "", 0, nil)
+}
+
+func stateToStatusWithHealth(state string, created time.Time, health string) string {
+	return stateToStatusFull(state, created, health, 0, nil)
+}
+
+func stateToStatusFull(state string, created time.Time, health string, exitCode int, finishedAt *time.Time) string {
+	base := ""
 	switch state {
 	case "running":
-		return "Up " + humanDuration(time.Since(created))
+		base = "Up " + humanDuration(time.Since(created))
+	case "paused":
+		base = "Up " + humanDuration(time.Since(created)) + " (Paused)"
 	case "created":
 		return "Created"
 	case "exited":
-		return "Exited (0) " + humanDuration(time.Since(created)) + " ago"
+		since := time.Since(created)
+		if finishedAt != nil {
+			since = time.Since(*finishedAt)
+		}
+		return fmt.Sprintf("Exited (%d) %s ago", exitCode, humanDuration(since))
 	default:
 		return state
 	}
+	switch health {
+	case "healthy":
+		return base + " (healthy)"
+	case "unhealthy":
+		return base + " (unhealthy)"
+	case "starting":
+		return base + " (health: starting)"
+	}
+	return base
 }
 
 func humanDuration(d time.Duration) string {
@@ -1811,25 +1708,26 @@ func humanDuration(d time.Duration) string {
 }
 
 func (h *Handler) resolveID(idOrName string) string {
-	if id := h.store.ResolveID(idOrName); id != "" {
-		return id
-	}
-	// Fall back to adopted (tagged) PVE CTs. Match exact ID, name, or
-	// 4+-char ID prefix.
-	for _, rec := range h.mgr.ListContainers() {
-		if rec.ID == idOrName || rec.Name == idOrName {
-			return rec.ID
-		}
-		if len(idOrName) >= 4 && strings.HasPrefix(rec.ID, idOrName) {
-			return rec.ID
-		}
-	}
-	return ""
+	return h.store.ResolveID(idOrName)
 }
 
 // buildHostConfig reconstructs a HostConfig from the stored container record.
+// If the full create-time HostConfig was persisted, we replay that verbatim
+// so Portainer's "Duplicate" flow sees the exact fields it posted; otherwise
+// we synthesize the minimum set from typed record fields.
 func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 	hc := &HostConfig{}
+	if len(rec.RawHostConfig) > 0 {
+		if err := json.Unmarshal(rec.RawHostConfig, hc); err != nil {
+			// Fall through to synthesized config on decode error.
+			hc = &HostConfig{}
+		}
+	}
+	if hc.NetworkMode == "" {
+		hc.NetworkMode = networkModeFor(rec)
+	}
+	// Rebuild PortBindings/Binds from the typed record so that runtime state
+	// (e.g. dynamically allocated ports) wins over the stored create body.
 	if len(rec.PortBindings) > 0 {
 		hc.PortBindings = make(map[string][]PortBinding)
 		for _, pb := range rec.PortBindings {
@@ -1840,81 +1738,378 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 			})
 		}
 	}
-	for _, m := range rec.Mounts {
-		bind := m.Source + ":" + m.Destination
-		if m.ReadOnly {
-			bind += ":ro"
+	if len(rec.Mounts) > 0 {
+		hc.Binds = hc.Binds[:0]
+		for _, m := range rec.Mounts {
+			bind := m.Source + ":" + m.Destination
+			if m.ReadOnly {
+				bind += ":ro"
+			}
+			hc.Binds = append(hc.Binds, bind)
 		}
-		hc.Binds = append(hc.Binds, bind)
 	}
-	if rec.RestartPolicy != nil {
-		hc.RestartPolicy = RestartPolicy{
-			Name:              rec.RestartPolicy.Name,
-			MaximumRetryCount: rec.RestartPolicy.MaximumRetryCount,
+	normalizeHostConfig(hc)
+	return hc
+}
+
+func normalizeHostConfig(hc *HostConfig) {
+	if hc.Binds == nil {
+		hc.Binds = []string{}
+	}
+	if hc.Devices == nil {
+		hc.Devices = []DeviceMapping{}
+	}
+	if hc.DeviceCgroupRules == nil {
+		hc.DeviceCgroupRules = []string{}
+	}
+	if hc.CapAdd == nil {
+		hc.CapAdd = []string{}
+	}
+	if hc.CapDrop == nil {
+		hc.CapDrop = []string{}
+	}
+	if hc.SecurityOpt == nil {
+		hc.SecurityOpt = []string{}
+	}
+	if hc.GroupAdd == nil {
+		hc.GroupAdd = []string{}
+	}
+	if hc.PortBindings == nil {
+		hc.PortBindings = map[string][]PortBinding{}
+	}
+}
+
+func (h *Handler) exposedPortsFor(rec *store.ContainerRecord) map[string]struct{} {
+	out := map[string]struct{}{}
+	for k := range rec.ExposedPorts {
+		out[k] = struct{}{}
+	}
+	for _, pb := range rec.PortBindings {
+		out[fmt.Sprintf("%d/%s", pb.ContainerPort, pb.Proto)] = struct{}{}
+	}
+	if img := h.store.GetImage(normalizeImageRef(rec.Image)); img != nil {
+		for _, p := range img.OCIPorts {
+			out[p] = struct{}{}
 		}
+	}
+	return out
+}
+
+func tmpfsOptionsString(opts map[string]any, readOnly bool) string {
+	flags := []string{"nosuid", "nodev"}
+	if readOnly {
+		flags = append(flags, "ro")
 	} else {
-		// Docker defaults to "no" when the user didn't pick anything.
-		hc.RestartPolicy = RestartPolicy{Name: "no"}
+		flags = append([]string{"rw"}, flags...)
 	}
-	if e := rec.HostConfigExtras; e != nil {
-		hc.Privileged = e.Privileged
-		hc.CapAdd = append([]string{}, e.CapAdd...)
-		hc.CapDrop = append([]string{}, e.CapDrop...)
-		hc.ExtraHosts = append([]string{}, e.ExtraHosts...)
-		hc.Dns = append([]string{}, e.Dns...)
-		hc.DnsSearch = append([]string{}, e.DnsSearch...)
-		hc.DnsOptions = append([]string{}, e.DnsOptions...)
-		hc.Memory = e.Memory
-		hc.CPUShares = e.CPUShares
-		hc.NanoCPUs = e.NanoCPUs
-		hc.ReadonlyRootfs = e.ReadonlyRootfs
-		hc.PidMode = e.PidMode
-		hc.UTSMode = e.UTSMode
-		if len(e.Tmpfs) > 0 {
-			hc.Tmpfs = map[string]string{}
-			for k, v := range e.Tmpfs {
-				hc.Tmpfs[k] = v
+	if opts != nil {
+		if v, ok := opts["SizeBytes"]; ok {
+			switch n := v.(type) {
+			case float64:
+				if n > 0 {
+					flags = append(flags, fmt.Sprintf("size=%d", int64(n)))
+				}
+			case int64:
+				if n > 0 {
+					flags = append(flags, fmt.Sprintf("size=%d", n))
+				}
+			case int:
+				if n > 0 {
+					flags = append(flags, fmt.Sprintf("size=%d", n))
+				}
 			}
 		}
-		for _, d := range e.Devices {
-			hc.Devices = append(hc.Devices, DeviceMapping{
-				PathOnHost:        d.PathOnHost,
-				PathInContainer:   d.PathInContainer,
-				CgroupPermissions: d.CgroupPermissions,
-			})
-		}
-		hc.DeviceCgroupRules = append([]string{}, e.DeviceCgroupRules...)
-		hc.UsernsMode = e.UsernsMode
-		hc.GroupAdd = append([]string{}, e.GroupAdd...)
-		hc.SecurityOpt = append([]string{}, e.SecurityOpt...)
-		hc.Sysctls = copyStringMap(e.Sysctls)
-		hc.PidsLimit = e.PidsLimit
-		hc.OomScoreAdj = e.OomScoreAdj
-		if e.LogDriver != "" {
-			hc.LogConfig = &LogConfig{
-				Type:   e.LogDriver,
-				Config: copyStringMap(e.LogOptions),
+		if v, ok := opts["Mode"]; ok {
+			if mode, ok := v.(float64); ok && mode > 0 {
+				flags = append(flags, fmt.Sprintf("mode=0%o", int(mode)))
 			}
 		}
 	}
-	// Reflect the stored mounts into HostConfig.Mounts — Docker's modern
-	// mount form. Portainer's container-edit dialog reads this alongside
-	// Binds; emitting both keeps old and new clients happy.
+	return strings.Join(flags, ",")
+}
+
+func propagationFromBindOptions(opts map[string]any) string {
+	if opts == nil {
+		return ""
+	}
+	v, ok := opts["Propagation"]
+	if !ok {
+		return ""
+	}
+	s, _ := v.(string)
+	switch s {
+	case "rprivate", "private", "rshared", "shared", "rslave", "slave":
+		return s
+	}
+	return ""
+}
+
+func apiToLXCUlimits(u []Ulimit) []lxc.Ulimit {
+	if len(u) == 0 {
+		return nil
+	}
+	out := make([]lxc.Ulimit, 0, len(u))
+	for _, x := range u {
+		out = append(out, lxc.Ulimit{Name: x.Name, Soft: x.Soft, Hard: x.Hard})
+	}
+	return out
+}
+
+func ensureSlice(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+func ensureMap(m map[string]string) map[string]string {
+	if m == nil {
+		return map[string]string{}
+	}
+	return m
+}
+
+func ensureStructMap(m map[string]struct{}) map[string]struct{} {
+	if m == nil {
+		return map[string]struct{}{}
+	}
+	return m
+}
+
+func containerExposes(exposed map[string]struct{}, wants []string) bool {
+	if len(exposed) == 0 {
+		return false
+	}
+	for _, want := range wants {
+		if _, ok := exposed[want]; ok {
+			return true
+		}
+		if !strings.Contains(want, "/") {
+			if _, ok := exposed[want+"/tcp"]; ok {
+				return true
+			}
+			if _, ok := exposed[want+"/udp"]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containerOnNetwork(rec *store.ContainerRecord, names []string) bool {
+	attached := map[string]bool{networkModeFor(rec): true, "gow": true}
+	for _, want := range names {
+		if attached[want] {
+			return true
+		}
+	}
+	return false
+}
+
+func containerUsesVolume(rec *store.ContainerRecord, st *store.Store, names []string) bool {
+	sources := map[string]bool{}
+	for _, name := range names {
+		if v := st.GetVolume(name); v != nil {
+			sources[v.Mountpoint] = true
+		}
+		sources[name] = true
+	}
 	for _, m := range rec.Mounts {
-		src := m.Source
-		if m.Name != "" {
-			// Named volumes use the volume name as the source; bind mounts
-			// use the host path.
-			src = m.Name
+		if sources[m.Source] {
+			return true
 		}
-		hc.Mounts = append(hc.Mounts, MountRequest{
-			Type:     orDefault(m.Type, "bind"),
-			Source:   src,
-			Target:   m.Destination,
-			ReadOnly: m.ReadOnly,
+	}
+	return false
+}
+
+func exitCodeForSignal(s string) int {
+	if s == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return 128 + n
+	}
+	name := strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(s)), "SIG")
+	numeric := map[string]int{
+		"HUP": 1, "INT": 2, "QUIT": 3, "ILL": 4, "TRAP": 5,
+		"ABRT": 6, "BUS": 7, "FPE": 8, "KILL": 9, "USR1": 10,
+		"SEGV": 11, "USR2": 12, "PIPE": 13, "ALRM": 14, "TERM": 15,
+		"STKFLT": 16, "CHLD": 17, "CONT": 18, "STOP": 19, "TSTP": 20,
+		"TTIN": 21, "TTOU": 22, "URG": 23, "XCPU": 24, "XFSZ": 25,
+		"VTALRM": 26, "PROF": 27, "WINCH": 28, "IO": 29, "PWR": 30,
+		"SYS": 31,
+	}
+	if n, ok := numeric[name]; ok {
+		return 128 + n
+	}
+	return 0
+}
+
+func isValidSignal(s string) bool {
+	if strings.ContainsAny(s, " \t\n") {
+		return false
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return n >= 0 && n <= 64
+	}
+	bare := strings.TrimPrefix(strings.ToUpper(s), "SIG")
+	if bare == "" {
+		return false
+	}
+	for _, r := range bare {
+		if !((r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '+' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidRestartPolicy(name string) bool {
+	switch name {
+	case "", "no", "always", "unless-stopped", "on-failure":
+		return true
+	}
+	return false
+}
+
+func isValidContainerName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		if r == '_' || r == '.' || r == '-' ||
+			(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			if i == 0 && (r == '_' || r == '.' || r == '-') {
+				return false
+			}
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func healthcheckFrom(rec *store.ContainerRecord) *Healthcheck {
+	if len(rec.HealthcheckTest) == 0 {
+		return nil
+	}
+	return &Healthcheck{
+		Test:        rec.HealthcheckTest,
+		Interval:    rec.HealthcheckInterval,
+		Timeout:     rec.HealthcheckTimeout,
+		Retries:     rec.HealthcheckRetries,
+		StartPeriod: rec.HealthcheckStartPeriod,
+	}
+}
+
+// healthStateFrom renders the stored health fields as the State.Health
+// object Portainer reads. Returns nil when no healthcheck is configured so
+// inspect omits the key entirely (matching Docker's behavior).
+func healthStateFrom(rec *store.ContainerRecord) *HealthState {
+	if len(rec.HealthcheckTest) == 0 {
+		return nil
+	}
+	status := rec.HealthStatus
+	if status == "" {
+		status = "starting"
+	}
+	log := make([]ContainerHealthEntry, 0, len(rec.HealthLog))
+	for _, r := range rec.HealthLog {
+		log = append(log, ContainerHealthEntry{
+			Start:    r.Start.Format(time.RFC3339Nano),
+			End:      r.End.Format(time.RFC3339Nano),
+			ExitCode: r.ExitCode,
+			Output:   r.Output,
 		})
 	}
-	return hc
+	return &HealthState{
+		Status:        status,
+		FailingStreak: rec.HealthFailingStreak,
+		Log:           log,
+	}
+}
+
+// hasMountAt reports whether the collected mount list already targets the
+// given in-container destination. Used to skip auto-creating anonymous
+// volumes for paths that the user already bind-mounted.
+func hasMountAt(mounts []store.MountSpec, dest string) bool {
+	for _, m := range mounts {
+		if m.Destination == dest {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureVolume resolves a named volume to its backing directory, creating
+// it on demand. Anonymous volumes and compose-declared-but-not-pre-created
+// volumes both rely on auto-creation; this matches Docker's behavior.
+func (h *Handler) ensureVolume(name string) (string, error) {
+	return h.ensureVolumeOwned(name, "", false)
+}
+
+func (h *Handler) ensureVolumeOwned(name, owner string, anonymous bool) (string, error) {
+	if v := h.store.GetVolume(name); v != nil {
+		return v.Mountpoint, nil
+	}
+	mountpoint := filepath.Join(h.volumeRoot(), name)
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		return "", err
+	}
+	rec := &store.VolumeRecord{
+		Name:       name,
+		Driver:     "local",
+		Mountpoint: mountpoint,
+		Created:    time.Now(),
+		OwnerID:    owner,
+		Anonymous:  anonymous,
+	}
+	if err := h.store.AddVolume(rec); err != nil {
+		return "", err
+	}
+	return mountpoint, nil
+}
+
+// mountJSONFrom converts a store mount record to the Docker wire format.
+// Records written before the Type field existed default to "bind" — the
+// only mount type the LXC runtime actually mounts today.
+func (h *Handler) mountJSONFrom(m store.MountSpec) MountJSON {
+	mode := "rw"
+	if m.ReadOnly {
+		mode = "ro"
+	}
+	t := m.Type
+	if t == "" {
+		t = "bind"
+	}
+	propagation := m.Propagation
+	if propagation == "" {
+		propagation = "rprivate"
+	}
+	out := MountJSON{
+		Type:        t,
+		Source:      m.Source,
+		Destination: m.Destination,
+		Mode:        mode,
+		RW:          !m.ReadOnly,
+		Propagation: propagation,
+	}
+	if t == "volume" {
+		if v := h.volumeByMountpoint(m.Source); v != nil {
+			out.Name = v.Name
+			out.Driver = v.Driver
+		}
+	}
+	return out
+}
+
+func (h *Handler) volumeByMountpoint(path string) *store.VolumeRecord {
+	for _, v := range h.store.ListVolumes() {
+		if v.Mountpoint == path {
+			return v
+		}
+	}
+	return nil
 }
 
 // mergeEnv merges image-level env vars with request-level env vars.
@@ -1939,75 +2134,4 @@ func mergeEnv(imageEnv, requestEnv []string) []string {
 		result = append(result, m[key])
 	}
 	return result
-}
-
-// labelString reads the first non-empty value found under the given keys.
-// Used to honor a primary label name with deprecated aliases as fallback.
-// When a non-primary key matches, a one-time deprecation warning is logged.
-func labelString(labels map[string]string, keys ...string) string {
-	for i, k := range keys {
-		if v := labels[k]; v != "" {
-			if i > 0 {
-				warnDeprecatedLabel(k, keys[0])
-			}
-			return v
-		}
-	}
-	return ""
-}
-
-// labelBool reports whether any of the given label keys is set to "true".
-// Used so the new "dld.*" namespace honors the older "gow.*" labels for
-// one transitional release. A one-time deprecation warning is logged when
-// a non-primary key is the source of the truthy value.
-func labelBool(labels map[string]string, keys ...string) bool {
-	for i, k := range keys {
-		if labels[k] == "true" {
-			if i > 0 {
-				warnDeprecatedLabel(k, keys[0])
-			}
-			return true
-		}
-	}
-	return false
-}
-
-var deprecatedLabelOnce sync.Map // key string -> sync.Once
-
-func warnDeprecatedLabel(old, replacement string) {
-	once, _ := deprecatedLabelOnce.LoadOrStore(old, &sync.Once{})
-	once.(*sync.Once).Do(func() {
-		log.Printf("DEPRECATION: label %q is deprecated; use %q instead", old, replacement)
-	})
-}
-
-// parseISOLabel parses the comma-separated value of the "dld.iso" label
-// into ISOMount entries. Format per item: "storage:volid[:dest]".
-//   - storage: PVE storage name (e.g. "isos")
-//   - volid:   path within that storage (e.g. "iso/Win11.iso")
-//   - dest:    optional in-container path (defaults to "/mnt/<basename>")
-//
-// Empty input yields nil.
-func parseISOLabel(raw string) []lxc.ISOMount {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
-	}
-	var out []lxc.ISOMount
-	for _, item := range strings.Split(raw, ",") {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-		parts := strings.SplitN(item, ":", 3)
-		if len(parts) < 2 {
-			continue
-		}
-		iso := lxc.ISOMount{Storage: parts[0], VolumeID: parts[1]}
-		if len(parts) == 3 {
-			iso.Destination = parts[2]
-		}
-		out = append(out, iso)
-	}
-	return out
 }

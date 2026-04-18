@@ -18,148 +18,73 @@ import (
 
 const defaultPath = "/var/lib/docker-lxc-daemon"
 
-// ContainerRecord holds Docker-layer metadata for a single container.
+// ContainerRecord holds Docker-layer metadata for a single container. Most
+// fields map 1:1 to the Docker Engine create payload. Ones prefixed "API"
+// are round-tripped through inspect for tools (Portainer's Duplicate/Edit
+// flow re-posts whatever inspect returned) but not necessarily enforced by
+// the LXC runtime.
 type ContainerRecord struct {
-	ID           string                       `json:"id"`       // Docker hex ID (API-facing)
-	VMID         int                          `json:"vmid"`     // Proxmox CT VMID (0 = legacy direct LXC)
-	Name         string                       `json:"name"`     // Docker-style name (no leading slash)
-	Image        string                       `json:"image"`    // Original image:tag as requested
-	ImageID      string                       `json:"image_id"` // Resolved image identifier
-	Created      time.Time                    `json:"created"`
-	Entrypoint   []string                     `json:"entrypoint"`
-	Cmd          []string                     `json:"cmd"`
-	Env          []string                     `json:"env"`
-	Labels       map[string]string            `json:"labels"`
-	IPAddress    string                       `json:"ip_address"`
-	PortBindings []PortBinding                `json:"port_bindings,omitempty"`
-	Mounts       []MountSpec                  `json:"mounts"`
-	Networks     map[string]NetworkAttachment `json:"networks,omitempty"`
-	StartedAt    *time.Time                   `json:"started_at,omitempty"`  // nil until first start; distinguishes "created" from "exited"
-	FinishedAt   *time.Time                   `json:"finished_at,omitempty"` // nil while running or before first exit
-	ExitCode     int                          `json:"exit_code,omitempty"`
-	// Ephemeral is true only for daemon-created raw-LXC containers that the
-	// GC is permitted to reap. Permanent Proxmox CTs (visible in PVE UI) and
-	// any pre-existing records that lack this flag are left strictly alone.
-	Ephemeral bool `json:"ephemeral,omitempty"`
-	// Storage records the PVE storage pool this container's rootfs lives
-	// on. Used by RemoveContainer for ephemeral containers (the ZFS clone
-	// dataset path includes the pool name) and for diagnostics on PVE CTs.
-	Storage string `json:"storage,omitempty"`
-	// RestartPolicy is echoed back through /containers/{id}/json so
-	// Portainer's container detail shows the policy the user selected at
-	// create time. The daemon does not currently enforce it — containers
-	// that exit stay exited until the user restarts them.
-	RestartPolicy *RestartPolicy `json:"restart_policy,omitempty"`
-	// RestartCount tracks how many times the user has restarted the
-	// container via /containers/{id}/restart. Surfaces on inspect.
-	RestartCount int `json:"restart_count,omitempty"`
-	// Healthcheck is echoed back on inspect so Portainer's detail panel
-	// and duplicate/edit dialog reflect the user's input. Like
-	// RestartPolicy, the daemon does not actually execute the check.
-	Healthcheck *HealthcheckConfig `json:"healthcheck,omitempty"`
-	// StopSignal mirrors Docker's Config.StopSignal field (e.g. "SIGINT").
-	// We don't map it into lxc-stop, but Portainer reads it from inspect.
-	StopSignal string `json:"stop_signal,omitempty"`
-	// WorkingDir mirrors Docker's Config.WorkingDir so inspect echoes
-	// what the user picked instead of always reporting empty.
-	WorkingDir string `json:"working_dir,omitempty"`
-	// User/Domainname/Hostname mirror their Config counterparts. The
-	// daemon does not actually drop privileges to User today.
-	User       string `json:"user,omitempty"`
-	Domainname string `json:"domainname,omitempty"`
-	Hostname   string `json:"hostname,omitempty"`
-	// Tty/OpenStdin/StdinOnce mirror the Config flags; currently not
-	// propagated to lxc-start but roundtrip through inspect.
-	Tty       bool `json:"tty,omitempty"`
-	OpenStdin bool `json:"open_stdin,omitempty"`
-	StdinOnce bool `json:"stdin_once,omitempty"`
-	// RequestedVolumes captures Config.Volumes from the create body so
-	// inspect can echo it back alongside the image-declared volumes.
-	// We do not auto-create anonymous volumes for these paths today; the
-	// field is purely roundtripped.
-	RequestedVolumes []string `json:"requested_volumes,omitempty"`
-	// HostConfigExtras holds the HostConfig fields we roundtrip through
-	// inspect without enforcing (Privileged, caps, DNS overrides,
-	// resource limits). Portainer's Host Config tab renders these.
-	HostConfigExtras *HostConfigExtras `json:"host_config_extras,omitempty"`
+	ID           string            `json:"id"`       // Docker hex ID (API-facing)
+	VMID         int               `json:"vmid"`     // Proxmox CT VMID (0 = legacy direct LXC)
+	Name         string            `json:"name"`     // Docker-style name (no leading slash)
+	Image        string            `json:"image"`    // Original image:tag as requested
+	ImageID      string            `json:"image_id"` // Resolved image identifier
+	Created      time.Time         `json:"created"`
+	Entrypoint   []string          `json:"entrypoint"`
+	Cmd          []string          `json:"cmd"`
+	Env          []string          `json:"env"`
+	Labels       map[string]string `json:"labels"`
+	IPAddress    string            `json:"ip_address"`
+	PortBindings []PortBinding     `json:"port_bindings,omitempty"`
+	Mounts       []MountSpec       `json:"mounts"`
+	StartedAt    *time.Time        `json:"started_at,omitempty"`  // nil until first start; distinguishes "created" from "exited"
+	FinishedAt   *time.Time        `json:"finished_at,omitempty"` // last stop/kill timestamp, for Portainer's "Stopped X ago"
+	ExitCode     int               `json:"exit_code,omitempty"`   // last observed exit code (best-effort)
+	// Echo-back fields: persisted verbatim so `docker inspect` returns
+	// whatever the client sent on create. Not wired to the LXC runtime.
+	Hostname     string              `json:"hostname,omitempty"`
+	Domainname   string              `json:"domainname,omitempty"`
+	User         string              `json:"user,omitempty"`
+	Tty          bool                `json:"tty,omitempty"`
+	OpenStdin    bool                `json:"open_stdin,omitempty"`
+	WorkingDir   string              `json:"working_dir,omitempty"`
+	StopSignal   string              `json:"stop_signal,omitempty"`
+	ExposedPorts map[string]struct{} `json:"exposed_ports,omitempty"`
+	Volumes      map[string]struct{} `json:"volumes,omitempty"`
+	StopTimeout  int                 `json:"stop_timeout,omitempty"`
+	OomScoreAdj  int                 `json:"oom_score_adj,omitempty"`
+	// Lifecycle policy. Hoisted out of RawHostConfig so the restart watcher
+	// doesn't have to re-decode the full JSON blob every 5 seconds.
+	RestartPolicy   string `json:"restart_policy,omitempty"`    // "always"|"on-failure"|"unless-stopped"|""
+	RestartMaxRetry int    `json:"restart_max_retry,omitempty"` // 0 = unlimited
+	RestartCount    int    `json:"restart_count,omitempty"`     // updated by the watcher
+	AutoRemove      bool   `json:"auto_remove,omitempty"`       // remove after exit
+	StoppedByUser   bool   `json:"stopped_by_user,omitempty"`   // set on explicit stop/kill to defeat unless-stopped
+	// Raw HostConfig as JSON for full round-trip. Decoding happens at the
+	// API layer; the store treats this as opaque.
+	RawHostConfig []byte `json:"raw_host_config,omitempty"`
+	// Healthcheck configuration and live health state. The API layer
+	// populates Healthcheck* at create time; the health watcher writes
+	// Health* as it runs probes.
+	HealthcheckTest        []string       `json:"hc_test,omitempty"`
+	HealthcheckInterval    int64          `json:"hc_interval,omitempty"` // nanoseconds
+	HealthcheckTimeout     int64          `json:"hc_timeout,omitempty"`  // nanoseconds
+	HealthcheckRetries     int            `json:"hc_retries,omitempty"`
+	HealthcheckStartPeriod int64          `json:"hc_start_period,omitempty"` // nanoseconds; grace window from start
+	StartError             string         `json:"start_error,omitempty"`     // last StartContainer failure message
+	HealthStatus           string         `json:"health_status,omitempty"`   // "starting"|"healthy"|"unhealthy"
+	HealthFailingStreak    int            `json:"health_fail_streak,omitempty"`
+	HealthLastCheck        *time.Time     `json:"health_last_check,omitempty"`
+	HealthLog              []HealthResult `json:"health_log,omitempty"`
 }
 
-// HostConfigExtras is the persisted subset of Docker's HostConfig we
-// echo on inspect. Each field maps 1:1 to its Docker counterpart.
-type HostConfigExtras struct {
-	Privileged        bool              `json:"privileged,omitempty"`
-	CapAdd            []string          `json:"cap_add,omitempty"`
-	CapDrop           []string          `json:"cap_drop,omitempty"`
-	ExtraHosts        []string          `json:"extra_hosts,omitempty"`
-	Dns               []string          `json:"dns,omitempty"`
-	DnsSearch         []string          `json:"dns_search,omitempty"`
-	DnsOptions        []string          `json:"dns_options,omitempty"`
-	Memory            int64             `json:"memory,omitempty"`
-	CPUShares         int64             `json:"cpu_shares,omitempty"`
-	NanoCPUs          int64             `json:"nano_cpus,omitempty"`
-	Tmpfs             map[string]string `json:"tmpfs,omitempty"`
-	ReadonlyRootfs    bool              `json:"readonly_rootfs,omitempty"`
-	PidMode           string            `json:"pid_mode,omitempty"`
-	UTSMode           string            `json:"uts_mode,omitempty"`
-	Devices           []DeviceMapping   `json:"devices,omitempty"`
-	DeviceCgroupRules []string          `json:"device_cgroup_rules,omitempty"`
-	UsernsMode        string            `json:"userns_mode,omitempty"`
-	GroupAdd          []string          `json:"group_add,omitempty"`
-	SecurityOpt       []string          `json:"security_opt,omitempty"`
-	Sysctls           map[string]string `json:"sysctls,omitempty"`
-	PidsLimit         int64             `json:"pids_limit,omitempty"`
-	OomScoreAdj       int               `json:"oom_score_adj,omitempty"`
-	LogDriver         string            `json:"log_driver,omitempty"`
-	LogOptions        map[string]string `json:"log_options,omitempty"`
-}
-
-// DeviceMapping mirrors Docker's HostConfig.Devices entries.
-type DeviceMapping struct {
-	PathOnHost        string `json:"path_on_host"`
-	PathInContainer   string `json:"path_in_container,omitempty"`
-	CgroupPermissions string `json:"cgroup_permissions,omitempty"`
-}
-
-// HealthcheckConfig mirrors Docker's Config.Healthcheck. Stored verbatim;
-// the daemon currently does not execute healthchecks (all fields are
-// echoed back on inspect for UI purposes only).
-type HealthcheckConfig struct {
-	Test          []string `json:"test,omitempty"`
-	Interval      int64    `json:"interval,omitempty"`
-	Timeout       int64    `json:"timeout,omitempty"`
-	StartPeriod   int64    `json:"start_period,omitempty"`
-	StartInterval int64    `json:"start_interval,omitempty"`
-	Retries       int      `json:"retries,omitempty"`
-}
-
-// RestartPolicy mirrors Docker's HostConfig.RestartPolicy block. Kept as a
-// pointer on ContainerRecord so zero-value state doesn't clobber persisted
-// records written before this field existed.
-type RestartPolicy struct {
-	Name              string `json:"name"`
-	MaximumRetryCount int    `json:"maximum_retry_count,omitempty"`
-}
-
-// NetworkAttachment records a container's membership in a Docker-style network.
-type NetworkAttachment struct {
-	NetworkID  string             `json:"network_id"`
-	IPAddress  string             `json:"ip_address,omitempty"`
-	Gateway    string             `json:"gateway,omitempty"`
-	MacAddress string             `json:"mac_address,omitempty"`
-	EndpointID string             `json:"endpoint_id,omitempty"`
-	Aliases    []string           `json:"aliases,omitempty"`
-	Links      []string           `json:"links,omitempty"`
-	DriverOpts map[string]string  `json:"driver_opts,omitempty"`
-	IPAMConfig *EndpointIPAMConfig `json:"ipam_config,omitempty"`
-}
-
-// EndpointIPAMConfig persists the per-endpoint IPAM block. The daemon
-// does not pin static addresses today; the field is roundtripped so
-// clients can read back what they submitted.
-type EndpointIPAMConfig struct {
-	IPv4Address  string   `json:"ipv4_address,omitempty"`
-	IPv6Address  string   `json:"ipv6_address,omitempty"`
-	LinkLocalIPs []string `json:"link_local_ips,omitempty"`
+// HealthResult captures a single healthcheck probe outcome, echoed in
+// State.Health.Log.
+type HealthResult struct {
+	Start    time.Time `json:"Start"`
+	End      time.Time `json:"End"`
+	ExitCode int       `json:"ExitCode"`
+	Output   string    `json:"Output"`
 }
 
 // PortBinding records a single host→container port mapping.
@@ -169,92 +94,60 @@ type PortBinding struct {
 	Proto         string `json:"proto"` // "tcp" or "udp"
 }
 
-// MountSpec mirrors the relevant fields of a Docker bind mount.
+// MountSpec mirrors the relevant fields of a Docker mount. Type carries the
+// semantic from the create body ("bind", "volume", "tmpfs") so inspect can
+// echo it back instead of hardcoding "bind". Defaults to "bind" for records
+// written before this field existed.
 type MountSpec struct {
-	Type        string `json:"type,omitempty"` // "bind" or "volume"
-	Name        string `json:"name,omitempty"` // volume name when Type=="volume"
+	Type        string `json:"type,omitempty"`
 	Source      string `json:"source"`
 	Destination string `json:"destination"`
 	ReadOnly    bool   `json:"read_only"`
+	Propagation string `json:"propagation,omitempty"`
 }
 
-// VolumeRecord holds metadata for a Docker-style named volume.
+// ImageRecord holds metadata for a pulled image (backed by a Proxmox CT
+// template on ZFS, or a legacy LXC template container).
+type ImageRecord struct {
+	ID           string    `json:"id"`            // e.g. "ubuntu_22.04"
+	Ref          string    `json:"ref"`           // original "ubuntu:22.04"
+	Distro       string    `json:"distro"`        // "ubuntu"
+	Release      string    `json:"release"`       // "jammy"
+	Arch         string    `json:"arch"`          // "amd64"
+	TemplateName string    `json:"template_name"` // LXC container used as clone source (legacy)
+	TemplateVMID int       `json:"template_vmid"` // Proxmox CT VMID of the template (0 = legacy)
+	Created      time.Time `json:"created"`
+	// OCI image metadata (populated only for OCI-pulled images).
+	OCIEntrypoint []string          `json:"oci_entrypoint,omitempty"`
+	OCICmd        []string          `json:"oci_cmd,omitempty"`
+	OCIEnv        []string          `json:"oci_env,omitempty"`
+	OCIWorkingDir string            `json:"oci_working_dir,omitempty"`
+	OCIPorts      []string          `json:"oci_ports,omitempty"`
+	OCILabels     map[string]string `json:"oci_labels,omitempty"`
+	// RepoDigest holds the image manifest digest ("sha256:...") when
+	// known. Populated by skopeo inspect after pull. Used to surface a
+	// canonical reference on the image detail page.
+	RepoDigest string `json:"repo_digest,omitempty"`
+}
+
+// VolumeRecord is a Docker-style named volume backed by a plain directory on
+// the host. Docker's "local" driver does the same thing; for the LXC daemon
+// this is the only driver we support.
 type VolumeRecord struct {
 	Name       string            `json:"name"`
 	Driver     string            `json:"driver"`
 	Mountpoint string            `json:"mountpoint"`
-	CreatedAt  time.Time         `json:"created_at"`
+	Created    time.Time         `json:"created"`
 	Labels     map[string]string `json:"labels,omitempty"`
 	Options    map[string]string `json:"options,omitempty"`
-}
-
-// NetworkRecord holds metadata for a Docker-style network object.
-type NetworkRecord struct {
-	ID         string            `json:"id"`
-	Name       string            `json:"name"`
-	Driver     string            `json:"driver"`
-	Scope      string            `json:"scope"`
-	CreatedAt  time.Time         `json:"created_at"`
-	Labels     map[string]string `json:"labels,omitempty"`
-	Options    map[string]string `json:"options,omitempty"`
-	Internal   bool              `json:"internal,omitempty"`
-	Attachable bool              `json:"attachable,omitempty"`
-	// IPAM is roundtripped verbatim on inspect. The daemon does not use
-	// these addresses for allocation — containers still get addresses
-	// from the single gow bridge — but Portainer's network detail page
-	// displays the configured Subnet/Gateway/IPRange.
-	IPAM *NetworkIPAM `json:"ipam,omitempty"`
-}
-
-// NetworkIPAM mirrors Docker's IPAM block.
-type NetworkIPAM struct {
-	Driver  string              `json:"driver,omitempty"`
-	Options map[string]string   `json:"options,omitempty"`
-	Config  []NetworkIPAMConfig `json:"config,omitempty"`
-}
-
-// NetworkIPAMConfig is one entry inside NetworkIPAM.Config.
-type NetworkIPAMConfig struct {
-	Subnet     string            `json:"subnet,omitempty"`
-	IPRange    string            `json:"ip_range,omitempty"`
-	Gateway    string            `json:"gateway,omitempty"`
-	AuxAddress map[string]string `json:"aux_address,omitempty"`
-}
-
-// ImageRecord holds metadata for a pulled image. Templates can be backed
-// by a raw ZFS dataset (preferred — invisible to the PVE UI), a Proxmox
-// CT template VMID (legacy from pre-Apr-2026 daemons; cluttered the UI),
-// or a directory-based LXC template container (legacy mode without PVE).
-type ImageRecord struct {
-	ID              string    `json:"id"`               // e.g. "ubuntu_22.04"
-	Ref             string    `json:"ref"`              // original "ubuntu:22.04"
-	Distro          string    `json:"distro"`           // "ubuntu"
-	Release         string    `json:"release"`          // "jammy"
-	Arch            string    `json:"arch"`             // "amd64"
-	TemplateName    string    `json:"template_name"`    // LXC container used as clone source (legacy)
-	TemplateVMID    int       `json:"template_vmid"`    // Proxmox CT VMID of the template (legacy; cluttered PVE UI)
-	TemplateDataset string    `json:"template_dataset"` // ZFS dataset path of the template (preferred for new pulls; e.g. "large/dld-templates/nginx-alpine")
-	Created         time.Time `json:"created"`
-	// OCI image metadata (populated only for OCI-pulled images).
-	OCIEntrypoint  []string           `json:"oci_entrypoint,omitempty"`
-	OCICmd         []string           `json:"oci_cmd,omitempty"`
-	OCIEnv         []string           `json:"oci_env,omitempty"`
-	OCIWorkingDir  string             `json:"oci_working_dir,omitempty"`
-	OCIPorts       []string           `json:"oci_ports,omitempty"`
-	OCILabels      map[string]string  `json:"oci_labels,omitempty"`
-	OCIUser        string             `json:"oci_user,omitempty"`
-	OCIStopSignal  string             `json:"oci_stop_signal,omitempty"`
-	OCIHealthcheck *HealthcheckConfig `json:"oci_healthcheck,omitempty"`
-	OCIVolumes     []string           `json:"oci_volumes,omitempty"`
-	OCIShell       []string           `json:"oci_shell,omitempty"`
-	OCIDigest      string             `json:"oci_digest,omitempty"`
+	OwnerID    string            `json:"owner_id,omitempty"`
+	Anonymous  bool              `json:"anonymous,omitempty"`
 }
 
 type state struct {
 	Containers map[string]*ContainerRecord `json:"containers"` // keyed by ID
 	Images     map[string]*ImageRecord     `json:"images"`     // keyed by Ref (e.g. "ubuntu:22.04")
-	Volumes    map[string]*VolumeRecord    `json:"volumes"`    // keyed by volume name
-	Networks   map[string]*NetworkRecord   `json:"networks"`   // keyed by network id
+	Volumes    map[string]*VolumeRecord    `json:"volumes"`    // keyed by Name
 	NextIP     int                         `json:"next_ip"`    // last octet of 10.100.0.x, starts at 2
 	FreeIPs    []int                       `json:"free_ips"`   // last octets of freed IPs available for reuse
 }
@@ -283,25 +176,12 @@ func NewAt(dir string) (*Store, error) {
 			Containers: make(map[string]*ContainerRecord),
 			Images:     make(map[string]*ImageRecord),
 			Volumes:    make(map[string]*VolumeRecord),
-			Networks:   make(map[string]*NetworkRecord),
 			NextIP:     2,
 		},
 	}
 
 	if err := s.load(); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("store: load: %w", err)
-	}
-	if s.data.Containers == nil {
-		s.data.Containers = make(map[string]*ContainerRecord)
-	}
-	if s.data.Images == nil {
-		s.data.Images = make(map[string]*ImageRecord)
-	}
-	if s.data.Volumes == nil {
-		s.data.Volumes = make(map[string]*VolumeRecord)
-	}
-	if s.data.Networks == nil {
-		s.data.Networks = make(map[string]*NetworkRecord)
 	}
 	return s, nil
 }
@@ -379,6 +259,7 @@ func (s *Store) GetContainer(id string) *ContainerRecord {
 func (s *Store) FindContainerByName(name string) *ContainerRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	name = strings.TrimPrefix(name, "/")
 	for _, r := range s.data.Containers {
 		if r.Name == name {
 			return r
@@ -396,82 +277,6 @@ func (s *Store) ListContainers() []*ContainerRecord {
 		out = append(out, r)
 	}
 	return out
-}
-
-// AddVolume persists a named volume record.
-func (s *Store) AddVolume(v *VolumeRecord) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data.Volumes[v.Name] = v
-	return s.save()
-}
-
-// GetVolume returns the named volume, or nil if not found.
-func (s *Store) GetVolume(name string) *VolumeRecord {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.data.Volumes[name]
-}
-
-// ListVolumes returns all known named volumes.
-func (s *Store) ListVolumes() []*VolumeRecord {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]*VolumeRecord, 0, len(s.data.Volumes))
-	for _, v := range s.data.Volumes {
-		out = append(out, v)
-	}
-	return out
-}
-
-// RemoveVolume deletes a named volume record.
-func (s *Store) RemoveVolume(name string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.data.Volumes, name)
-	return s.save()
-}
-
-// AddNetwork persists a network record.
-func (s *Store) AddNetwork(n *NetworkRecord) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data.Networks[n.ID] = n
-	return s.save()
-}
-
-// GetNetwork returns a network by id or name, or nil if not found.
-func (s *Store) GetNetwork(idOrName string) *NetworkRecord {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if n, ok := s.data.Networks[idOrName]; ok {
-		return n
-	}
-	for _, n := range s.data.Networks {
-		if n.Name == idOrName {
-			return n
-		}
-	}
-	return nil
-}
-
-// ListNetworks returns all known networks.
-func (s *Store) ListNetworks() []*NetworkRecord {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]*NetworkRecord, 0, len(s.data.Networks))
-	for _, n := range s.data.Networks {
-		out = append(out, n)
-	}
-	return out
-}
-
-// RemoveNetwork deletes a network by id.
-func (s *Store) RemoveNetwork(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.data.Networks, id)
-	return s.save()
 }
 
 // AddImage persists a new image record keyed by its Ref.
@@ -537,12 +342,58 @@ func (s *Store) ListImages() []*ImageRecord {
 	return out
 }
 
+// --- Volumes ---
+
+// AddVolume persists a volume record keyed by name. Replaces any existing
+// record with the same name (used by the API layer's idempotent create).
+func (s *Store) AddVolume(v *VolumeRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data.Volumes == nil {
+		s.data.Volumes = make(map[string]*VolumeRecord)
+	}
+	s.data.Volumes[v.Name] = v
+	return s.save()
+}
+
+// GetVolume returns the record for name, or nil when absent.
+func (s *Store) GetVolume(name string) *VolumeRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.data.Volumes[name]
+}
+
+// ListVolumes returns all volume records.
+func (s *Store) ListVolumes() []*VolumeRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*VolumeRecord, 0, len(s.data.Volumes))
+	for _, v := range s.data.Volumes {
+		out = append(out, v)
+	}
+	return out
+}
+
+// RemoveVolume deletes a volume record. The caller is responsible for
+// removing the on-disk directory (or leaving it behind when `docker volume
+// rm` is called without -f).
+func (s *Store) RemoveVolume(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.data.Volumes, name)
+	return s.save()
+}
+
 // ResolveID resolves a partial or full container ID or name to a full ID.
 // Returns "" if not found.
 func (s *Store) ResolveID(idOrName string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	idOrName = strings.TrimPrefix(idOrName, "/")
+	if idOrName == "" {
+		return ""
+	}
 	// Exact ID match
 	if _, ok := s.data.Containers[idOrName]; ok {
 		return idOrName
@@ -587,9 +438,4 @@ func (s *Store) save() error {
 		return err
 	}
 	return os.Rename(tmp, s.path)
-}
-
-// RootDir returns the directory containing the store state.
-func (s *Store) RootDir() string {
-	return filepath.Dir(s.path)
 }
