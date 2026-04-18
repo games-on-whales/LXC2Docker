@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
+	"github.com/games-on-whales/docker-lxc-daemon/internal/oci"
 	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
 	"github.com/gorilla/mux"
 )
@@ -23,6 +26,10 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 		if !filt.matchImageReference(rec.Ref) {
 			continue
 		}
+		labels := rec.OCILabels
+		if labels == nil {
+			labels = map[string]string{}
+		}
 		out = append(out, ImageSummary{
 			ID:          "sha256:" + rec.ID,
 			RepoTags:    []string{rec.Ref},
@@ -30,7 +37,7 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 			Created:     rec.Created.Unix(),
 			Size:        imageSize(h.mgr.LXCPath(), rec),
 			VirtualSize: imageSize(h.mgr.LXCPath(), rec),
-			Labels:      map[string]string{},
+			Labels:      labels,
 			Containers:  -1, // Docker convention for "not computed"
 		})
 	}
@@ -69,6 +76,8 @@ func imageSize(lxcPath string, rec *store.ImageRecord) int64 {
 
 // POST /images/create  (docker pull)
 // Query params: fromImage=<name>, tag=<tag>
+// Headers: X-Registry-Auth — base64-encoded JSON credentials (Portainer
+// sets this when the user has a registry configured for the image ref).
 func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 	fromImage := r.URL.Query().Get("fromImage")
 	tag := r.URL.Query().Get("tag")
@@ -81,28 +90,111 @@ func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 		ref = fromImage + ":" + tag
 	}
 
+	creds := decodeRegistryAuth(r.Header.Get("X-Registry-Auth"))
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 
 	enc := json.NewEncoder(w)
-	send := func(status string) {
-		enc.Encode(map[string]string{"status": status})
+	flush := func() {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
 	}
+	sendStatus := func(status string) {
+		enc.Encode(map[string]string{"status": status})
+		flush()
+	}
+	sendEvent := func(ev oci.ProgressEvent) {
+		frame := map[string]any{
+			"status": ev.Status,
+		}
+		if ev.ID != "" {
+			frame["id"] = ev.ID
+		}
+		if ev.Total > 0 || ev.Current > 0 {
+			frame["progressDetail"] = map[string]int64{
+				"current": ev.Current,
+				"total":   ev.Total,
+			}
+			// Docker also includes a human-readable progress string;
+			// Portainer renders the bar from progressDetail regardless,
+			// so we skip the redundant text.
+		}
+		enc.Encode(frame)
+		flush()
+	}
 
-	send(fmt.Sprintf("Pulling from %s", fromImage))
+	sendStatus(fmt.Sprintf("Pulling from %s", fromImage))
 
-	err := h.mgr.PullImage(ref, "amd64", func(msg string) {
-		send(msg)
+	err := h.mgr.PullImageWith(ref, "amd64", lxc.PullOpts{
+		Credentials: creds,
+		OnStatus:    sendStatus,
+		OnEvent:     sendEvent,
 	})
 	if err != nil {
-		send(fmt.Sprintf("Error: %s", err))
+		// Match Docker's error-frame shape — Portainer displays the
+		// `errorDetail.message` field verbatim in the pull modal.
+		enc.Encode(map[string]any{
+			"error": err.Error(),
+			"errorDetail": map[string]string{
+				"message": err.Error(),
+			},
+		})
+		flush()
 		return
 	}
 
-	send(fmt.Sprintf("Status: Downloaded newer image for %s", ref))
+	sendStatus(fmt.Sprintf("Status: Downloaded newer image for %s", ref))
+}
+
+// decodeRegistryAuth parses Docker's X-Registry-Auth header, a base64url JSON
+// object. When the header is empty or malformed we return "" — skopeo then
+// does an anonymous pull, which matches the behavior before credentials
+// support was added.
+//
+// Docker's client sets the base64 with no padding; skopeo wants
+// "username:password", so we collapse identitytoken to token form when
+// that's the only credential present.
+func decodeRegistryAuth(header string) string {
+	if header == "" {
+		return ""
+	}
+	// Docker uses URL-safe base64 without padding. The stdlib strict decoder
+	// rejects both — try the permissive ones in order.
+	raw, err := base64.RawURLEncoding.DecodeString(header)
+	if err != nil {
+		if raw, err = base64.StdEncoding.DecodeString(header); err != nil {
+			if raw, err = base64.URLEncoding.DecodeString(header); err != nil {
+				return ""
+			}
+		}
+	}
+	var cfg struct {
+		Username      string `json:"username"`
+		Password      string `json:"password"`
+		Auth          string `json:"auth"` // base64("user:pass")
+		IdentityToken string `json:"identitytoken"`
+	}
+	if json.Unmarshal(raw, &cfg) != nil {
+		return ""
+	}
+	if cfg.Username != "" && cfg.Password != "" {
+		return cfg.Username + ":" + cfg.Password
+	}
+	// `auth` is pre-encoded "user:pass"; skopeo accepts the decoded form.
+	if cfg.Auth != "" {
+		if dec, err := base64.StdEncoding.DecodeString(cfg.Auth); err == nil {
+			return string(dec)
+		}
+	}
+	if cfg.IdentityToken != "" {
+		// Bearer tokens are passed to skopeo as "<oauth>:<token>" — most
+		// OCI registries accept this shape. Callers using identity tokens
+		// probably want to configure registries separately anyway.
+		return "<token>:" + cfg.IdentityToken
+	}
+	return ""
 }
 
 // GET /images/{name}/json  (docker image inspect)
@@ -125,12 +217,16 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 	// "Duplicate" and "Run from image" modals pre-populate with the correct
 	// entrypoint/cmd/env. Distro and App images don't have OCI configs; we
 	// emit an empty Config so the shape is still correct.
+	labels := rec.OCILabels
+	if labels == nil {
+		labels = map[string]string{}
+	}
 	cfg := &ContainerConfig{
 		Env:        rec.OCIEnv,
 		Cmd:        rec.OCICmd,
 		Entrypoint: rec.OCIEntrypoint,
 		WorkingDir: rec.OCIWorkingDir,
-		Labels:     map[string]string{},
+		Labels:     labels,
 	}
 	if cfg.Env == nil {
 		cfg.Env = []string{}
@@ -158,7 +254,7 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 		Metadata: ImageMetadata{
 			LastTagTime: rec.Created.Format(time.RFC3339),
 		},
-		Labels:        map[string]string{},
+		Labels:        labels,
 		Author:        "docker-lxc-daemon",
 		DockerVersion: "24.0.0-lxc",
 	}

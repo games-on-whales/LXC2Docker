@@ -88,6 +88,8 @@ func main() {
 
 	// Start background GC that removes stopped ephemeral containers.
 	mgr.StartGC(ctx)
+	// Start the restart-policy / AutoRemove watcher.
+	mgr.StartRestartWatcher(ctx)
 
 	go func() {
 		<-ctx.Done()

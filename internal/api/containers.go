@@ -176,26 +176,29 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 
 	// Persist record before creating so the IP is allocated.
 	rec := &store.ContainerRecord{
-		ID:            id,
-		Name:          name,
-		Image:         req.Image,
-		ImageID:       normalizeImageRef(req.Image),
-		Created:       time.Now(),
-		Entrypoint:    entrypoint,
-		Cmd:           cmd,
-		Env:           env,
-		Labels:        req.Labels,
-		Hostname:      req.Hostname,
-		Domainname:    req.Domainname,
-		User:          req.User,
-		Tty:           req.Tty,
-		OpenStdin:     req.OpenStdin,
-		WorkingDir:    workingDir,
-		StopSignal:    req.StopSignal,
-		ExposedPorts:  req.ExposedPorts,
-		Volumes:       req.Volumes,
-		RawHostConfig: rawHC,
-		Mounts:        storeMounts,
+		ID:              id,
+		Name:            name,
+		Image:           req.Image,
+		ImageID:         normalizeImageRef(req.Image),
+		Created:         time.Now(),
+		Entrypoint:      entrypoint,
+		Cmd:             cmd,
+		Env:             env,
+		Labels:          req.Labels,
+		Hostname:        req.Hostname,
+		Domainname:      req.Domainname,
+		User:            req.User,
+		Tty:             req.Tty,
+		OpenStdin:       req.OpenStdin,
+		WorkingDir:      workingDir,
+		StopSignal:      req.StopSignal,
+		ExposedPorts:    req.ExposedPorts,
+		Volumes:         req.Volumes,
+		RawHostConfig:   rawHC,
+		Mounts:          storeMounts,
+		RestartPolicy:   req.HostConfig.RestartPolicy.Name,
+		RestartMaxRetry: req.HostConfig.RestartPolicy.MaximumRetryCount,
+		AutoRemove:      req.HostConfig.AutoRemove,
 	}
 	// Parse port bindings from HostConfig (e.g. "80/tcp" -> [{HostPort:8080, ContainerPort:80, Proto:"tcp"}])
 	for containerPortProto, bindings := range req.HostConfig.PortBindings {
@@ -475,11 +478,23 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Record first-start timestamp so inspect can distinguish "created" from "exited".
-	if rec := h.store.GetContainer(id); rec != nil && rec.StartedAt == nil {
-		now := time.Now()
-		rec.StartedAt = &now
-		h.store.AddContainer(rec)
+	// Record first-start timestamp so inspect can distinguish "created" from
+	// "exited", and clear the user-stopped flag so the restart watcher
+	// enforces the policy again on subsequent exits.
+	if rec := h.store.GetContainer(id); rec != nil {
+		changed := false
+		if rec.StartedAt == nil {
+			now := time.Now()
+			rec.StartedAt = &now
+			changed = true
+		}
+		if rec.StoppedByUser {
+			rec.StoppedByUser = false
+			changed = true
+		}
+		if changed {
+			h.store.AddContainer(rec)
+		}
 	}
 
 	// Set up port forwarding rules after successful start.
@@ -508,6 +523,12 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec := h.store.GetContainer(id)
+	if rec != nil {
+		// Mark as user-stopped so the restart watcher doesn't bring it
+		// back when the policy is unless-stopped / always.
+		rec.StoppedByUser = true
+		h.store.AddContainer(rec)
+	}
 	h.emitContainer("stop", rec)
 	h.emitContainer("die", rec)
 	w.WriteHeader(http.StatusNoContent)
@@ -552,6 +573,10 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec := h.store.GetContainer(id)
+	if rec != nil {
+		rec.StoppedByUser = true
+		h.store.AddContainer(rec)
+	}
 	h.emitContainer("kill", rec)
 	h.emitContainer("die", rec)
 	w.WriteHeader(http.StatusNoContent)

@@ -49,6 +49,13 @@ type ContainerRecord struct {
 	StopSignal   string              `json:"stop_signal,omitempty"`
 	ExposedPorts map[string]struct{} `json:"exposed_ports,omitempty"`
 	Volumes      map[string]struct{} `json:"volumes,omitempty"`
+	// Lifecycle policy. Hoisted out of RawHostConfig so the restart watcher
+	// doesn't have to re-decode the full JSON blob every 5 seconds.
+	RestartPolicy   string `json:"restart_policy,omitempty"`    // "always"|"on-failure"|"unless-stopped"|""
+	RestartMaxRetry int    `json:"restart_max_retry,omitempty"` // 0 = unlimited
+	RestartCount    int    `json:"restart_count,omitempty"`     // updated by the watcher
+	AutoRemove      bool   `json:"auto_remove,omitempty"`       // remove after exit
+	StoppedByUser   bool   `json:"stopped_by_user,omitempty"`   // set on explicit stop/kill to defeat unless-stopped
 	// Raw HostConfig as JSON for full round-trip. Decoding happens at the
 	// API layer; the store treats this as opaque.
 	RawHostConfig []byte `json:"raw_host_config,omitempty"`
@@ -84,11 +91,12 @@ type ImageRecord struct {
 	TemplateVMID int       `json:"template_vmid"` // Proxmox CT VMID of the template (0 = legacy)
 	Created      time.Time `json:"created"`
 	// OCI image metadata (populated only for OCI-pulled images).
-	OCIEntrypoint []string `json:"oci_entrypoint,omitempty"`
-	OCICmd        []string `json:"oci_cmd,omitempty"`
-	OCIEnv        []string `json:"oci_env,omitempty"`
-	OCIWorkingDir string   `json:"oci_working_dir,omitempty"`
-	OCIPorts      []string `json:"oci_ports,omitempty"`
+	OCIEntrypoint []string          `json:"oci_entrypoint,omitempty"`
+	OCICmd        []string          `json:"oci_cmd,omitempty"`
+	OCIEnv        []string          `json:"oci_env,omitempty"`
+	OCIWorkingDir string            `json:"oci_working_dir,omitempty"`
+	OCIPorts      []string          `json:"oci_ports,omitempty"`
+	OCILabels     map[string]string `json:"oci_labels,omitempty"`
 }
 
 type state struct {

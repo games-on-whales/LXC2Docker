@@ -109,6 +109,97 @@ func (m *Manager) StartGC(ctx context.Context) {
 	}()
 }
 
+// StartRestartWatcher enforces HostConfig.RestartPolicy and HostConfig.AutoRemove
+// on container exits. Polling is cheap — State() runs lxc-info / pct status
+// which are sub-millisecond per container — so we check every 5 seconds. A
+// dedicated watcher (vs folding into gc()) keeps the faster cadence for
+// restart events decoupled from the slower gc cycle.
+func (m *Manager) StartRestartWatcher(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m.enforceRestartPolicies()
+			}
+		}
+	}()
+}
+
+// enforceRestartPolicies walks stored containers once per tick. For each
+// container that has exited, it consults RestartPolicy/AutoRemove and takes
+// the appropriate action (restart, remove, or leave).
+func (m *Manager) enforceRestartPolicies() {
+	for _, rec := range m.store.ListContainers() {
+		// Skip containers that were never started — "created" state shouldn't
+		// trigger restart logic.
+		if rec.StartedAt == nil {
+			continue
+		}
+		state, _ := m.State(rec.ID)
+		if state != "exited" {
+			continue
+		}
+
+		// AutoRemove wins over RestartPolicy because Docker treats
+		// --rm as a stronger signal — the container ceases to exist
+		// after exit regardless of what the policy says.
+		if rec.AutoRemove {
+			log.Printf("restart-watcher: auto-removing exited container %s (%s)", rec.Name, rec.ID[:12])
+			RemovePortForwards(rec.IPAddress)
+			if err := m.RemoveContainer(rec.ID); err != nil {
+				log.Printf("restart-watcher: remove %s: %v", rec.ID[:12], err)
+			}
+			continue
+		}
+
+		if !shouldRestart(rec) {
+			continue
+		}
+
+		log.Printf("restart-watcher: restarting %s (%s) per policy=%s (attempt %d)",
+			rec.Name, rec.ID[:12], rec.RestartPolicy, rec.RestartCount+1)
+		if err := m.StartContainer(rec.ID); err != nil {
+			log.Printf("restart-watcher: start %s: %v", rec.ID[:12], err)
+			continue
+		}
+		rec.RestartCount++
+		if err := m.store.AddContainer(rec); err != nil {
+			log.Printf("restart-watcher: persist %s: %v", rec.ID[:12], err)
+		}
+	}
+}
+
+// shouldRestart reports whether a stopped container should be auto-restarted
+// based on its stored RestartPolicy + StoppedByUser flag. The semantics
+// match the Docker daemon:
+//   - ""/"no"         → never
+//   - "always"        → always, even if the user stopped it
+//   - "unless-stopped"→ restart unless StoppedByUser is set
+//   - "on-failure"    → restart up to MaximumRetryCount times; we can't
+//     distinguish "failure" from "clean exit" without an exit code (LXC's
+//     State() doesn't expose one), so we treat every exit as failure. The
+//     retry cap prevents infinite loops for containers that exit
+//     immediately.
+func shouldRestart(rec *store.ContainerRecord) bool {
+	switch rec.RestartPolicy {
+	case "always":
+		return true
+	case "unless-stopped":
+		return !rec.StoppedByUser
+	case "on-failure":
+		if rec.RestartMaxRetry > 0 && rec.RestartCount >= rec.RestartMaxRetry {
+			return false
+		}
+		return !rec.StoppedByUser
+	default:
+		return false
+	}
+}
+
 func (m *Manager) gc() {
 	// Separate ephemeral containers into stopped (remove immediately) and
 	// running (check for orphans).
@@ -186,14 +277,36 @@ func (m *Manager) gc() {
 	}
 }
 
-// PullImage ensures a template container exists for the given image ref.
-// For distro images it runs lxc-create with the download template.
-// For app images it creates the base template, starts it, installs packages,
-// then stops it — producing a ready-to-clone template.
+// PullOpts controls a PullImage invocation. Credentials (if non-empty) are
+// passed to skopeo as --src-creds so private registries succeed. OnEvent
+// receives structured layer-progress events so the API layer can stream
+// Docker-style pull progress to Portainer.
+type PullOpts struct {
+	Credentials string
+	OnStatus    func(string)
+	OnEvent     func(oci.ProgressEvent)
+}
+
+// PullImage ensures a template container exists for the given image ref,
+// using only a status callback. Thin wrapper around PullImageWith kept for
+// internal callers that don't care about credentials or structured events.
 func (m *Manager) PullImage(ref, arch string, progress func(string)) error {
+	return m.PullImageWith(ref, arch, PullOpts{OnStatus: progress})
+}
+
+// PullImageWith is the full-fat version of PullImage. OCI pulls honor
+// opts.Credentials (sent to skopeo) and emit layer progress via
+// opts.OnEvent. Distro and app pulls ignore credentials — they're fetched
+// from images.linuxcontainers.org which is public.
+func (m *Manager) PullImageWith(ref, arch string, opts PullOpts) error {
 	resolved, err := image.Resolve(ref, arch)
 	if err != nil {
 		return err
+	}
+	// Legacy shim — downstream code still expects a single status callback.
+	progress := opts.OnStatus
+	if progress == nil {
+		progress = func(string) {}
 	}
 
 	// If the template container already exists, nothing to do — but restore
@@ -215,7 +328,7 @@ func (m *Manager) PullImage(ref, arch string, progress func(string)) error {
 	case image.KindApp:
 		return m.pullApp(resolved, progress)
 	case image.KindOCI:
-		return m.pullOCI(resolved, progress)
+		return m.pullOCI(resolved, opts)
 	}
 	return fmt.Errorf("manager: unknown image kind")
 }
@@ -343,10 +456,18 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 // pullOCI pulls an arbitrary OCI/Docker image via skopeo + umoci, unpacks it
 // to a rootfs, and creates a template from it. In PVE mode the template is a
 // Proxmox CT on the configured storage; otherwise a direct LXC template.
-func (m *Manager) pullOCI(r *image.ResolvedImage, progress func(string)) error {
+func (m *Manager) pullOCI(r *image.ResolvedImage, opts PullOpts) error {
 	ociStoreDir := filepath.Join(filepath.Dir(m.lxcPath), "docker-lxc-daemon", "oci")
 
-	cfg, rootfsPath, err := oci.Pull(ociStoreDir, r.Ref, progress)
+	progress := opts.OnStatus
+	if progress == nil {
+		progress = func(string) {}
+	}
+	cfg, rootfsPath, err := oci.Pull(ociStoreDir, r.Ref, oci.PullOpts{
+		Credentials: opts.Credentials,
+		OnStatus:    opts.OnStatus,
+		OnEvent:     opts.OnEvent,
+	})
 	if err != nil {
 		return fmt.Errorf("manager: oci pull: %w", err)
 	}
@@ -455,6 +576,7 @@ lxc.uts.name = %s
 			OCIEnv:        cfg.Env,
 			OCIWorkingDir: cfg.WorkingDir,
 			OCIPorts:      cfg.Ports,
+			OCILabels:     cfg.Labels,
 		}); err == nil {
 			os.WriteFile(filepath.Join(templateDir, "oci-meta.json"), data, 0o644)
 		}
@@ -473,6 +595,7 @@ lxc.uts.name = %s
 		OCIEnv:        cfg.Env,
 		OCIWorkingDir: cfg.WorkingDir,
 		OCIPorts:      cfg.Ports,
+		OCILabels:     cfg.Labels,
 	})
 }
 
