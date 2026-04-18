@@ -46,6 +46,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, "Image is required")
 		return
 	}
+	imageRef := normalizeImageRef(req.Image)
 	if !isValidRestartPolicy(req.HostConfig.RestartPolicy.Name) {
 		errResponse(w, http.StatusBadRequest,
 			fmt.Sprintf("invalid restart policy %q; expected one of no, always, unless-stopped, on-failure", req.HostConfig.RestartPolicy.Name))
@@ -90,7 +91,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	// /containers/create with an image that hasn't been pulled yet; when
 	// the registry is private the user's credentials arrive in
 	// X-Registry-Auth on this request (same decoder as /images/create).
-	if rec := h.store.GetImage(normalizeImageRef(req.Image)); rec == nil {
+	if rec := h.store.GetImage(imageRef); rec == nil || !h.mgr.ImageReady(rec) {
 		creds := decodeRegistryAuth(r.Header.Get("X-Registry-Auth"))
 		pullErr := h.mgr.PullImageWith(req.Image, "amd64", lxc.PullOpts{
 			Credentials: creds,
@@ -111,7 +112,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	entrypoint := req.Entrypoint
 	cmd := req.Cmd
 	env := req.Env
-	if imgRec := h.store.GetImage(normalizeImageRef(req.Image)); imgRec != nil {
+	if imgRec := h.store.GetImage(imageRef); imgRec != nil {
 		// OCI image defaults.
 		if len(entrypoint) == 0 && len(imgRec.OCIEntrypoint) > 0 {
 			entrypoint = imgRec.OCIEntrypoint
@@ -135,7 +136,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	// Working directory: request overrides image default.
 	workingDir := req.WorkingDir
 	if workingDir == "" {
-		if imgRec := h.store.GetImage(normalizeImageRef(req.Image)); imgRec != nil {
+		if imgRec := h.store.GetImage(imageRef); imgRec != nil {
 			workingDir = imgRec.OCIWorkingDir
 		}
 	}
@@ -146,7 +147,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Env:               env,
 		WorkingDir:        workingDir,
 		DeviceCgroupRules: req.HostConfig.DeviceCgroupRules,
-		NetworkMode:       req.HostConfig.NetworkMode,
+		NetworkMode:       canonicalNetworkName(req.HostConfig.NetworkMode),
 		IpcMode:           req.HostConfig.IpcMode,
 		UTSMode:           req.HostConfig.UTSMode,
 		PidMode:           req.HostConfig.PidMode,
@@ -287,7 +288,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 
 	if req.NetworkingConfig != nil {
 		for name := range req.NetworkingConfig.EndpointsConfig {
-			if name == "gow" {
+			if canonicalNetworkName(name) == "gow" {
 				continue
 			}
 			if h.store.GetNetwork(name) == nil {
@@ -302,7 +303,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		ID:              id,
 		Name:            name,
 		Image:           req.Image,
-		ImageID:         normalizeImageRef(req.Image),
+		ImageID:         imageRef,
 		Created:         time.Now(),
 		Entrypoint:      entrypoint,
 		Cmd:             cmd,
@@ -367,7 +368,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("createContainer: creating LXC container %s (image=%s)", id[:12], req.Image)
-	if err := h.mgr.CreateContainer(id, normalizeImageRef(req.Image), cfg); err != nil {
+	if err := h.mgr.CreateContainer(id, imageRef, cfg); err != nil {
 		log.Printf("createContainer: failed: %v", err)
 		h.store.RemoveContainer(id)
 		errResponse(w, http.StatusInternalServerError, err.Error())
