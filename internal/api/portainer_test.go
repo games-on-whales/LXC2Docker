@@ -87,3 +87,55 @@ func TestImagesLoadRouteHitsLoadImageHandler(t *testing.T) {
 		t.Fatalf("expected /images/load to map to loadImage handler")
 	}
 }
+
+func TestImagesGetSingleRouteHitsSaveImageHandler(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		attachPTYs: map[string]*os.File{},
+		events:     newEventBroker(),
+	}
+
+	r := h.routes()
+	req := httptest.NewRequest(http.MethodGet, "/v1.45/images/nginx:latest/get", nil)
+	match := &mux.RouteMatch{}
+	if !r.Match(req, match) {
+		t.Fatal("expected /images/{name}/get route to match")
+	}
+
+	got, ok := match.Handler.(http.HandlerFunc)
+	if !ok {
+		t.Fatalf("expected route handler to be http.HandlerFunc, got %T", match.Handler)
+	}
+
+	want := http.HandlerFunc(h.saveImage)
+	if reflect.ValueOf(got).Pointer() != reflect.ValueOf(want).Pointer() {
+		t.Fatalf("expected /images/{name}/get to map to saveImage handler")
+	}
+}
+
+func TestImagesGetBulkRouteHitsSaveImagesHandler(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		attachPTYs: map[string]*os.File{},
+		events:     newEventBroker(),
+	}
+
+	r := h.routes()
+	req := httptest.NewRequest(http.MethodGet, "/v1.45/images/get", nil)
+	match := &mux.RouteMatch{}
+	if !r.Match(req, match) {
+		t.Fatal("expected /images/get route to match")
+	}
+
+	got, ok := match.Handler.(http.HandlerFunc)
+	if !ok {
+		t.Fatalf("expected route handler to be http.HandlerFunc, got %T", match.Handler)
+	}
+
+	want := http.HandlerFunc(h.saveImages)
+	if reflect.ValueOf(got).Pointer() != reflect.ValueOf(want).Pointer() {
+		t.Fatalf("expected /images/get to map to saveImages handler")
+	}
+}
