@@ -545,7 +545,7 @@ func (m *Manager) PullImage(ref, arch string, progress func(string)) error {
 // opts.OnEvent. Distro and app pulls ignore credentials — they're fetched
 // from images.linuxcontainers.org which is public.
 func (m *Manager) PullImageWith(ref, arch string, opts PullOpts) error {
-	resolved, err := image.Resolve(ref, arch)
+	resolved, err := image.Resolve(ref, arch, m.UsePVE())
 	if err != nil {
 		return err
 	}
@@ -613,7 +613,7 @@ func (m *Manager) pullDistro(r *image.ResolvedImage, progress func(string)) erro
 func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 	// 1. Ensure the base distro template exists.
 	progress(fmt.Sprintf("Pulling base image %s for %s", r.BaseRef, r.Ref))
-	baseResolved, err := image.Resolve(r.BaseRef, r.Arch)
+	baseResolved, err := image.Resolve(r.BaseRef, r.Arch, m.UsePVE())
 	if err != nil {
 		return err
 	}
@@ -647,7 +647,7 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 	}
 	defer m.store.FreeIP(ip) // Template doesn't need a permanent IP.
 
-	if err := rewriteConfig(templateCfgPath, &templateCfg, ip, r.TemplateContainerName); err != nil {
+	if err := rewriteConfig(templateCfgPath, &templateCfg, ip, r.TemplateContainerName, false); err != nil {
 		return fmt.Errorf("manager: rewrite app template config: %w", err)
 	}
 	templateRootfs := filepath.Join(m.lxcPath, r.TemplateContainerName, "rootfs")
@@ -995,7 +995,7 @@ lxc.uts.name = %s
 
 	// Rewrite config with full daemon-managed settings.
 	// Note: rewriteConfig may populate cfg.SocketLinks for socket bind mounts.
-	if err := rewriteConfig(configPath, &cfg, ip, id); err != nil {
+	if err := rewriteConfig(configPath, &cfg, ip, id, true); err != nil {
 		return fmt.Errorf("manager: rewrite config: %w", err)
 	}
 
@@ -1041,7 +1041,7 @@ func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cf
 
 	// Rewrite the cloned config.
 	configPath := filepath.Join(m.lxcPath, id, "config")
-	if err := rewriteConfig(configPath, &cfg, ip, id); err != nil {
+	if err := rewriteConfig(configPath, &cfg, ip, id, true); err != nil {
 		return fmt.Errorf("manager: rewrite config: %w", err)
 	}
 

@@ -126,7 +126,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		// App registry defaults (if no OCI config and no user-provided cmd).
 		if len(entrypoint) == 0 && len(cmd) == 0 {
-			if resolved, err := image.Resolve(imgRec.Ref, "amd64"); err == nil && resolved.App != nil && resolved.App.DefaultCmd != "" {
+			if resolved, err := image.Resolve(imgRec.Ref, "amd64", false); err == nil && resolved.App != nil && resolved.App.DefaultCmd != "" {
 				cmd = []string{"/bin/sh", "-c", resolved.App.DefaultCmd}
 			}
 		}
