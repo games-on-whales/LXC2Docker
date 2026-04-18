@@ -628,21 +628,25 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		pid = containerPID(id)
 	}
 
+	rootfs := h.mgr.RootfsPath(id)
 	resp := ContainerJSON{
 		ID:             rec.ID,
 		Created:        rec.Created.Format(time.RFC3339Nano),
 		Path:           path,
 		Args:           args,
 		Name:           "/" + rec.Name,
-		ResolvConfPath: "",
-		HostnamePath:   "",
+		ResolvConfPath: filepath.Join(rootfs, "etc", "resolv.conf"),
+		HostnamePath:   filepath.Join(rootfs, "etc", "hostname"),
 		LogPath:        h.mgr.LogPath(id),
 		RestartCount:   rec.RestartCount,
 		Driver:         "lxc",
 		Platform:       "linux",
 		GraphDriver: GraphDriver{
 			Name: "lxc",
-			Data: map[string]string{},
+			Data: map[string]string{
+				"LxcPath": h.mgr.LXCPath(),
+				"Rootfs":  rootfs,
+			},
 		},
 		State: ContainerState{
 			Status:     state,

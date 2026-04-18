@@ -524,6 +524,7 @@ type InfoResponse struct {
 	HTTPSProxy         string            `json:"HttpsProxy"`
 	NoProxy            string            `json:"NoProxy"`
 	SecurityOptions    []string          `json:"SecurityOptions"`
+	LoggingDriver      string            `json:"LoggingDriver"`
 	Warnings           []string          `json:"Warnings"`
 	ClientInfo         map[string]string `json:"ClientInfo,omitempty"`
 }

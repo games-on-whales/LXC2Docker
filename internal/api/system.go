@@ -178,6 +178,7 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 		HTTPSProxy:         os.Getenv("HTTPS_PROXY"),
 		NoProxy:            os.Getenv("NO_PROXY"),
 		SecurityOptions:    []string{"name=seccomp,profile=default"},
+		LoggingDriver:      "json-file",
 		Warnings:           []string{},
 	}
 	jsonResponse(w, http.StatusOK, resp)
