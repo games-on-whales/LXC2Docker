@@ -1,0 +1,62 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+
+	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
+	"github.com/gorilla/mux"
+)
+
+func TestDistributionInspectUsesCanonicalPayload(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store init: %v", err)
+	}
+	if err := st.AddImage(&store.ImageRecord{
+		ID:  "sha256image",
+		Ref: "docker.io/library/nginx:latest",
+	}); err != nil {
+		t.Fatalf("add image: %v", err)
+	}
+
+	h := &Handler{
+		store:      st,
+		attachPTYs: map[string]*os.File{},
+		execs:      newExecStore(),
+		events:     newEventBroker(),
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1.45/distribution/nginx:latest/json", nil)
+	req = mux.SetURLVars(req, map[string]string{"name": "nginx:latest"})
+	h.distributionInspect(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var out map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	descRaw, ok := out["Descriptor"].(map[string]any)
+	if !ok {
+		t.Fatalf("Descriptor missing or wrong type: %#v", out["Descriptor"])
+	}
+	if _, ok := descRaw["mediaType"]; !ok {
+		t.Fatalf("missing descriptor mediaType key: %#v", out)
+	}
+	if _, ok := descRaw["digest"]; !ok {
+		t.Fatalf("missing descriptor digest key: %#v", out)
+	}
+	if _, ok := descRaw["size"]; !ok {
+		t.Fatalf("missing descriptor size key: %#v", out)
+	}
+}

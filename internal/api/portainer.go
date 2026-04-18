@@ -150,12 +150,17 @@ func applyLiveLimits(id string, hc HostConfig) string {
 // registry ourselves; a minimal response with a single linux/amd64 platform
 // entry is enough to pass the UI's "does this image exist remotely?" check.
 func (h *Handler) distributionInspect(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	ref := normalizeImageRef(name)
+	digest := ""
+	if rec := h.store.GetImage(ref); rec != nil {
+		digest = "sha256:" + rec.ID
+	}
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"Descriptor": map[string]any{
-			"MediaType": "application/vnd.docker.distribution.manifest.v2+json",
-			"Digest":    "",
-			"Size":      0,
-			"URLs":      []string{},
+			"mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+			"digest":    digest,
+			"size":      0,
 		},
 		"Platforms": []map[string]string{
 			{"architecture": "amd64", "os": "linux"},
