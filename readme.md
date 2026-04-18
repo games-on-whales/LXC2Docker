@@ -13,6 +13,22 @@ make build        # -> bin/docker-lxc-daemon
 sudo make install # -> /usr/local/bin + systemd unit
 ```
 
+## Testing
+
+Run all checks:
+
+```sh
+make test
+```
+
+Individual targets:
+
+```sh
+make test-build       # compile check (`go test -run '^$' ./...`)
+make test-unit        # unit tests
+make test-integration # integration tests (`go test -tags=integration ./...`)
+```
+
 ## Run
 
 ```sh
