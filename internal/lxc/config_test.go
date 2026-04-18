@@ -1,6 +1,9 @@
 package lxc
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCapabilityItemsPrivileged(t *testing.T) {
 	t.Parallel()
@@ -58,4 +61,55 @@ func TestNormalizeCap(t *testing.T) {
 	if got := normalizeCap(" CAP_NET_ADMIN "); got != "net_admin" {
 		t.Fatalf("normalizeCap = %q, want %q", got, "net_admin")
 	}
+}
+
+func TestAppendSocketMountMountsRuntimeSocketDirAtRealDestination(t *testing.T) {
+	t.Parallel()
+
+	runtimeDir := "/run/user/wolf"
+	socket := "/run/user/wolf/wayland-1"
+
+	cfg := &ContainerConfig{}
+	items := appendSocketMount(nil, cfg, socket, MountSpec{
+		Source:      socket,
+		Destination: "/run/user/wolf/wayland-1",
+	})
+
+	want := strings.ReplaceAll(runtimeDir, " ", `\040`) + " run/user/wolf none bind,create=dir 0 0"
+	if !hasMountEntry(items, want) {
+		t.Fatalf("expected direct runtime dir mount %q, got %#v", want, items)
+	}
+	if len(cfg.SocketLinks) != 0 {
+		t.Fatalf("expected no socket symlinks for direct runtime dir mount, got %#v", cfg.SocketLinks)
+	}
+}
+
+func TestAppendSocketMountKeepsHiddenSocketMountForTranslatedDestinations(t *testing.T) {
+	t.Parallel()
+
+	runtimeDir := "/run/wolf"
+	socket := "/run/wolf/wolf.sock"
+
+	cfg := &ContainerConfig{}
+	items := appendSocketMount(nil, cfg, socket, MountSpec{
+		Source:      socket,
+		Destination: "/var/run/wolf/wolf.sock",
+	})
+
+	want := strings.ReplaceAll(runtimeDir, " ", `\040`) + " .socket-dirs/wolf none bind,create=dir 0 0"
+	if !hasMountEntry(items, want) {
+		t.Fatalf("expected hidden socket dir mount %q, got %#v", want, items)
+	}
+	if got := cfg.SocketLinks["/var/run/wolf/wolf.sock"]; got != "/.socket-dirs/wolf/wolf.sock" {
+		t.Fatalf("unexpected socket link target %q", got)
+	}
+}
+
+func hasMountEntry(items []configItem, want string) bool {
+	for _, item := range items {
+		if item.key == "lxc.mount.entry" && item.value == want {
+			return true
+		}
+	}
+	return false
 }
