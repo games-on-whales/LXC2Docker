@@ -177,11 +177,11 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/tasks/{id}/logs", h.swarmUnavailable).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/configs", h.swarmUnavailable).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/configs/create", h.swarmUnavailable).Methods(http.MethodPost)
-		sub.HandleFunc("/configs/{id}", h.swarmUnavailable).Methods(http.MethodGet, http.MethodDelete)
+		sub.HandleFunc("/configs/{id}", h.swarmUnavailable).Methods(http.MethodGet, http.MethodHead, http.MethodDelete)
 		sub.HandleFunc("/configs/{id}/update", h.swarmUnavailable).Methods(http.MethodPost)
 		sub.HandleFunc("/secrets", h.swarmUnavailable).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/secrets/create", h.swarmUnavailable).Methods(http.MethodPost)
-		sub.HandleFunc("/secrets/{id}", h.swarmUnavailable).Methods(http.MethodGet, http.MethodDelete)
+		sub.HandleFunc("/secrets/{id}", h.swarmUnavailable).Methods(http.MethodGet, http.MethodHead, http.MethodDelete)
 		sub.HandleFunc("/secrets/{id}/update", h.swarmUnavailable).Methods(http.MethodPost)
 
 		// Exec

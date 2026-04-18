@@ -62,9 +62,9 @@ type NetworkingConfig struct {
 type HostConfig struct {
 	// Mounts & storage
 	Binds          []string          `json:"Binds"` // "host:container[:ro]"
-	Mounts         []MountSpec       `json:"Mounts,omitempty"`
-	Tmpfs          map[string]string `json:"Tmpfs,omitempty"`
-	VolumesFrom    []string          `json:"VolumesFrom,omitempty"`
+	Mounts         []MountSpec       `json:"Mounts"`
+	Tmpfs          map[string]string `json:"Tmpfs"`
+	VolumesFrom    []string          `json:"VolumesFrom"`
 	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
 	ShmSize        int64             `json:"ShmSize"`
 	// Devices & capabilities
@@ -75,7 +75,7 @@ type HostConfig struct {
 	Privileged        bool              `json:"Privileged"`
 	SecurityOpt       []string          `json:"SecurityOpt"`
 	GroupAdd          []string          `json:"GroupAdd"`
-	Sysctls           map[string]string `json:"Sysctls,omitempty"`
+	Sysctls           map[string]string `json:"Sysctls"`
 	// Resource limits
 	Memory            int64  `json:"Memory"` // bytes, 0=unlimited
 	MemoryReservation int64  `json:"MemoryReservation"`
@@ -93,10 +93,10 @@ type HostConfig struct {
 	// Networking / DNS
 	NetworkMode     string                   `json:"NetworkMode"`
 	PortBindings    map[string][]PortBinding `json:"PortBindings"`
-	DNS             []string                 `json:"Dns,omitempty"`
-	DNSOptions      []string                 `json:"DnsOptions,omitempty"`
-	DNSSearch       []string                 `json:"DnsSearch,omitempty"`
-	ExtraHosts      []string                 `json:"ExtraHosts,omitempty"`
+	DNS             []string                 `json:"Dns"`
+	DNSOptions      []string                 `json:"DnsOptions"`
+	DNSSearch       []string                 `json:"DnsSearch"`
+	ExtraHosts      []string                 `json:"ExtraHosts"`
 	PublishAllPorts bool                     `json:"PublishAllPorts"`
 	// Namespaces
 	IpcMode      string `json:"IpcMode"`
@@ -110,9 +110,9 @@ type HostConfig struct {
 	Init          *bool         `json:"Init,omitempty"`
 	Runtime       string        `json:"Runtime"`
 	// Misc
-	Ulimits     []Ulimit          `json:"Ulimits,omitempty"`
-	LogConfig   *LogConfig        `json:"LogConfig,omitempty"`
-	Annotations map[string]string `json:"Annotations,omitempty"`
+	Ulimits     []Ulimit          `json:"Ulimits"`
+	LogConfig   *LogConfig        `json:"LogConfig"`
+	Annotations map[string]string `json:"Annotations"`
 }
 
 // MountSpec is the new-style mount declaration Portainer prefers over Binds.
