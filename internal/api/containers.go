@@ -375,7 +375,7 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		}
 		mounts := make([]MountJSON, 0, len(rec.Mounts))
 		for _, m := range rec.Mounts {
-			mounts = append(mounts, mountJSONFrom(m))
+			mounts = append(mounts, h.mountJSONFrom(m))
 		}
 		summary := ContainerSummary{
 			ID:      rec.ID,
@@ -471,7 +471,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 	// Build Mounts array from stored mount specs.
 	mounts := make([]MountJSON, 0, len(rec.Mounts))
 	for _, m := range rec.Mounts {
-		mounts = append(mounts, mountJSONFrom(m))
+		mounts = append(mounts, h.mountJSONFrom(m))
 	}
 
 	// Split entrypoint[0] as Path and the rest as Args, matching what Docker
@@ -549,6 +549,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Labels:       rec.Labels,
 			WorkingDir:   rec.WorkingDir,
 			StopSignal:   rec.StopSignal,
+			Healthcheck:  healthcheckFrom(rec),
 		},
 		HostConfig: buildHostConfig(rec),
 		NetworkSettings: NetworkSettings{
@@ -1343,6 +1344,19 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 	return hc
 }
 
+func healthcheckFrom(rec *store.ContainerRecord) *Healthcheck {
+	if len(rec.HealthcheckTest) == 0 {
+		return nil
+	}
+	return &Healthcheck{
+		Test:        rec.HealthcheckTest,
+		Interval:    rec.HealthcheckInterval,
+		Timeout:     rec.HealthcheckTimeout,
+		Retries:     rec.HealthcheckRetries,
+		StartPeriod: rec.HealthcheckStartPeriod,
+	}
+}
+
 // healthStateFrom renders the stored health fields as the State.Health
 // object Portainer reads. Returns nil when no healthcheck is configured so
 // inspect omits the key entirely (matching Docker's behavior).
@@ -1408,7 +1422,7 @@ func (h *Handler) ensureVolume(name string) (string, error) {
 // mountJSONFrom converts a store mount record to the Docker wire format.
 // Records written before the Type field existed default to "bind" — the
 // only mount type the LXC runtime actually mounts today.
-func mountJSONFrom(m store.MountSpec) MountJSON {
+func (h *Handler) mountJSONFrom(m store.MountSpec) MountJSON {
 	mode := "rw"
 	if m.ReadOnly {
 		mode = "ro"
@@ -1417,13 +1431,29 @@ func mountJSONFrom(m store.MountSpec) MountJSON {
 	if t == "" {
 		t = "bind"
 	}
-	return MountJSON{
+	out := MountJSON{
 		Type:        t,
 		Source:      m.Source,
 		Destination: m.Destination,
 		Mode:        mode,
 		RW:          !m.ReadOnly,
 	}
+	if t == "volume" {
+		if v := h.volumeByMountpoint(m.Source); v != nil {
+			out.Name = v.Name
+			out.Driver = v.Driver
+		}
+	}
+	return out
+}
+
+func (h *Handler) volumeByMountpoint(path string) *store.VolumeRecord {
+	for _, v := range h.store.ListVolumes() {
+		if v.Mountpoint == path {
+			return v
+		}
+	}
+	return nil
 }
 
 // mergeEnv merges image-level env vars with request-level env vars.

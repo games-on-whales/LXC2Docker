@@ -204,10 +204,13 @@ type GraphDriver struct {
 // MountJSON represents a mount in the inspect response.
 type MountJSON struct {
 	Type        string `json:"Type"`
+	Name        string `json:"Name,omitempty"`
 	Source      string `json:"Source"`
 	Destination string `json:"Destination"`
+	Driver      string `json:"Driver,omitempty"`
 	Mode        string `json:"Mode"`
 	RW          bool   `json:"RW"`
+	Propagation string `json:"Propagation"`
 }
 
 // ContainerState holds the runtime state of a container.

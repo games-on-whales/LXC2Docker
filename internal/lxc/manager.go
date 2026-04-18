@@ -337,7 +337,13 @@ func truncateOutput(s string) string {
 // which are sub-millisecond per container — so we check every 5 seconds. A
 // dedicated watcher (vs folding into gc()) keeps the faster cadence for
 // restart events decoupled from the slower gc cycle.
+type RestartEmitter func(id, action string)
+
 func (m *Manager) StartRestartWatcher(ctx context.Context) {
+	m.StartRestartWatcherWithEmitter(ctx, nil)
+}
+
+func (m *Manager) StartRestartWatcherWithEmitter(ctx context.Context, emit RestartEmitter) {
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -346,7 +352,7 @@ func (m *Manager) StartRestartWatcher(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				m.enforceRestartPolicies()
+				m.enforceRestartPolicies(emit)
 			}
 		}
 	}()
@@ -355,7 +361,7 @@ func (m *Manager) StartRestartWatcher(ctx context.Context) {
 // enforceRestartPolicies walks stored containers once per tick. For each
 // container that has exited, it consults RestartPolicy/AutoRemove and takes
 // the appropriate action (restart, remove, or leave).
-func (m *Manager) enforceRestartPolicies() {
+func (m *Manager) enforceRestartPolicies(emit RestartEmitter) {
 	for _, rec := range m.store.ListContainers() {
 		// Skip containers that were never started — "created" state shouldn't
 		// trigger restart logic.
@@ -387,6 +393,8 @@ func (m *Manager) enforceRestartPolicies() {
 			RemovePortForwards(rec.IPAddress)
 			if err := m.RemoveContainer(rec.ID); err != nil {
 				log.Printf("restart-watcher: remove %s: %v", rec.ID[:12], err)
+			} else if emit != nil {
+				emit(rec.ID, "destroy")
 			}
 			continue
 		}
@@ -404,6 +412,9 @@ func (m *Manager) enforceRestartPolicies() {
 		rec.RestartCount++
 		if err := m.store.AddContainer(rec); err != nil {
 			log.Printf("restart-watcher: persist %s: %v", rec.ID[:12], err)
+		}
+		if emit != nil {
+			emit(rec.ID, "restart")
 		}
 	}
 }

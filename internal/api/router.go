@@ -29,9 +29,9 @@ func NewHandler(mgr *lxc.Manager, st *store.Store) http.Handler {
 // caller can wire hooks that depend on the event broker (e.g. health
 // watcher → events). Returning the concrete *Handler would leak internals
 // to main.go; instead we expose only the hook type main.go needs.
-func NewHandlerWithHooks(mgr *lxc.Manager, st *store.Store) (http.Handler, func(id, status string)) {
+func NewHandlerWithHooks(mgr *lxc.Manager, st *store.Store) (http.Handler, func(id, status string), func(id, action string)) {
 	h := newHandler(mgr, st)
-	return h.routes(), h.HealthEmitter()
+	return h.routes(), h.HealthEmitter(), h.RestartEmitter()
 }
 
 func newHandler(mgr *lxc.Manager, st *store.Store) *Handler {

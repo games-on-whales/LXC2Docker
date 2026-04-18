@@ -404,12 +404,56 @@ func (h *Handler) listVolumes(w http.ResponseWriter, r *http.Request) {
 		if !filt.matchLabel(v.Labels) {
 			continue
 		}
+		if !matchVolumeName(filt, v.Name) {
+			continue
+		}
+		if !matchVolumeDriver(filt, v.Driver) {
+			continue
+		}
+		if filt.has("dangling") && !matchDangling(filt, h.volumeInUse(v.Name)) {
+			continue
+		}
 		out = append(out, volumeJSON(v))
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"Volumes":  out,
 		"Warnings": []string{},
 	})
+}
+
+func matchVolumeName(f filters, name string) bool {
+	if !f.has("name") {
+		return true
+	}
+	for _, want := range f["name"] {
+		if strings.Contains(name, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchVolumeDriver(f filters, driver string) bool {
+	if !f.has("driver") {
+		return true
+	}
+	return f.matchAny("driver", driver)
+}
+
+func matchDangling(f filters, inUse bool) bool {
+	for _, want := range f["dangling"] {
+		switch want {
+		case "1", "true":
+			if !inUse {
+				return true
+			}
+		case "0", "false":
+			if inUse {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (h *Handler) inspectVolume(w http.ResponseWriter, r *http.Request) {

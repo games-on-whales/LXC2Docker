@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -78,6 +79,12 @@ func (b *eventBroker) publish(ev Event) {
 // lifecycle action on a stored record.
 func (h *Handler) emitContainer(action string, rec *store.ContainerRecord) {
 	h.emitContainerWithAttrs(action, rec, nil)
+}
+
+func (h *Handler) RestartEmitter() func(id, action string) {
+	return func(id, action string) {
+		h.emitContainer(action, h.store.GetContainer(id))
+	}
 }
 
 // HealthEmitter returns a function suitable for lxc.Manager.StartHealthWatcher.
@@ -237,10 +244,13 @@ func matchEvent(f filters, ev Event) bool {
 		return false
 	}
 	if f.has("container") {
-		// Container filter accepts ID or name.
 		match := false
 		for _, want := range f["container"] {
 			if want == ev.Actor.ID || want == ev.Actor.Attributes["name"] {
+				match = true
+				break
+			}
+			if len(want) >= 4 && strings.HasPrefix(ev.Actor.ID, want) {
 				match = true
 				break
 			}

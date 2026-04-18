@@ -49,7 +49,7 @@ func main() {
 		log.Fatalf("manager: %v", err)
 	}
 
-	handler, healthEmit := api.NewHandlerWithHooks(mgr, st)
+	handler, healthEmit, restartEmit := api.NewHandlerWithHooks(mgr, st)
 
 	// Ensure socket directory exists.
 	socketDir := filepath.Dir(*socketPath)
@@ -89,7 +89,7 @@ func main() {
 	// Start background GC that removes stopped ephemeral containers.
 	mgr.StartGC(ctx)
 	// Start the restart-policy / AutoRemove watcher.
-	mgr.StartRestartWatcher(ctx)
+	mgr.StartRestartWatcherWithEmitter(ctx, restartEmit)
 	// Start the HEALTHCHECK runner so Portainer's health badge updates.
 	mgr.StartHealthWatcher(ctx, healthEmit)
 
