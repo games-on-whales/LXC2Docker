@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -530,10 +531,28 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	return items
 }
 
+var dockerDefaultCaps = []string{
+	"audit_write",
+	"chown",
+	"dac_override",
+	"fowner",
+	"fsetid",
+	"kill",
+	"mknod",
+	"net_bind_service",
+	"net_raw",
+	"setfcap",
+	"setgid",
+	"setpcap",
+	"setuid",
+	"sys_chroot",
+}
+
 // capabilityItems translates Docker's Privileged / CapAdd / CapDrop into LXC
 // config lines. Privileged wins — when set we clear all drops and grant
-// full device cgroup access. Otherwise CapDrop/CapAdd produce matching
-// lxc.cap.drop / lxc.cap.keep entries, one capability per line.
+// full device cgroup access. For CapAdd / CapDrop we compute Docker's final
+// capability set and emit it as lxc.cap.keep after clearing inherited drops,
+// because LXC rejects configurations that mix keep and drop directives.
 func capabilityItems(cfg *ContainerConfig) []configItem {
 	var items []configItem
 	if cfg.Privileged {
@@ -544,11 +563,31 @@ func capabilityItems(cfg *ContainerConfig) []configItem {
 		)
 		return items
 	}
-	for _, c := range cfg.CapDrop {
-		items = append(items, configItem{"lxc.cap.drop", normalizeCap(c)})
+
+	if len(cfg.CapAdd) == 0 && len(cfg.CapDrop) == 0 {
+		return items
+	}
+
+	finalCaps := make(map[string]struct{}, len(dockerDefaultCaps)+len(cfg.CapAdd))
+	for _, c := range dockerDefaultCaps {
+		finalCaps[c] = struct{}{}
 	}
 	for _, c := range cfg.CapAdd {
-		items = append(items, configItem{"lxc.cap.keep", normalizeCap(c)})
+		finalCaps[normalizeCap(c)] = struct{}{}
+	}
+	for _, c := range cfg.CapDrop {
+		delete(finalCaps, normalizeCap(c))
+	}
+
+	// Clear inherited drops from common.conf before using lxc.cap.keep.
+	items = append(items, configItem{"lxc.cap.drop", ""})
+	keep := make([]string, 0, len(finalCaps))
+	for c := range finalCaps {
+		keep = append(keep, c)
+	}
+	slices.Sort(keep)
+	for _, c := range keep {
+		items = append(items, configItem{"lxc.cap.keep", c})
 	}
 	return items
 }
