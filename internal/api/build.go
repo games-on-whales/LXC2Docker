@@ -258,17 +258,16 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 					fail(inst.op + ": " + err.Error())
 					return
 				}
-			case "RUN":
-				script := inst.args
-				if state.workdir != "" {
-					script = fmt.Sprintf("mkdir -p %q && cd %q && %s", state.workdir, state.workdir, inst.args)
-				}
-				shellArgs := runShell(state.shell)
-				args := append([]string{rootfs}, shellArgs...)
-				args = append(args, script)
-				cmd := exec.Command("chroot", args...)
-				cmd.Env = append(os.Environ(), state.env...)
-				out, err := cmd.CombinedOutput()
+		case "RUN":
+			script := inst.args
+			if state.workdir != "" {
+				script = fmt.Sprintf("mkdir -p %q && cd %q && %s", state.workdir, state.workdir, inst.args)
+			}
+			shellArgs := runShell(state.shell)
+			args := buildRunArgs(rootfs, shellArgs, state.user, script)
+			cmd := exec.Command("chroot", args...)
+			cmd.Env = append(os.Environ(), state.env...)
+			out, err := cmd.CombinedOutput()
 				if len(out) > 0 {
 					send(map[string]string{"stream": string(out)})
 				}
@@ -644,6 +643,17 @@ func runShell(declared []string) []string {
 		out = append(out, "-c")
 	}
 	return out
+}
+
+func buildRunArgs(rootfs string, shellArgs []string, user, script string) []string {
+	args := []string{}
+	if user = strings.TrimSpace(user); user != "" {
+		args = append(args, "--userspec", user)
+	}
+	args = append(args, rootfs)
+	args = append(args, shellArgs...)
+	args = append(args, script)
+	return args
 }
 
 // parseVolumeInstruction parses a Dockerfile VOLUME directive. Accepts

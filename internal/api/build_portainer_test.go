@@ -102,3 +102,23 @@ func TestEvaluateBuildStagePreservesPortainerMetadata(t *testing.T) {
 		t.Fatalf("expected label role=web, got %+v", state.labels)
 	}
 }
+
+func TestBuildRunArgsHonorsDockerfileUserForPortainerBuilds(t *testing.T) {
+	t.Parallel()
+
+	args := buildRunArgs("/tmp/rootfs", []string{"/bin/sh", "-lc"}, "1000:1000", "echo hi")
+	want := []string{"--userspec", "1000:1000", "/tmp/rootfs", "/bin/sh", "-lc", "echo hi"}
+	if len(args) != len(want) {
+		t.Fatalf("expected %d args, got %d: %#v", len(want), len(args), args)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("expected arg %d = %q, got %#v", i, want[i], args)
+		}
+	}
+
+	args = buildRunArgs("/tmp/rootfs", []string{"/bin/sh", "-lc"}, "", "echo hi")
+	if len(args) < 1 || args[0] != "/tmp/rootfs" {
+		t.Fatalf("expected rootfs first when no user is set, got %#v", args)
+	}
+}
