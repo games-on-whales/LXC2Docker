@@ -195,51 +195,57 @@ func (h *Handler) sampleStats(id, name string) dockerStats {
 	return s
 }
 
-// readBlkioServiceBytes parses cgroup v2's io.stat into Docker's legacy
-// per-device, per-op byte counters. Format (one line per device):
+// readBlkioServiceBytes parses cgroup v2's io.stat (preferred) or the
+// cgroup v1 blkio.throttle.io_service_bytes fallback into Docker's legacy
+// per-device, per-op byte counters. Format v2 (one line per device):
 //
 //	MAJ:MIN rbytes=N wbytes=N rios=N wios=N dbytes=N dios=N
 //
-// We emit two entries per device ("Read" and "Write") since that's the
-// minimum Portainer reads to render the disk chart. Missing file → empty
-// slice, matching the pre-populated path's behavior.
+// Format v1:
+//
+//	MAJ:MIN Read N
+//	MAJ:MIN Write N
+//	...
+//
+// Portainer reads Read/Write to render the disk chart; missing file → empty.
 func readBlkioServiceBytes(cg string) []any {
 	out := []any{}
 	if cg == "" {
 		return out
 	}
-	data, err := os.ReadFile(filepath.Join(cg, "io.stat"))
-	if err != nil {
-		return out
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		major, minor := parseMajMin(fields[0])
-		var rbytes, wbytes uint64
-		for _, f := range fields[1:] {
-			k, v, ok := strings.Cut(f, "=")
-			if !ok {
+	// v2
+	if data, err := os.ReadFile(filepath.Join(cg, "io.stat")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
 				continue
 			}
-			n, _ := strconv.ParseUint(v, 10, 64)
-			switch k {
-			case "rbytes":
-				rbytes = n
-			case "wbytes":
-				wbytes = n
+			major, minor := parseMajMin(fields[0])
+			var rbytes, wbytes uint64
+			for _, f := range fields[1:] {
+				k, v, ok := strings.Cut(f, "=")
+				if !ok {
+					continue
+				}
+				n, _ := strconv.ParseUint(v, 10, 64)
+				switch k {
+				case "rbytes":
+					rbytes = n
+				case "wbytes":
+					wbytes = n
+				}
+			}
+			if rbytes > 0 || wbytes > 0 {
+				out = append(out,
+					map[string]any{"major": major, "minor": minor, "op": "Read", "value": rbytes},
+					map[string]any{"major": major, "minor": minor, "op": "Write", "value": wbytes},
+				)
 			}
 		}
-		if rbytes > 0 || wbytes > 0 {
-			out = append(out,
-				map[string]any{"major": major, "minor": minor, "op": "Read", "value": rbytes},
-				map[string]any{"major": major, "minor": minor, "op": "Write", "value": wbytes},
-			)
-		}
+		return out
 	}
-	return out
+	// v1 fallback.
+	return readBlkioV1(cg, "blkio.throttle.io_service_bytes")
 }
 
 // readBlkioServiced is the IOs-served counterpart to readBlkioServiceBytes.
@@ -248,36 +254,65 @@ func readBlkioServiced(cg string) []any {
 	if cg == "" {
 		return out
 	}
-	data, err := os.ReadFile(filepath.Join(cg, "io.stat"))
+	if data, err := os.ReadFile(filepath.Join(cg, "io.stat")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			major, minor := parseMajMin(fields[0])
+			var rios, wios uint64
+			for _, f := range fields[1:] {
+				k, v, ok := strings.Cut(f, "=")
+				if !ok {
+					continue
+				}
+				n, _ := strconv.ParseUint(v, 10, 64)
+				switch k {
+				case "rios":
+					rios = n
+				case "wios":
+					wios = n
+				}
+			}
+			if rios > 0 || wios > 0 {
+				out = append(out,
+					map[string]any{"major": major, "minor": minor, "op": "Read", "value": rios},
+					map[string]any{"major": major, "minor": minor, "op": "Write", "value": wios},
+				)
+			}
+		}
+		return out
+	}
+	return readBlkioV1(cg, "blkio.throttle.io_serviced")
+}
+
+// readBlkioV1 parses cgroup v1's blkio recursive counter files. They list
+// `MAJ:MIN <op> <value>` lines plus a "Total" summary we skip. Only Read
+// and Write op codes are emitted (Async/Sync duplicate counts).
+func readBlkioV1(cg, filename string) []any {
+	out := []any{}
+	data, err := os.ReadFile(filepath.Join(cg, filename))
 	if err != nil {
 		return out
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		if len(fields) != 3 {
+			continue
+		}
+		op := fields[1]
+		if op != "Read" && op != "Write" {
 			continue
 		}
 		major, minor := parseMajMin(fields[0])
-		var rios, wios uint64
-		for _, f := range fields[1:] {
-			k, v, ok := strings.Cut(f, "=")
-			if !ok {
-				continue
-			}
-			n, _ := strconv.ParseUint(v, 10, 64)
-			switch k {
-			case "rios":
-				rios = n
-			case "wios":
-				wios = n
-			}
+		n, _ := strconv.ParseUint(fields[2], 10, 64)
+		if n == 0 {
+			continue
 		}
-		if rios > 0 || wios > 0 {
-			out = append(out,
-				map[string]any{"major": major, "minor": minor, "op": "Read", "value": rios},
-				map[string]any{"major": major, "minor": minor, "op": "Write", "value": wios},
-			)
-		}
+		out = append(out, map[string]any{
+			"major": major, "minor": minor, "op": op, "value": n,
+		})
 	}
 	return out
 }

@@ -831,6 +831,7 @@ lxc.uts.name = %s
 		OCIWorkingDir: cfg.WorkingDir,
 		OCIPorts:      cfg.Ports,
 		OCILabels:     cfg.Labels,
+		RepoDigest:    cfg.Digest,
 	})
 }
 

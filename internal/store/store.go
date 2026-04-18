@@ -121,6 +121,10 @@ type ImageRecord struct {
 	OCIWorkingDir string            `json:"oci_working_dir,omitempty"`
 	OCIPorts      []string          `json:"oci_ports,omitempty"`
 	OCILabels     map[string]string `json:"oci_labels,omitempty"`
+	// RepoDigest holds the image manifest digest ("sha256:...") when
+	// known. Populated by skopeo inspect after pull. Used to surface a
+	// canonical reference on the image detail page.
+	RepoDigest string `json:"repo_digest,omitempty"`
 }
 
 // VolumeRecord is a Docker-style named volume backed by a plain directory on

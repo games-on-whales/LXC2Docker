@@ -25,6 +25,7 @@ type ImageConfig struct {
 	WorkingDir string
 	Ports      []string          // e.g. ["80/tcp", "443/tcp"]
 	Labels     map[string]string // OCI image labels (rendered in Portainer's image detail)
+	Digest     string            // manifest digest, "sha256:..." (empty if unknown)
 }
 
 // ProgressEvent represents a single line of pull progress emitted to the
@@ -142,7 +143,40 @@ func Pull(storeDir, ref string, opts PullOpts) (*ImageConfig, string, error) {
 		return nil, "", fmt.Errorf("oci: rootfs not found at %s", rootfs)
 	}
 
+	// Extract the manifest digest from index.json so the caller can persist
+	// a RepoDigest. We already have index.json parsed in parseImageConfig,
+	// but reading it again here keeps the public API simple.
+	cfg.Digest = manifestDigest(ociDir, tag)
+
 	return cfg, rootfs, nil
+}
+
+// manifestDigest returns the top-level manifest digest recorded in the
+// OCI layout's index.json. Matches what `docker pull` prints and what
+// `docker inspect` exposes as RepoDigests. Empty on any error.
+func manifestDigest(ociDir, tag string) string {
+	data, err := os.ReadFile(filepath.Join(ociDir, "index.json"))
+	if err != nil {
+		return ""
+	}
+	var index struct {
+		Manifests []struct {
+			Digest      string            `json:"digest"`
+			Annotations map[string]string `json:"annotations"`
+		} `json:"manifests"`
+	}
+	if err := json.Unmarshal(data, &index); err != nil {
+		return ""
+	}
+	for _, m := range index.Manifests {
+		if m.Annotations["org.opencontainers.image.ref.name"] == tag {
+			return m.Digest
+		}
+	}
+	if len(index.Manifests) > 0 {
+		return index.Manifests[0].Digest
+	}
+	return ""
 }
 
 // parseSkopeoProgress reads skopeo's stderr line-by-line, translates the

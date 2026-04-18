@@ -44,6 +44,16 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Name conflict: Docker returns 409 rather than silently clobbering
+	// the existing container's record. Portainer relies on this to detect
+	// duplicate-create attempts (e.g. after a partially-failed deploy) and
+	// surface a clear error to the user.
+	if name != "" && h.store.FindContainerByName(name) != nil {
+		errResponse(w, http.StatusConflict,
+			fmt.Sprintf("Conflict. The container name %q is already in use.", "/"+name))
+		return
+	}
+
 	// Auto-pull if image not present. Portainer's deploy flow POSTs
 	// /containers/create with an image that hasn't been pulled yet; when
 	// the registry is private the user's credentials arrive in
@@ -154,6 +164,34 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		cfg.Devices = append(cfg.Devices, lxc.DeviceSpec{
 			PathOnHost:      d.PathOnHost,
 			PathInContainer: d.PathInContainer,
+		})
+	}
+
+	// Anonymous volumes declared in Config.Volumes. Docker's runtime
+	// creates a fresh named volume with a generated name per entry and
+	// bind-mounts it at the requested path. Compose-style database
+	// containers (`VOLUME /var/lib/postgresql/data` in the Dockerfile)
+	// rely on this so state persists across container rebuilds even
+	// without an explicit --mount flag.
+	for path := range req.Volumes {
+		// Skip paths that already have an explicit bind or mount — user
+		// intent wins over the Dockerfile's VOLUME directive.
+		if hasMountAt(storeMounts, path) {
+			continue
+		}
+		volName := generateID()[:12] + "_anon"
+		mountpoint, err := h.ensureVolume(volName)
+		if err != nil {
+			continue
+		}
+		storeMounts = append(storeMounts, store.MountSpec{
+			Type:        "volume",
+			Source:      mountpoint,
+			Destination: path,
+		})
+		cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
+			Source:      mountpoint,
+			Destination: path,
 		})
 	}
 
@@ -576,7 +614,7 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	if err := h.mgr.StopContainer(id, 10*time.Second); err != nil {
+	if err := h.mgr.StopContainer(id, stopTimeout(r)); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -593,6 +631,25 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 	h.emitContainer("stop", rec)
 	h.emitContainer("die", rec)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// stopTimeout reads the Docker-standard `t` query param (seconds before
+// SIGKILL). Missing / malformed falls back to 10 s, matching Docker's
+// default. Negative values disable the timeout — we translate that to an
+// effectively unbounded wait (1 hour) rather than block forever.
+func stopTimeout(r *http.Request) time.Duration {
+	v := r.URL.Query().Get("t")
+	if v == "" {
+		return 10 * time.Second
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 10 * time.Second
+	}
+	if n < 0 {
+		return time.Hour
+	}
+	return time.Duration(n) * time.Second
 }
 
 // POST /containers/{id}/wait
@@ -900,7 +957,7 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	state, _ := h.mgr.State(id)
 	if state == "running" {
-		if err := h.mgr.StopContainer(id, 10*time.Second); err != nil {
+		if err := h.mgr.StopContainer(id, stopTimeout(r)); err != nil {
 			errResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -1278,6 +1335,18 @@ func healthStateFrom(rec *store.ContainerRecord) *HealthState {
 		FailingStreak: rec.HealthFailingStreak,
 		Log:           log,
 	}
+}
+
+// hasMountAt reports whether the collected mount list already targets the
+// given in-container destination. Used to skip auto-creating anonymous
+// volumes for paths that the user already bind-mounted.
+func hasMountAt(mounts []store.MountSpec, dest string) bool {
+	for _, m := range mounts {
+		if m.Destination == dest {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureVolume resolves a named volume to its backing directory, creating

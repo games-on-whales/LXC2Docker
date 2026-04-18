@@ -42,7 +42,7 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 		out = append(out, ImageSummary{
 			ID:          "sha256:" + rec.ID,
 			RepoTags:    []string{rec.Ref},
-			RepoDigests: []string{},
+			RepoDigests: digestRefs(rec),
 			Created:     rec.Created.Unix(),
 			Size:        imageSize(h.mgr.LXCPath(), rec),
 			VirtualSize: imageSize(h.mgr.LXCPath(), rec),
@@ -51,6 +51,21 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	jsonResponse(w, http.StatusOK, out)
+}
+
+// digestRefs returns RepoDigests in Docker's "<repo>@<digest>" shape. If
+// we captured a manifest digest at pull time (OCI pulls only), we emit one
+// entry; otherwise the array is empty. Portainer's image detail page shows
+// these under "Digests".
+func digestRefs(rec *store.ImageRecord) []string {
+	if rec.RepoDigest == "" {
+		return []string{}
+	}
+	bare := rec.Ref
+	if i := strings.Index(bare, ":"); i != -1 {
+		bare = bare[:i]
+	}
+	return []string{bare + "@" + rec.RepoDigest}
 }
 
 // imageSize returns the on-disk size of an image template's rootfs. For
@@ -257,7 +272,7 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 	resp := ImageInspect{
 		ID:              "sha256:" + rec.ID,
 		RepoTags:        []string{rec.Ref},
-		RepoDigests:     []string{},
+		RepoDigests:     digestRefs(rec),
 		Created:         rec.Created.Format(time.RFC3339),
 		Architecture:    rec.Arch,
 		Os:              "linux",
