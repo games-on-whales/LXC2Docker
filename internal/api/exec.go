@@ -137,19 +137,7 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 	if req.Detach {
 		// Fire-and-forget: run the command, don't stream output.
 		cmd := h.mgr.ExecAs(rec.ContainerID, execCmd, rec.Env, rec.User)
-		go func() {
-			err := cmd.Run()
-			code := 0
-			if err != nil {
-				if ee, ok := err.(*exec.ExitError); ok {
-					code = ee.ExitCode()
-				}
-			}
-			h.execs.update(rec.ID, func(r *execRecord) {
-				r.Running = false
-				r.ExitCode = code
-			})
-		}()
+		h.startDetachedExec(rec.ID, cmd)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -205,6 +193,26 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		r.Running = false
 		r.ExitCode = code
 	})
+}
+
+func (h *Handler) startDetachedExec(execID string, cmd *exec.Cmd) {
+	h.execs.update(execID, func(r *execRecord) {
+		r.Running = true
+		r.StartedAt = time.Now()
+	})
+	go func() {
+		err := cmd.Run()
+		code := 0
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				code = ee.ExitCode()
+			}
+		}
+		h.execs.update(execID, func(r *execRecord) {
+			r.Running = false
+			r.ExitCode = code
+		})
+	}()
 }
 
 // GET /exec/{id}/json
