@@ -318,6 +318,12 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
 	withSize := r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true"
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
 	filt := parseFilters(r)
 	records := h.store.ListContainers()
 
@@ -405,7 +411,57 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Created > out[j].Created
 	})
+	if before := filt["before"]; len(before) > 0 {
+		out = trimBefore(out, before, h.store)
+	}
+	if since := filt["since"]; len(since) > 0 {
+		out = trimSince(out, since, h.store)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
 	jsonResponse(w, http.StatusOK, out)
+}
+
+func trimBefore(list []ContainerSummary, refs []string, st *store.Store) []ContainerSummary {
+	cutoff := refCutoff(refs, st)
+	if cutoff == 0 {
+		return list
+	}
+	out := list[:0]
+	for _, c := range list {
+		if c.Created < cutoff {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func trimSince(list []ContainerSummary, refs []string, st *store.Store) []ContainerSummary {
+	cutoff := refCutoff(refs, st)
+	if cutoff == 0 {
+		return list
+	}
+	out := list[:0]
+	for _, c := range list {
+		if c.Created > cutoff {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func refCutoff(refs []string, st *store.Store) int64 {
+	for _, r := range refs {
+		id := st.ResolveID(r)
+		if id == "" {
+			continue
+		}
+		if rec := st.GetContainer(id); rec != nil {
+			return rec.Created.Unix()
+		}
+	}
+	return 0
 }
 
 // networkModeFor returns the NetworkMode string Portainer displays in the list
@@ -1099,6 +1155,13 @@ func (h *Handler) topContainer(w http.ResponseWriter, r *http.Request) {
 	cmd := h.mgr.Exec(id, psCmd, nil)
 	out, err := cmd.Output()
 	if err != nil {
+		if titles, procs, ok := procTop(containerPID(id)); ok {
+			jsonResponse(w, http.StatusOK, map[string]any{
+				"Titles":    titles,
+				"Processes": procs,
+			})
+			return
+		}
 		errResponse(w, http.StatusInternalServerError, fmt.Sprintf("ps: %v", err))
 		return
 	}
@@ -1129,6 +1192,74 @@ func (h *Handler) topContainer(w http.ResponseWriter, r *http.Request) {
 		"Titles":    titles,
 		"Processes": processes,
 	})
+}
+
+func procTop(initPID int) ([]string, [][]string, bool) {
+	if initPID <= 0 {
+		return nil, nil, false
+	}
+	pids := map[int]bool{initPID: true}
+	pids = walkChildren(initPID, pids)
+	titles := []string{"UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"}
+	var rows [][]string
+	for pid := range pids {
+		row := readProcRow(pid)
+		if row != nil {
+			rows = append(rows, row)
+		}
+	}
+	if len(rows) == 0 {
+		return nil, nil, false
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i][1] < rows[j][1] })
+	return titles, rows, true
+}
+
+func walkChildren(pid int, seen map[int]bool) map[int]bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid))
+	if err != nil {
+		return seen
+	}
+	for _, f := range strings.Fields(string(data)) {
+		child, err := strconv.Atoi(f)
+		if err != nil || seen[child] {
+			continue
+		}
+		seen[child] = true
+		walkChildren(child, seen)
+	}
+	return seen
+}
+
+func readProcRow(pid int) []string {
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return nil
+	}
+	var uid, ppid, name string
+	for _, line := range strings.Split(string(status), "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		switch k {
+		case "Uid":
+			if fields := strings.Fields(v); len(fields) > 0 {
+				uid = fields[0]
+			}
+		case "PPid":
+			ppid = v
+		case "Name":
+			name = v
+		}
+	}
+	cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	cmd := name
+	if len(cmdline) > 0 {
+		cmd = strings.ReplaceAll(strings.TrimRight(string(cmdline), "\x00"), "\x00", " ")
+	}
+	return []string{uid, strconv.Itoa(pid), ppid, "0", "00:00", "?", "00:00:00", cmd}
 }
 
 // POST /containers/{id}/attach

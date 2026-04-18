@@ -252,11 +252,28 @@ func (h *Handler) createNetwork(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) connectNetwork(w http.ResponseWriter, r *http.Request) {
+	if !h.knownNetwork(mux.Vars(r)["id"]) {
+		errResponse(w, http.StatusNotFound, "network not found")
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) disconnectNetwork(w http.ResponseWriter, r *http.Request) {
+	if !h.knownNetwork(mux.Vars(r)["id"]) {
+		errResponse(w, http.StatusNotFound, "network not found")
+		return
+	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) knownNetwork(id string) bool {
+	for _, n := range defaultNetworks() {
+		if n["Id"] == id || n["Name"] == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) removeNetwork(w http.ResponseWriter, r *http.Request) {
@@ -476,7 +493,12 @@ func (h *Handler) inspectVolume(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "no such volume")
 		return
 	}
-	jsonResponse(w, http.StatusOK, volumeJSON(v))
+	body := volumeJSON(v)
+	body["UsageData"] = map[string]int64{
+		"Size":     rootfsSize(v.Mountpoint),
+		"RefCount": int64(volumeRefCount(h.store, v.Name)),
+	}
+	jsonResponse(w, http.StatusOK, body)
 }
 
 // createVolume persists a new named volume and mkdirs the backing directory.

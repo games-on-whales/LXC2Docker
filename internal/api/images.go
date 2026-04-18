@@ -310,7 +310,20 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 	ref := normalizeImageRef(name)
+	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
+	if h.store.GetImage(ref) == nil {
+		if force {
+			jsonResponse(w, http.StatusOK, []map[string]string{})
+			return
+		}
+		errResponse(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
+		return
+	}
 	if err := h.mgr.RemoveImage(ref); err != nil {
+		if force {
+			jsonResponse(w, http.StatusOK, []map[string]string{})
+			return
+		}
 		errResponse(w, http.StatusConflict, err.Error())
 		return
 	}
