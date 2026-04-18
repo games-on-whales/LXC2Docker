@@ -132,7 +132,7 @@ func (h *Handler) routes() http.Handler {
 		// messages are short because Portainer displays them verbatim.
 		ni := notImplementedFunc("not supported by docker-lxc-daemon")
 		sub.HandleFunc("/build", buildNotImplemented).Methods(http.MethodPost)
-		sub.HandleFunc("/images/load", ni).Methods(http.MethodPost)
+		sub.HandleFunc("/images/load", h.loadImage).Methods(http.MethodPost)
 		sub.HandleFunc("/images/search", ni).Methods(http.MethodGet)
 		sub.HandleFunc("/commit", h.commitContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/session", ni).Methods(http.MethodPost)

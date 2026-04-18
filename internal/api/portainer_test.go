@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
@@ -58,5 +59,31 @@ func TestDistributionInspectUsesCanonicalPayload(t *testing.T) {
 	}
 	if _, ok := descRaw["size"]; !ok {
 		t.Fatalf("missing descriptor size key: %#v", out)
+	}
+}
+
+func TestImagesLoadRouteHitsLoadImageHandler(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		attachPTYs: map[string]*os.File{},
+		events:     newEventBroker(),
+	}
+
+	r := h.routes()
+	req := httptest.NewRequest(http.MethodPost, "/v1.45/images/load", nil)
+	match := &mux.RouteMatch{}
+	if !r.Match(req, match) {
+		t.Fatal("expected /images/load route to match")
+	}
+
+	got, ok := match.Handler.(http.HandlerFunc)
+	if !ok {
+		t.Fatalf("expected route handler to be http.HandlerFunc, got %T", match.Handler)
+	}
+
+	want := http.HandlerFunc(h.loadImage)
+	if reflect.ValueOf(got).Pointer() != reflect.ValueOf(want).Pointer() {
+		t.Fatalf("expected /images/load to map to loadImage handler")
 	}
 }
