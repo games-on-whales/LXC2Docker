@@ -122,3 +122,17 @@ func TestBuildRunArgsHonorsDockerfileUserForPortainerBuilds(t *testing.T) {
 		t.Fatalf("expected rootfs first when no user is set, got %#v", args)
 	}
 }
+
+func TestIsScratchBuildRefSupportsPortainerScratchStages(t *testing.T) {
+	t.Parallel()
+
+	if !isScratchBuildRef("scratch") {
+		t.Fatal("expected scratch to be recognized")
+	}
+	if !isScratchBuildRef(" Scratch ") {
+		t.Fatal("expected scratch matching to be case-insensitive and trimmed")
+	}
+	if isScratchBuildRef("docker.io/library/scratch:latest") {
+		t.Fatal("expected only literal scratch to be treated as a scratch stage")
+	}
+}

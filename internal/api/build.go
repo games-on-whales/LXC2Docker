@@ -190,16 +190,26 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 		for k, v := range queryLabels {
 			state.labels[k] = v
 		}
-		baseRef := normalizeImageRef(resolveStageBaseRef(stage.baseRef, stageRefs))
+		resolvedBaseRef := resolveStageBaseRef(stage.baseRef, stageRefs)
+		scratchBase := isScratchBuildRef(resolvedBaseRef)
+		baseRef := normalizeImageRef(resolvedBaseRef)
+		if scratchBase {
+			baseRef = "scratch"
+		}
 		send(map[string]string{"stream": fmt.Sprintf("Step %d: resolving base image %s\n", step, baseRef)})
 		step++
-		if err := h.ensureBuildBaseImage(baseRef, send); err != nil {
-			cleanupStageImages()
-			fail("pull base image: " + err.Error())
-			return
+		if !scratchBase {
+			if err := h.ensureBuildBaseImage(baseRef, send); err != nil {
+				cleanupStageImages()
+				fail("pull base image: " + err.Error())
+				return
+			}
+		} else {
+			send(map[string]string{"stream": "Using empty scratch rootfs\n"})
 		}
 
 		tmpID := "build-" + generateID()[:12]
+		rootfs := h.mgr.RootfsPath(tmpID)
 		rec := &store.ContainerRecord{
 			ID:         tmpID,
 			Name:       tmpID,
@@ -217,23 +227,34 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 		}
 
 		cleanupTemp := func() {
-			if st, _ := h.mgr.State(tmpID); st == "running" {
-				_ = h.mgr.StopContainer(tmpID, 5*time.Second)
+			if !scratchBase {
+				if st, _ := h.mgr.State(tmpID); st == "running" {
+					_ = h.mgr.StopContainer(tmpID, 5*time.Second)
+				}
+				_ = h.mgr.RemoveContainer(tmpID)
+			} else {
+				_ = os.RemoveAll(filepath.Join(h.mgr.LXCPath(), tmpID))
 			}
-			_ = h.mgr.RemoveContainer(tmpID)
 			_ = h.store.RemoveContainer(tmpID)
 		}
 
 		send(map[string]string{"stream": fmt.Sprintf("Step %d: cloning base image into temporary builder %s\n", step, tmpID)})
 		step++
-		if err := h.mgr.CreateContainer(tmpID, baseRef, buildContainerConfigFromState(state)); err != nil {
-			_ = h.store.RemoveContainer(tmpID)
-			cleanupStageImages()
-			fail("create temporary builder: " + err.Error())
-			return
+		if scratchBase {
+			if err := os.MkdirAll(rootfs, 0o755); err != nil {
+				_ = h.store.RemoveContainer(tmpID)
+				cleanupStageImages()
+				fail("create scratch builder rootfs: " + err.Error())
+				return
+			}
+		} else {
+			if err := h.mgr.CreateContainer(tmpID, baseRef, buildContainerConfigFromState(state)); err != nil {
+				_ = h.store.RemoveContainer(tmpID)
+				cleanupStageImages()
+				fail("create temporary builder: " + err.Error())
+				return
+			}
 		}
-
-		rootfs := h.mgr.RootfsPath(tmpID)
 		for _, inst := range stage.instructions {
 			send(map[string]string{"stream": fmt.Sprintf("Step %d: %s %s\n", step, inst.op, inst.args)})
 			step++
@@ -549,6 +570,10 @@ func resolveStageBaseRef(baseRef string, stageRefs map[string]string) string {
 		return ref
 	}
 	return baseRef
+}
+
+func isScratchBuildRef(ref string) bool {
+	return strings.EqualFold(strings.TrimSpace(ref), "scratch")
 }
 
 // parseHealthcheckInstruction handles the two HEALTHCHECK forms:
@@ -1056,33 +1081,35 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 		}
 		sourceDS := fmt.Sprintf("%s/lxc-%s", storage, tmpID)
 		targetDS := fmt.Sprintf("%s/dld-templates/%s", storage, strings.TrimPrefix(safeTemplateName(ref), "__template_build_"))
-		_, _ = exec.Command("zfs", "destroy", "-r", targetDS).CombinedOutput()
-		if out, err := exec.Command("zfs", "rename", sourceDS, targetDS).CombinedOutput(); err != nil {
-			return fmt.Errorf("zfs rename %s -> %s: %s: %w", sourceDS, targetDS, out, err)
+		if err := exec.Command("zfs", "list", "-H", "-o", "name", sourceDS).Run(); err == nil {
+			_, _ = exec.Command("zfs", "destroy", "-r", targetDS).CombinedOutput()
+			if out, err := exec.Command("zfs", "rename", sourceDS, targetDS).CombinedOutput(); err != nil {
+				return fmt.Errorf("zfs rename %s -> %s: %s: %w", sourceDS, targetDS, out, err)
+			}
+			if out, err := exec.Command("zfs", "snapshot", targetDS+"@tmpl").CombinedOutput(); err != nil {
+				return fmt.Errorf("zfs snapshot %s@tmpl: %s: %w", targetDS, out, err)
+			}
+			_ = os.RemoveAll(filepath.Join(h.mgr.LXCPath(), tmpID))
+			_ = h.store.RemoveContainer(tmpID)
+			return h.store.AddImage(&store.ImageRecord{
+				ID:              "build_" + strings.TrimPrefix(safeTemplateName(ref), "__template_build_"),
+				Ref:             ref,
+				Arch:            "amd64",
+				TemplateDataset: targetDS,
+				Created:         time.Now(),
+				OCIEntrypoint:   state.entrypoint,
+				OCICmd:          state.cmd,
+				OCIEnv:          state.env,
+				OCIWorkingDir:   state.workdir,
+				OCIPorts:        state.exposed,
+				OCILabels:       state.labels,
+				OCIUser:         state.user,
+				OCIStopSignal:   state.stopSignal,
+				OCIHealthcheck:  state.healthcheck,
+				OCIVolumes:      append([]string{}, state.volumes...),
+				OCIShell:        append([]string{}, state.shell...),
+			})
 		}
-		if out, err := exec.Command("zfs", "snapshot", targetDS+"@tmpl").CombinedOutput(); err != nil {
-			return fmt.Errorf("zfs snapshot %s@tmpl: %s: %w", targetDS, out, err)
-		}
-		_ = os.RemoveAll(filepath.Join(h.mgr.LXCPath(), tmpID))
-		_ = h.store.RemoveContainer(tmpID)
-		return h.store.AddImage(&store.ImageRecord{
-			ID:              "build_" + strings.TrimPrefix(safeTemplateName(ref), "__template_build_"),
-			Ref:             ref,
-			Arch:            "amd64",
-			TemplateDataset: targetDS,
-			Created:         time.Now(),
-			OCIEntrypoint:   state.entrypoint,
-			OCICmd:          state.cmd,
-			OCIEnv:          state.env,
-			OCIWorkingDir:   state.workdir,
-			OCIPorts:        state.exposed,
-			OCILabels:       state.labels,
-			OCIUser:         state.user,
-			OCIStopSignal:   state.stopSignal,
-			OCIHealthcheck:  state.healthcheck,
-			OCIVolumes:      append([]string{}, state.volumes...),
-			OCIShell:        append([]string{}, state.shell...),
-		})
 	}
 
 	targetName := safeTemplateName(ref)
