@@ -260,6 +260,7 @@ type ContainerHealthEntry struct {
 type ContainerConfig struct {
 	Hostname     string              `json:"Hostname"`
 	Domainname   string              `json:"Domainname"`
+	MacAddress   string              `json:"MacAddress"`
 	User         string              `json:"User"`
 	AttachStdin  bool                `json:"AttachStdin"`
 	AttachStdout bool                `json:"AttachStdout"`
@@ -268,6 +269,8 @@ type ContainerConfig struct {
 	Tty          bool                `json:"Tty"`
 	OpenStdin    bool                `json:"OpenStdin"`
 	StdinOnce    bool                `json:"StdinOnce"`
+	NetworkDisabled bool             `json:"NetworkDisabled"`
+	ArgsEscaped  bool                `json:"ArgsEscaped"`
 	Image        string              `json:"Image"`
 	Volumes      map[string]struct{} `json:"Volumes"`
 	Cmd          []string            `json:"Cmd"`
@@ -275,6 +278,8 @@ type ContainerConfig struct {
 	Env          []string            `json:"Env"`
 	Labels       map[string]string   `json:"Labels"`
 	WorkingDir   string              `json:"WorkingDir"`
+	OnBuild      []string            `json:"OnBuild"`
+	Shell        []string            `json:"Shell"`
 	StopSignal   string              `json:"StopSignal,omitempty"`
 	StopTimeout  *int                `json:"StopTimeout,omitempty"`
 	Healthcheck  *Healthcheck        `json:"Healthcheck,omitempty"`

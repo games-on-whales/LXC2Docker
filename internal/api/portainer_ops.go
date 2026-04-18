@@ -763,6 +763,7 @@ type commitConfig struct {
 	Labels       map[string]string   `json:"Labels"`
 	Hostname     *string             `json:"Hostname"`
 	Domainname   *string             `json:"Domainname"`
+	MacAddress   *string             `json:"MacAddress"`
 	User         *string             `json:"User"`
 	AttachStdin  *bool               `json:"AttachStdin"`
 	AttachStdout *bool               `json:"AttachStdout"`
@@ -770,7 +771,11 @@ type commitConfig struct {
 	Tty          *bool               `json:"Tty"`
 	OpenStdin    *bool               `json:"OpenStdin"`
 	StdinOnce    *bool               `json:"StdinOnce"`
+	NetworkDisabled *bool            `json:"NetworkDisabled"`
+	ArgsEscaped  *bool               `json:"ArgsEscaped"`
 	WorkingDir   *string             `json:"WorkingDir"`
+	OnBuild      []string            `json:"OnBuild"`
+	Shell        []string            `json:"Shell"`
 	StopSignal   *string             `json:"StopSignal"`
 	StopTimeout  *int                `json:"StopTimeout"`
 	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
@@ -816,6 +821,9 @@ func applyCommitConfig(rec *store.ImageRecord, cfg *commitConfig) {
 	if cfg.Domainname != nil {
 		rec.OCIDomainname = *cfg.Domainname
 	}
+	if cfg.MacAddress != nil {
+		rec.OCIMacAddress = *cfg.MacAddress
+	}
 	if cfg.User != nil {
 		rec.OCIUser = *cfg.User
 	}
@@ -837,8 +845,17 @@ func applyCommitConfig(rec *store.ImageRecord, cfg *commitConfig) {
 	if cfg.StdinOnce != nil {
 		rec.OCIStdinOnce = *cfg.StdinOnce
 	}
+	if cfg.NetworkDisabled != nil {
+		rec.OCINetworkDisabled = *cfg.NetworkDisabled
+	}
+	if cfg.ArgsEscaped != nil {
+		rec.OCIArgsEscaped = *cfg.ArgsEscaped
+	}
 	if cfg.WorkingDir != nil {
 		rec.OCIWorkingDir = *cfg.WorkingDir
+	}
+	if cfg.OnBuild != nil {
+		rec.OCIOnBuild = append([]string{}, cfg.OnBuild...)
 	}
 	if cfg.StopSignal != nil {
 		rec.OCIStopSignal = *cfg.StopSignal

@@ -311,6 +311,7 @@ func synthesiseImageConfig(rec *store.ImageRecord, layerSHA string) ([]byte, str
 	cfg := map[string]any{
 		"Hostname":     rec.OCIHostname,
 		"Domainname":   rec.OCIDomainname,
+		"MacAddress":   rec.OCIMacAddress,
 		"Env":          append([]string{}, rec.OCIEnv...),
 		"Cmd":          append([]string{}, rec.OCICmd...),
 		"Entrypoint":   append([]string{}, rec.OCIEntrypoint...),
@@ -326,7 +327,11 @@ func synthesiseImageConfig(rec *store.ImageRecord, layerSHA string) ([]byte, str
 		"Tty":          rec.OCITty,
 		"OpenStdin":    rec.OCIOpenStdin,
 		"StdinOnce":    rec.OCIStdinOnce,
+		"NetworkDisabled": rec.OCINetworkDisabled,
+		"ArgsEscaped":  rec.OCIArgsEscaped,
 		"Volumes":      volumes,
+		"OnBuild":      append([]string{}, rec.OCIOnBuild...),
+		"Shell":        append([]string{}, rec.OCIShell...),
 	}
 	if hc := rec.OCIHealthcheck; hc != nil {
 		cfg["Healthcheck"] = map[string]any{
@@ -404,6 +409,7 @@ type saveImageConfig struct {
 type saveImageConfigBody struct {
 	Hostname     string              `json:"Hostname"`
 	Domainname   string              `json:"Domainname"`
+	MacAddress   string              `json:"MacAddress"`
 	Env          []string            `json:"Env"`
 	Cmd          []string            `json:"Cmd"`
 	Entrypoint   []string            `json:"Entrypoint"`
@@ -419,7 +425,11 @@ type saveImageConfigBody struct {
 	Tty          bool                `json:"Tty"`
 	OpenStdin    bool                `json:"OpenStdin"`
 	StdinOnce    bool                `json:"StdinOnce"`
+	NetworkDisabled bool             `json:"NetworkDisabled"`
+	ArgsEscaped  bool                `json:"ArgsEscaped"`
 	Volumes      map[string]struct{} `json:"Volumes"`
+	OnBuild      []string            `json:"OnBuild"`
+	Shell        []string            `json:"Shell"`
 	Healthcheck  *struct {
 		Test        []string `json:"Test"`
 		Interval    int64    `json:"Interval"`
@@ -536,6 +546,7 @@ func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send 
 			Release:         cfg.OSVersion,
 			OCIHostname:     effective.Hostname,
 			OCIDomainname:   effective.Domainname,
+			OCIMacAddress:   effective.MacAddress,
 			OCIEntrypoint:   append([]string{}, effective.Entrypoint...),
 			OCICmd:          append([]string{}, effective.Cmd...),
 			OCIEnv:          append([]string{}, effective.Env...),
@@ -549,9 +560,13 @@ func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send 
 			OCITty:          effective.Tty,
 			OCIOpenStdin:    effective.OpenStdin,
 			OCIStdinOnce:    effective.StdinOnce,
+			OCIArgsEscaped:  effective.ArgsEscaped,
+			OCINetworkDisabled: effective.NetworkDisabled,
 			OCIStopSignal:   effective.StopSignal,
 			OCIStopTimeout:  stopTimeoutValue(effective.StopTimeout),
 			OCIVolumes:      mapKeys(effective.Volumes),
+			OCIOnBuild:      append([]string{}, effective.OnBuild...),
+			OCIShell:        append([]string{}, effective.Shell...),
 		}
 		if hc := effective.Healthcheck; hc != nil && len(hc.Test) > 0 {
 			rec.OCIHealthcheck = &store.HealthcheckConfig{

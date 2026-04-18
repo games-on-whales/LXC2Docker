@@ -180,6 +180,7 @@ type ImageRecord struct {
 	OCIWorkingDir string            `json:"oci_working_dir,omitempty"`
 	OCIHostname   string            `json:"oci_hostname,omitempty"`
 	OCIDomainname string            `json:"oci_domainname,omitempty"`
+	OCIMacAddress string            `json:"oci_mac_address,omitempty"`
 	OCIPorts      []string          `json:"oci_ports,omitempty"`
 	OCILabels     map[string]string `json:"oci_labels,omitempty"`
 	OCIUser       string            `json:"oci_user,omitempty"`
@@ -189,10 +190,13 @@ type ImageRecord struct {
 	OCITty        bool              `json:"oci_tty,omitempty"`
 	OCIOpenStdin  bool              `json:"oci_open_stdin,omitempty"`
 	OCIStdinOnce  bool              `json:"oci_stdin_once,omitempty"`
+	OCIArgsEscaped bool             `json:"oci_args_escaped,omitempty"`
+	OCINetworkDisabled bool         `json:"oci_network_disabled,omitempty"`
 	OCIStopSignal string            `json:"oci_stop_signal,omitempty"`
 	OCIStopTimeout int              `json:"oci_stop_timeout,omitempty"`
 	OCIHealthcheck *HealthcheckConfig `json:"oci_healthcheck,omitempty"`
 	OCIVolumes    []string          `json:"oci_volumes,omitempty"`
+	OCIOnBuild    []string          `json:"oci_onbuild,omitempty"`
 	OCIShell      []string          `json:"oci_shell,omitempty"`
 	TemplateDataset string           `json:"template_dataset,omitempty"`
 	// RepoDigest holds the image manifest digest ("sha256:...") when
