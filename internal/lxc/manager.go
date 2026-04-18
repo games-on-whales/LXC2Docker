@@ -109,6 +109,155 @@ func (m *Manager) StartGC(ctx context.Context) {
 	}()
 }
 
+// HealthEmitter reports each probe outcome so the API layer can publish a
+// Docker "health_status" event. May be nil.
+type HealthEmitter func(id, status string)
+
+// StartHealthWatcher runs configured HEALTHCHECKs on their Interval. It
+// ticks once per second and skips containers whose next-check deadline
+// hasn't arrived. Probes use mgr.Exec (lxc-attach / pct exec) so they run
+// inside the container, matching Docker's semantics.
+func (m *Manager) StartHealthWatcher(ctx context.Context, emit HealthEmitter) {
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				m.runDueHealthchecks(now, emit)
+			}
+		}
+	}()
+}
+
+func (m *Manager) runDueHealthchecks(now time.Time, emit HealthEmitter) {
+	for _, rec := range m.store.ListContainers() {
+		if len(rec.HealthcheckTest) == 0 {
+			continue
+		}
+		// Honor NONE disable form: ["NONE"] means "no healthcheck".
+		if len(rec.HealthcheckTest) == 1 && rec.HealthcheckTest[0] == "NONE" {
+			continue
+		}
+		if state, _ := m.State(rec.ID); state != "running" {
+			// Reset to "starting" when the container restarts.
+			if rec.HealthStatus != "starting" {
+				rec.HealthStatus = "starting"
+				rec.HealthFailingStreak = 0
+				m.store.AddContainer(rec)
+			}
+			continue
+		}
+		interval := time.Duration(rec.HealthcheckInterval)
+		if interval <= 0 {
+			interval = 30 * time.Second // Docker default.
+		}
+		if rec.HealthLastCheck != nil && now.Sub(*rec.HealthLastCheck) < interval {
+			continue
+		}
+		m.runOneHealthcheck(rec, now, emit)
+	}
+}
+
+// runOneHealthcheck runs a single HEALTHCHECK probe and updates the
+// container record with the outcome. Health status flips to "healthy"
+// after any success and to "unhealthy" once the failing streak exceeds
+// Retries (Docker default: 3).
+func (m *Manager) runOneHealthcheck(rec *store.ContainerRecord, start time.Time, emit HealthEmitter) {
+	test := rec.HealthcheckTest
+	// Test formats:
+	//   ["CMD", "bin", "arg1", ...]        — exec argv directly
+	//   ["CMD-SHELL", "<shell string>"]    — run via /bin/sh -c
+	//   ["NONE"]                           — disabled (handled upstream)
+	var cmdArgs []string
+	switch test[0] {
+	case "CMD":
+		cmdArgs = test[1:]
+	case "CMD-SHELL":
+		if len(test) < 2 {
+			return
+		}
+		cmdArgs = []string{"/bin/sh", "-c", test[1]}
+	default:
+		// Bare list; treat as argv.
+		cmdArgs = test
+	}
+	if len(cmdArgs) == 0 {
+		return
+	}
+
+	timeout := time.Duration(rec.HealthcheckTimeout)
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := m.Exec(rec.ID, cmdArgs, nil)
+	// Bind the command to the timeout context so it's killed if the probe
+	// overruns (exec.Command doesn't honor context by default — wrap via
+	// CommandContext).
+	cmdCtx := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+	out, err := cmdCtx.CombinedOutput()
+	end := time.Now()
+
+	exitCode := 0
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			exitCode = ee.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+
+	prevStatus := rec.HealthStatus
+	result := store.HealthResult{
+		Start:    start,
+		End:      end,
+		ExitCode: exitCode,
+		Output:   truncateOutput(string(out)),
+	}
+	rec.HealthLastCheck = &end
+	rec.HealthLog = append(rec.HealthLog, result)
+	// Keep the last 5 entries, matching Docker's default.
+	if len(rec.HealthLog) > 5 {
+		rec.HealthLog = rec.HealthLog[len(rec.HealthLog)-5:]
+	}
+	retries := rec.HealthcheckRetries
+	if retries <= 0 {
+		retries = 3
+	}
+	if exitCode == 0 {
+		rec.HealthFailingStreak = 0
+		rec.HealthStatus = "healthy"
+	} else {
+		rec.HealthFailingStreak++
+		if rec.HealthFailingStreak >= retries {
+			rec.HealthStatus = "unhealthy"
+		}
+	}
+	if err := m.store.AddContainer(rec); err != nil {
+		log.Printf("health-watcher: persist %s: %v", rec.ID[:12], err)
+		return
+	}
+	if emit != nil && rec.HealthStatus != prevStatus {
+		emit(rec.ID, rec.HealthStatus)
+	}
+}
+
+// truncateOutput clips probe stdout/stderr to a reasonable length so the
+// health log doesn't balloon the state file. Docker's limit is 4096; we
+// use the same.
+func truncateOutput(s string) string {
+	const max = 4096
+	if len(s) > max {
+		return s[:max]
+	}
+	return s
+}
+
 // StartRestartWatcher enforces HostConfig.RestartPolicy and HostConfig.AutoRemove
 // on container exits. Polling is cheap — State() runs lxc-info / pct status
 // which are sub-millisecond per container — so we check every 5 seconds. A
@@ -142,6 +291,18 @@ func (m *Manager) enforceRestartPolicies() {
 		state, _ := m.State(rec.ID)
 		if state != "exited" {
 			continue
+		}
+
+		// Record the first observed exit time so inspect can show
+		// "Exited X minutes ago". The watcher is the earliest place we
+		// can reliably detect a spontaneous exit — StopContainer sets
+		// FinishedAt on user-initiated stops, but crashes need this path.
+		if rec.FinishedAt == nil {
+			now := time.Now()
+			rec.FinishedAt = &now
+			if err := m.store.AddContainer(rec); err != nil {
+				log.Printf("restart-watcher: persist FinishedAt %s: %v", rec.ID[:12], err)
+			}
 		}
 
 		// AutoRemove wins over RestartPolicy because Docker treats

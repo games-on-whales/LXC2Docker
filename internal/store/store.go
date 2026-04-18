@@ -37,7 +37,9 @@ type ContainerRecord struct {
 	IPAddress    string            `json:"ip_address"`
 	PortBindings []PortBinding     `json:"port_bindings,omitempty"`
 	Mounts       []MountSpec       `json:"mounts"`
-	StartedAt    *time.Time        `json:"started_at,omitempty"` // nil until first start; distinguishes "created" from "exited"
+	StartedAt    *time.Time        `json:"started_at,omitempty"`  // nil until first start; distinguishes "created" from "exited"
+	FinishedAt   *time.Time        `json:"finished_at,omitempty"` // last stop/kill timestamp, for Portainer's "Stopped X ago"
+	ExitCode     int               `json:"exit_code,omitempty"`   // last observed exit code (best-effort)
 	// Echo-back fields: persisted verbatim so `docker inspect` returns
 	// whatever the client sent on create. Not wired to the LXC runtime.
 	Hostname     string              `json:"hostname,omitempty"`
@@ -59,6 +61,26 @@ type ContainerRecord struct {
 	// Raw HostConfig as JSON for full round-trip. Decoding happens at the
 	// API layer; the store treats this as opaque.
 	RawHostConfig []byte `json:"raw_host_config,omitempty"`
+	// Healthcheck configuration and live health state. The API layer
+	// populates Healthcheck* at create time; the health watcher writes
+	// Health* as it runs probes.
+	HealthcheckTest     []string       `json:"hc_test,omitempty"`
+	HealthcheckInterval int64          `json:"hc_interval,omitempty"` // nanoseconds
+	HealthcheckTimeout  int64          `json:"hc_timeout,omitempty"`  // nanoseconds
+	HealthcheckRetries  int            `json:"hc_retries,omitempty"`
+	HealthStatus        string         `json:"health_status,omitempty"` // "starting"|"healthy"|"unhealthy"
+	HealthFailingStreak int            `json:"health_fail_streak,omitempty"`
+	HealthLastCheck     *time.Time     `json:"health_last_check,omitempty"`
+	HealthLog           []HealthResult `json:"health_log,omitempty"`
+}
+
+// HealthResult captures a single healthcheck probe outcome, echoed in
+// State.Health.Log.
+type HealthResult struct {
+	Start    time.Time `json:"Start"`
+	End      time.Time `json:"End"`
+	ExitCode int       `json:"ExitCode"`
+	Output   string    `json:"Output"`
 }
 
 // PortBinding records a single host→container port mapping.
@@ -99,9 +121,22 @@ type ImageRecord struct {
 	OCILabels     map[string]string `json:"oci_labels,omitempty"`
 }
 
+// VolumeRecord is a Docker-style named volume backed by a plain directory on
+// the host. Docker's "local" driver does the same thing; for the LXC daemon
+// this is the only driver we support.
+type VolumeRecord struct {
+	Name       string            `json:"name"`
+	Driver     string            `json:"driver"`
+	Mountpoint string            `json:"mountpoint"`
+	Created    time.Time         `json:"created"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	Options    map[string]string `json:"options,omitempty"`
+}
+
 type state struct {
 	Containers map[string]*ContainerRecord `json:"containers"` // keyed by ID
 	Images     map[string]*ImageRecord     `json:"images"`     // keyed by Ref (e.g. "ubuntu:22.04")
+	Volumes    map[string]*VolumeRecord    `json:"volumes"`    // keyed by Name
 	NextIP     int                         `json:"next_ip"`    // last octet of 10.100.0.x, starts at 2
 	FreeIPs    []int                       `json:"free_ips"`   // last octets of freed IPs available for reuse
 }
@@ -129,6 +164,7 @@ func NewAt(dir string) (*Store, error) {
 		data: state{
 			Containers: make(map[string]*ContainerRecord),
 			Images:     make(map[string]*ImageRecord),
+			Volumes:    make(map[string]*VolumeRecord),
 			NextIP:     2,
 		},
 	}
@@ -292,6 +328,48 @@ func (s *Store) ListImages() []*ImageRecord {
 		out = append(out, r)
 	}
 	return out
+}
+
+// --- Volumes ---
+
+// AddVolume persists a volume record keyed by name. Replaces any existing
+// record with the same name (used by the API layer's idempotent create).
+func (s *Store) AddVolume(v *VolumeRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data.Volumes == nil {
+		s.data.Volumes = make(map[string]*VolumeRecord)
+	}
+	s.data.Volumes[v.Name] = v
+	return s.save()
+}
+
+// GetVolume returns the record for name, or nil when absent.
+func (s *Store) GetVolume(name string) *VolumeRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.data.Volumes[name]
+}
+
+// ListVolumes returns all volume records.
+func (s *Store) ListVolumes() []*VolumeRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*VolumeRecord, 0, len(s.data.Volumes))
+	for _, v := range s.data.Volumes {
+		out = append(out, v)
+	}
+	return out
+}
+
+// RemoveVolume deletes a volume record. The caller is responsible for
+// removing the on-disk directory (or leaving it behind when `docker volume
+// rm` is called without -f).
+func (s *Store) RemoveVolume(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.data.Volumes, name)
+	return s.save()
 }
 
 // ResolveID resolves a partial or full container ID or name to a full ID.

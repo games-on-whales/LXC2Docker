@@ -22,6 +22,19 @@ type Handler struct {
 
 // NewHandler wires up the Handler and returns an http.Handler ready to serve.
 func NewHandler(mgr *lxc.Manager, st *store.Store) http.Handler {
+	return newHandler(mgr, st).routes()
+}
+
+// NewHandlerWithHooks is like NewHandler but also returns the Handler so the
+// caller can wire hooks that depend on the event broker (e.g. health
+// watcher → events). Returning the concrete *Handler would leak internals
+// to main.go; instead we expose only the hook type main.go needs.
+func NewHandlerWithHooks(mgr *lxc.Manager, st *store.Store) (http.Handler, func(id, status string)) {
+	h := newHandler(mgr, st)
+	return h.routes(), h.HealthEmitter()
+}
+
+func newHandler(mgr *lxc.Manager, st *store.Store) *Handler {
 	h := &Handler{
 		mgr:    mgr,
 		store:  st,
@@ -35,7 +48,7 @@ func NewHandler(mgr *lxc.Manager, st *store.Store) http.Handler {
 			h.execs.prune()
 		}
 	}()
-	return h.routes()
+	return h
 }
 
 func (h *Handler) routes() http.Handler {

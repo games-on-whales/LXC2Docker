@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
+	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
 	"github.com/gorilla/mux"
 	"golang.org/x/sys/unix"
 )
@@ -288,23 +290,46 @@ func (h *Handler) systemDF(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// listVolumes returns an empty volume set. The daemon exposes bind mounts
-// rather than named volumes, but Portainer polls this endpoint every refresh
-// and a 404 surfaces as an error banner.
+// volumeRoot returns the directory holding all named volume backing
+// directories. Each volume gets a subdirectory named after the volume.
+func (h *Handler) volumeRoot() string {
+	return filepath.Join(h.mgr.LXCPath(), "..", "docker-lxc-daemon", "volumes")
+}
+
+// listVolumes returns all known named volumes. Portainer's Volumes tab
+// polls this and also uses it to populate the "Volume" dropdown on the
+// container create form.
 func (h *Handler) listVolumes(w http.ResponseWriter, r *http.Request) {
+	filt := parseFilters(r)
+	records := h.store.ListVolumes()
+	out := make([]map[string]any, 0, len(records))
+	for _, v := range records {
+		if !filt.matchLabel(v.Labels) {
+			continue
+		}
+		out = append(out, volumeJSON(v))
+	}
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"Volumes":  []any{},
-		"Warnings": nil,
+		"Volumes":  out,
+		"Warnings": []string{},
 	})
 }
 
 func (h *Handler) inspectVolume(w http.ResponseWriter, r *http.Request) {
-	errResponse(w, http.StatusNotFound, "no such volume")
+	name := mux.Vars(r)["name"]
+	v := h.store.GetVolume(name)
+	if v == nil {
+		errResponse(w, http.StatusNotFound, "no such volume")
+		return
+	}
+	jsonResponse(w, http.StatusOK, volumeJSON(v))
 }
 
+// createVolume persists a new named volume and mkdirs the backing directory.
+// Idempotent: Portainer compose stacks issue the same POST on every up, so a
+// pre-existing volume returns 201 with the existing record rather than an
+// error.
 func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
-	// Accept the body but don't persist anything — the daemon has no named
-	// volume store. Returning the input name keeps compose/Portainer happy.
 	var req struct {
 		Name       string            `json:"Name"`
 		Driver     string            `json:"Driver"`
@@ -313,31 +338,127 @@ func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.Name == "" {
-		req.Name = "unnamed"
+		req.Name = generateVolumeName()
 	}
 	if req.Driver == "" {
 		req.Driver = "local"
 	}
-	jsonResponse(w, http.StatusCreated, map[string]any{
-		"Name":       req.Name,
-		"Driver":     req.Driver,
-		"Mountpoint": "/var/lib/docker-lxc-daemon/volumes/" + req.Name,
-		"CreatedAt":  time.Now().Format(time.RFC3339),
-		"Scope":      "local",
-		"Options":    req.DriverOpts,
-		"Labels":     req.Labels,
-	})
+	mountpoint := filepath.Join(h.volumeRoot(), req.Name)
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	v := &store.VolumeRecord{
+		Name:       req.Name,
+		Driver:     req.Driver,
+		Mountpoint: mountpoint,
+		Created:    time.Now(),
+		Labels:     req.Labels,
+		Options:    req.DriverOpts,
+	}
+	// Preserve the original creation time on re-create so Portainer's
+	// "Created X ago" doesn't reset every compose-up.
+	if existing := h.store.GetVolume(req.Name); existing != nil {
+		v.Created = existing.Created
+	}
+	if err := h.store.AddVolume(v); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	jsonResponse(w, http.StatusCreated, volumeJSON(v))
 }
 
 func (h *Handler) removeVolume(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	v := h.store.GetVolume(name)
+	if v == nil {
+		// Docker returns 204 for a missing volume only when force=1; else
+		// 404. Portainer doesn't rely on either behavior, so we follow the
+		// stricter spec.
+		if r.URL.Query().Get("force") == "1" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		errResponse(w, http.StatusNotFound, "no such volume")
+		return
+	}
+	// Refuse to delete volumes that are actively mounted. This mirrors
+	// Docker's "volume in use" error.
+	if h.volumeInUse(name) && r.URL.Query().Get("force") != "1" {
+		errResponse(w, http.StatusConflict, "volume is in use")
+		return
+	}
+	os.RemoveAll(v.Mountpoint)
+	h.store.RemoveVolume(name)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// pruneVolumes removes volumes with no current consumers. Docker also
+// respects label filters here; we implement the `label=` form via the
+// filter helper.
 func (h *Handler) pruneVolumes(w http.ResponseWriter, r *http.Request) {
+	filt := parseFilters(r)
+	var deleted []string
+	for _, v := range h.store.ListVolumes() {
+		if h.volumeInUse(v.Name) {
+			continue
+		}
+		if !filt.matchLabel(v.Labels) {
+			continue
+		}
+		os.RemoveAll(v.Mountpoint)
+		h.store.RemoveVolume(v.Name)
+		deleted = append(deleted, v.Name)
+	}
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"VolumesDeleted": []string{},
+		"VolumesDeleted": deleted,
 		"SpaceReclaimed": 0,
 	})
+}
+
+// volumeInUse returns true when any container has a mount whose source
+// equals the given volume's backing directory. This is the primitive
+// Docker uses to gate volume removal on active consumers.
+func (h *Handler) volumeInUse(name string) bool {
+	v := h.store.GetVolume(name)
+	if v == nil {
+		return false
+	}
+	for _, c := range h.store.ListContainers() {
+		for _, m := range c.Mounts {
+			if m.Source == v.Mountpoint {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// volumeJSON renders a store.VolumeRecord as Docker's volume response body.
+func volumeJSON(v *store.VolumeRecord) map[string]any {
+	opts := v.Options
+	if opts == nil {
+		opts = map[string]string{}
+	}
+	labels := v.Labels
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	return map[string]any{
+		"Name":       v.Name,
+		"Driver":     v.Driver,
+		"Mountpoint": v.Mountpoint,
+		"CreatedAt":  v.Created.Format(time.RFC3339),
+		"Scope":      "local",
+		"Options":    opts,
+		"Labels":     labels,
+	}
+}
+
+// generateVolumeName produces a 64-char hex identifier for anonymous
+// volumes, matching Docker's convention.
+func generateVolumeName() string {
+	return generateID()
 }
 
 // auth accepts registry credentials. We don't actually authenticate (skopeo

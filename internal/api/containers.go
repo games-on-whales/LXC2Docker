@@ -149,25 +149,36 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// New-style Mounts (Portainer emits these alongside or instead of Binds).
-	// Only bind mounts map cleanly to LXC today; "volume" and "tmpfs" types
-	// are persisted on the record but not mounted. Portainer still wants to
-	// see them with their declared type on inspect.
+	// Bind mounts use the source path directly. Volume mounts resolve the
+	// named volume to its backing directory (auto-creating it so anonymous
+	// volumes and compose stacks with declared volumes both work). Tmpfs
+	// mounts fall through to HostConfig.Tmpfs and are handled there.
 	for _, m := range req.HostConfig.Mounts {
 		mType := m.Type
 		if mType == "" {
 			mType = "bind"
 		}
+		source := m.Source
+		if mType == "volume" {
+			if resolved, err := h.ensureVolume(m.Source); err == nil {
+				source = resolved
+			} else {
+				continue
+			}
+		}
 		storeMounts = append(storeMounts, store.MountSpec{
 			Type:        mType,
-			Source:      m.Source,
+			Source:      source,
 			Destination: m.Target,
 			ReadOnly:    m.ReadOnly,
 		})
-		if mType != "bind" {
+		if mType == "tmpfs" {
+			// Tmpfs uses the lxc.mount.entry tmpfs path via HostConfig.Tmpfs
+			// — not a bind mount. Skip adding to cfg.Mounts.
 			continue
 		}
 		cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
-			Source:      m.Source,
+			Source:      source,
 			Destination: m.Target,
 			ReadOnly:    m.ReadOnly,
 		})
@@ -202,6 +213,13 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		RestartPolicy:   req.HostConfig.RestartPolicy.Name,
 		RestartMaxRetry: req.HostConfig.RestartPolicy.MaximumRetryCount,
 		AutoRemove:      req.HostConfig.AutoRemove,
+	}
+	if hc := req.Healthcheck; hc != nil && len(hc.Test) > 0 {
+		rec.HealthcheckTest = hc.Test
+		rec.HealthcheckInterval = hc.Interval
+		rec.HealthcheckTimeout = hc.Timeout
+		rec.HealthcheckRetries = hc.Retries
+		rec.HealthStatus = "starting"
 	}
 	// Parse port bindings from HostConfig (e.g. "80/tcp" -> [{HostPort:8080, ContainerPort:80, Proto:"tcp"}])
 	for containerPortProto, bindings := range req.HostConfig.PortBindings {
@@ -377,6 +395,10 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 	if rec.StartedAt != nil {
 		startedAt = rec.StartedAt.Format(time.RFC3339)
 	}
+	finishedAt := "0001-01-01T00:00:00Z"
+	if rec.FinishedAt != nil {
+		finishedAt = rec.FinishedAt.Format(time.RFC3339)
+	}
 
 	// Build Mounts array from stored mount specs.
 	mounts := make([]MountJSON, 0, len(rec.Mounts))
@@ -435,8 +457,10 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Running:    running,
 			Paused:     paused,
 			Pid:        pid,
+			ExitCode:   rec.ExitCode,
 			StartedAt:  startedAt,
-			FinishedAt: "0001-01-01T00:00:00Z",
+			FinishedAt: finishedAt,
+			Health:     healthStateFrom(rec),
 		},
 		Image:  rec.Image,
 		Mounts: mounts,
@@ -482,8 +506,9 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Record first-start timestamp so inspect can distinguish "created" from
-	// "exited", and clear the user-stopped flag so the restart watcher
-	// enforces the policy again on subsequent exits.
+	// "exited", clear the user-stopped flag so the restart watcher enforces
+	// the policy again on subsequent exits, and clear FinishedAt now that
+	// the container is running again.
 	if rec := h.store.GetContainer(id); rec != nil {
 		changed := false
 		if rec.StartedAt == nil {
@@ -493,6 +518,10 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		if rec.StoppedByUser {
 			rec.StoppedByUser = false
+			changed = true
+		}
+		if rec.FinishedAt != nil {
+			rec.FinishedAt = nil
 			changed = true
 		}
 		if changed {
@@ -528,8 +557,11 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 	rec := h.store.GetContainer(id)
 	if rec != nil {
 		// Mark as user-stopped so the restart watcher doesn't bring it
-		// back when the policy is unless-stopped / always.
+		// back when the policy is unless-stopped / always, and record
+		// the finish time so inspect shows "Stopped X ago".
 		rec.StoppedByUser = true
+		now := time.Now()
+		rec.FinishedAt = &now
 		h.store.AddContainer(rec)
 	}
 	h.emitContainer("stop", rec)
@@ -578,6 +610,8 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 	rec := h.store.GetContainer(id)
 	if rec != nil {
 		rec.StoppedByUser = true
+		now := time.Now()
+		rec.FinishedAt = &now
 		h.store.AddContainer(rec)
 	}
 	h.emitContainer("kill", rec)
@@ -1168,6 +1202,56 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 		}
 	}
 	return hc
+}
+
+// healthStateFrom renders the stored health fields as the State.Health
+// object Portainer reads. Returns nil when no healthcheck is configured so
+// inspect omits the key entirely (matching Docker's behavior).
+func healthStateFrom(rec *store.ContainerRecord) *HealthState {
+	if len(rec.HealthcheckTest) == 0 {
+		return nil
+	}
+	status := rec.HealthStatus
+	if status == "" {
+		status = "starting"
+	}
+	log := make([]ContainerHealthEntry, 0, len(rec.HealthLog))
+	for _, r := range rec.HealthLog {
+		log = append(log, ContainerHealthEntry{
+			Start:    r.Start.Format(time.RFC3339Nano),
+			End:      r.End.Format(time.RFC3339Nano),
+			ExitCode: r.ExitCode,
+			Output:   r.Output,
+		})
+	}
+	return &HealthState{
+		Status:        status,
+		FailingStreak: rec.HealthFailingStreak,
+		Log:           log,
+	}
+}
+
+// ensureVolume resolves a named volume to its backing directory, creating
+// it on demand. Anonymous volumes and compose-declared-but-not-pre-created
+// volumes both rely on auto-creation; this matches Docker's behavior.
+func (h *Handler) ensureVolume(name string) (string, error) {
+	if v := h.store.GetVolume(name); v != nil {
+		return v.Mountpoint, nil
+	}
+	mountpoint := filepath.Join(h.volumeRoot(), name)
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		return "", err
+	}
+	rec := &store.VolumeRecord{
+		Name:       name,
+		Driver:     "local",
+		Mountpoint: mountpoint,
+		Created:    time.Now(),
+	}
+	if err := h.store.AddVolume(rec); err != nil {
+		return "", err
+	}
+	return mountpoint, nil
 }
 
 // mountJSONFrom converts a store mount record to the Docker wire format.

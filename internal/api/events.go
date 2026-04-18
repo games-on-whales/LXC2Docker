@@ -80,6 +80,22 @@ func (h *Handler) emitContainer(action string, rec *store.ContainerRecord) {
 	h.emitContainerWithAttrs(action, rec, nil)
 }
 
+// HealthEmitter returns a function suitable for lxc.Manager.StartHealthWatcher.
+// Each call publishes a Docker-shaped "health_status" event (matching what
+// `docker events` emits) so Portainer refreshes the container's health
+// badge without a full snapshot refresh.
+func (h *Handler) HealthEmitter() func(id, status string) {
+	return func(id, status string) {
+		rec := h.store.GetContainer(id)
+		if rec == nil {
+			return
+		}
+		h.emitContainerWithAttrs("health_status: "+status, rec, map[string]string{
+			"health_status": status,
+		})
+	}
+}
+
 // emitImage publishes an "image" event. Portainer subscribes to the events
 // stream and refreshes its Images tab whenever it sees one. The actor ID
 // is the ref (e.g. "nginx:latest") to match Docker's convention.

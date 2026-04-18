@@ -182,12 +182,111 @@ func (h *Handler) sampleStats(id, name string) dockerStats {
 		s.Networks = readNetStats(pid)
 	}
 
-	// Blkio — empty arrays satisfy the schema; real numbers require cgroup
-	// v1 blkio or eBPF on v2. Portainer tolerates empty arrays.
-	s.BlkioStats.IOServiceBytesRecursive = []any{}
-	s.BlkioStats.IOServicedRecursive = []any{}
+	// Blkio — read cgroup v2 io.stat if present, fall back to empty arrays.
+	// Portainer's stats chart plots IOServiceBytesRecursive; populating it
+	// unlocks real disk I/O graphs instead of a flat line.
+	s.BlkioStats.IOServiceBytesRecursive = readBlkioServiceBytes(cgPath)
+	s.BlkioStats.IOServicedRecursive = readBlkioServiced(cgPath)
 
 	return s
+}
+
+// readBlkioServiceBytes parses cgroup v2's io.stat into Docker's legacy
+// per-device, per-op byte counters. Format (one line per device):
+//
+//	MAJ:MIN rbytes=N wbytes=N rios=N wios=N dbytes=N dios=N
+//
+// We emit two entries per device ("Read" and "Write") since that's the
+// minimum Portainer reads to render the disk chart. Missing file → empty
+// slice, matching the pre-populated path's behavior.
+func readBlkioServiceBytes(cg string) []any {
+	out := []any{}
+	if cg == "" {
+		return out
+	}
+	data, err := os.ReadFile(filepath.Join(cg, "io.stat"))
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		major, minor := parseMajMin(fields[0])
+		var rbytes, wbytes uint64
+		for _, f := range fields[1:] {
+			k, v, ok := strings.Cut(f, "=")
+			if !ok {
+				continue
+			}
+			n, _ := strconv.ParseUint(v, 10, 64)
+			switch k {
+			case "rbytes":
+				rbytes = n
+			case "wbytes":
+				wbytes = n
+			}
+		}
+		if rbytes > 0 || wbytes > 0 {
+			out = append(out,
+				map[string]any{"major": major, "minor": minor, "op": "Read", "value": rbytes},
+				map[string]any{"major": major, "minor": minor, "op": "Write", "value": wbytes},
+			)
+		}
+	}
+	return out
+}
+
+// readBlkioServiced is the IOs-served counterpart to readBlkioServiceBytes.
+func readBlkioServiced(cg string) []any {
+	out := []any{}
+	if cg == "" {
+		return out
+	}
+	data, err := os.ReadFile(filepath.Join(cg, "io.stat"))
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		major, minor := parseMajMin(fields[0])
+		var rios, wios uint64
+		for _, f := range fields[1:] {
+			k, v, ok := strings.Cut(f, "=")
+			if !ok {
+				continue
+			}
+			n, _ := strconv.ParseUint(v, 10, 64)
+			switch k {
+			case "rios":
+				rios = n
+			case "wios":
+				wios = n
+			}
+		}
+		if rios > 0 || wios > 0 {
+			out = append(out,
+				map[string]any{"major": major, "minor": minor, "op": "Read", "value": rios},
+				map[string]any{"major": major, "minor": minor, "op": "Write", "value": wios},
+			)
+		}
+	}
+	return out
+}
+
+// parseMajMin splits "MAJ:MIN" into its two integers. Bad input → (0, 0).
+func parseMajMin(s string) (uint64, uint64) {
+	maj, min, ok := strings.Cut(s, ":")
+	if !ok {
+		return 0, 0
+	}
+	ma, _ := strconv.ParseUint(maj, 10, 64)
+	mi, _ := strconv.ParseUint(min, 10, 64)
+	return ma, mi
 }
 
 func onlineCPUs() int {
