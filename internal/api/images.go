@@ -232,7 +232,8 @@ func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 
 // GET /images/search
 func (h *Handler) searchImages(w http.ResponseWriter, r *http.Request) {
-	term := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("term")))
+	rawTerm := strings.TrimSpace(r.URL.Query().Get("term"))
+	term := strings.ToLower(rawTerm)
 	if term == "" {
 		errResponse(w, http.StatusBadRequest, "term query parameter is required")
 		return
@@ -283,8 +284,35 @@ func (h *Handler) searchImages(w http.ResponseWriter, r *http.Request) {
 			limit--
 		}
 	}
+	if len(results) == 0 {
+		if synthetic := syntheticImageSearchName(rawTerm); synthetic != "" {
+			results = append(results, ImageSearchResult{
+				Name:        synthetic,
+				Description: "Pullable image reference",
+				StarCount:   0,
+				IsOfficial:  false,
+				IsAutomated: false,
+			})
+		}
+	}
 
 	jsonResponse(w, http.StatusOK, results)
+}
+
+func syntheticImageSearchName(term string) string {
+	name := shortenImageRef(strings.TrimSpace(strings.ToLower(term)))
+	if name == "" {
+		return ""
+	}
+	if digest := strings.IndexByte(name, '@'); digest >= 0 {
+		name = name[:digest]
+	}
+	lastSlash := strings.LastIndexByte(name, '/')
+	lastColon := strings.LastIndexByte(name, ':')
+	if lastColon > lastSlash {
+		name = name[:lastColon]
+	}
+	return strings.TrimSpace(name)
 }
 
 // decodeRegistryAuth parses Docker's X-Registry-Auth header, a base64url JSON
