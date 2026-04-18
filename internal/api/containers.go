@@ -51,6 +51,23 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("invalid restart policy %q; expected one of no, always, unless-stopped, on-failure", req.HostConfig.RestartPolicy.Name))
 		return
 	}
+	if req.HostConfig.RestartPolicy.MaximumRetryCount != 0 &&
+		req.HostConfig.RestartPolicy.Name != "on-failure" {
+		errResponse(w, http.StatusBadRequest,
+			"maximum retry count cannot be used with restart policies other than on-failure")
+		return
+	}
+	if req.HostConfig.MemorySwap > 0 &&
+		req.HostConfig.Memory > 0 &&
+		req.HostConfig.MemorySwap < req.HostConfig.Memory {
+		errResponse(w, http.StatusBadRequest,
+			"Minimum memoryswap limit should be larger than memory limit, see usage")
+		return
+	}
+	if req.HostConfig.Memory < 0 {
+		errResponse(w, http.StatusBadRequest, "Memory limit cannot be negative")
+		return
+	}
 	if req.HostConfig.AutoRemove &&
 		req.HostConfig.RestartPolicy.Name != "" &&
 		req.HostConfig.RestartPolicy.Name != "no" {
