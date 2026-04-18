@@ -396,6 +396,11 @@ func (h *Handler) listPlugins(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, []Plugin{})
 }
 
+// POST /plugins/create
+func (h *Handler) createPlugin(w http.ResponseWriter, r *http.Request) {
+	errResponse(w, http.StatusNotImplemented, "plugins are not supported by docker-lxc-daemon")
+}
+
 // GET /plugins/privileges
 // Portainer probes this before plugin installation to discover what elevated
 // permissions a plugin would request. We don't support Docker plugins, so the
@@ -427,6 +432,16 @@ func (h *Handler) enablePlugin(w http.ResponseWriter, r *http.Request) {
 // POST /plugins/{name}/disable
 func (h *Handler) disablePlugin(w http.ResponseWriter, r *http.Request) {
 	errResponse(w, http.StatusNotFound, "plugin not found")
+}
+
+// POST /plugins/{name}/push
+func (h *Handler) pushPlugin(w http.ResponseWriter, r *http.Request) {
+	errResponse(w, http.StatusNotImplemented, "plugins are not supported by docker-lxc-daemon")
+}
+
+// POST /plugins/{name}/set
+func (h *Handler) setPlugin(w http.ResponseWriter, r *http.Request) {
+	errResponse(w, http.StatusNotImplemented, "plugins are not supported by docker-lxc-daemon")
 }
 
 // POST /plugins/{name}/upgrade
@@ -469,6 +484,39 @@ func (h *Handler) inspectDistribution(w http.ResponseWriter, r *http.Request) {
 			{"architecture": "amd64", "os": "linux"},
 		},
 	})
+}
+
+// POST /images/{name}/push
+// Portainer exposes a "push image" action from the image detail view. We
+// don't implement registry pushes yet, but Docker clients expect a streamed
+// JSON response from this route rather than a hard 404.
+func (h *Handler) pushImage(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	tag := strings.TrimSpace(r.URL.Query().Get("tag"))
+	ref := normalizeImageRef(name)
+	if tag != "" && !strings.Contains(name, ":") {
+		ref = normalizeImageRef(name + ":" + tag)
+	}
+	if h.store.GetImage(ref) == nil {
+		errResponse(w, http.StatusNotFound, "No such image: "+name)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	enc := json.NewEncoder(w)
+	_ = enc.Encode(map[string]string{
+		"status": fmt.Sprintf("The push refers to repository [%s]", ref),
+	})
+	_ = enc.Encode(map[string]any{
+		"error": "image push is not supported by docker-lxc-daemon",
+		"errorDetail": map[string]string{
+			"message": "image push is not supported by docker-lxc-daemon",
+		},
+	})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // GET /containers/{id}/export

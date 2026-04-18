@@ -302,8 +302,11 @@ func TestHeadMethodsRouteToDockerReadHandlers(t *testing.T) {
 		{name: "images", path: "/v1.45/images/json"},
 		{name: "search images", path: "/v1.45/images/search?term=nginx"},
 		{name: "inspect image", path: "/v1.45/images/ubuntu/json"},
+		{name: "save image", path: "/v1.45/images/ubuntu/get"},
+		{name: "save images", path: "/v1.45/images/get"},
 		{name: "image history", path: "/v1.45/images/ubuntu/history"},
 		{name: "distribution inspect", path: "/v1.45/distribution/ubuntu/json"},
+		{name: "container export", path: "/v1.45/containers/abc/export"},
 		{name: "container top", path: "/v1.45/containers/abc/top"},
 		{name: "container stats", path: "/v1.45/containers/abc/stats"},
 		{name: "container changes", path: "/v1.45/containers/abc/changes"},
@@ -318,6 +321,38 @@ func TestHeadMethodsRouteToDockerReadHandlers(t *testing.T) {
 			t.Parallel()
 			req := httptest.NewRequest(http.MethodHead, tc.path, nil)
 			match := &mux.RouteMatch{}
+			if !r.Match(req, match) {
+				t.Fatalf("expected %s route to match", tc.path)
+			}
+		})
+	}
+}
+
+func TestAdditionalPortainerRoutesExist(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		store:      nil,
+		attachPTYs: map[string]*os.File{},
+		events:     newEventBroker(),
+	}
+	r := mustMuxRouter(t, h.routes())
+
+	tests := []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/v1.45/containers/abc/attach/ws"},
+		{method: http.MethodPost, path: "/v1.45/images/nginx:latest/push"},
+		{method: http.MethodPost, path: "/v1.45/swarm/unlock"},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			t.Parallel()
+			match := &mux.RouteMatch{}
+			req := httptest.NewRequest(tc.method, tc.path, nil)
 			if !r.Match(req, match) {
 				t.Fatalf("expected %s route to match", tc.path)
 			}

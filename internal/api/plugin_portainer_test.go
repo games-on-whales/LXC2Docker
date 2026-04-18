@@ -27,6 +27,7 @@ func TestPluginRoutesExistForPortainer(t *testing.T) {
 	}{
 		{method: http.MethodGet, path: "/v1.45/plugins", status: http.StatusOK},
 		{method: http.MethodHead, path: "/v1.45/plugins", status: http.StatusOK},
+		{method: http.MethodPost, path: "/v1.45/plugins/create", status: http.StatusNotImplemented},
 		{method: http.MethodGet, path: "/v1.45/plugins/privileges?remote=docker.io/library/example:latest", status: http.StatusOK},
 		{method: http.MethodHead, path: "/v1.45/plugins/privileges?remote=docker.io/library/example:latest", status: http.StatusOK},
 		{method: http.MethodGet, path: "/v1.45/plugins/example/json", status: http.StatusNotFound},
@@ -35,6 +36,8 @@ func TestPluginRoutesExistForPortainer(t *testing.T) {
 		{method: http.MethodPost, path: "/v1.45/plugins/pull?remote=docker.io/library/example:latest", status: http.StatusNotImplemented},
 		{method: http.MethodPost, path: "/v1.45/plugins/example/enable", status: http.StatusNotFound},
 		{method: http.MethodPost, path: "/v1.45/plugins/example/disable", status: http.StatusNotFound},
+		{method: http.MethodPost, path: "/v1.45/plugins/example/push", status: http.StatusNotImplemented},
+		{method: http.MethodPost, path: "/v1.45/plugins/example/set", status: http.StatusNotImplemented},
 		{method: http.MethodPost, path: "/v1.45/plugins/example/upgrade?remote=docker.io/library/example:latest", status: http.StatusNotImplemented},
 		{method: http.MethodDelete, path: "/v1.45/plugins/example", status: http.StatusNotFound},
 	}
