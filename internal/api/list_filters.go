@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/games-on-whales/LXC2Docker/internal/lxc"
 	"github.com/games-on-whales/LXC2Docker/internal/store"
 )
 
@@ -188,10 +189,10 @@ func matchesNetworkFilters(n *store.NetworkRecord, f listFilters) bool {
 	}
 	// Docker's "type" filter bucketises into "builtin" vs "custom". We don't
 	// track a bucket, so custom networks always match "custom" and the
-	// default gow network is "builtin".
+	// default managed bridge is "builtin".
 	if vals := f["type"]; len(vals) > 0 {
 		bucket := "custom"
-		if n.Name == "gow" {
+		if canonicalNetworkName(n.Name) == lxc.DefaultNetworkName {
 			bucket = "builtin"
 		}
 		if !f.anyMatch("type", bucket) {

@@ -288,10 +288,10 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 
 	if req.NetworkingConfig != nil {
 		for name := range req.NetworkingConfig.EndpointsConfig {
-			if canonicalNetworkName(name) == "gow" {
+			if canonicalNetworkName(name) == lxc.DefaultNetworkName {
 				continue
 			}
-			if h.store.GetNetwork(name) == nil {
+			if h.store.GetNetwork(canonicalNetworkName(name)) == nil {
 				errResponse(w, http.StatusBadRequest, fmt.Sprintf("network %q not found", name))
 				return
 			}
@@ -570,7 +570,7 @@ func networkModeFor(rec *store.ContainerRecord) string {
 	if len(rec.Networks) > 0 {
 		names := make([]string, 0, len(rec.Networks))
 		for name := range rec.Networks {
-			if name == "gow" {
+			if canonicalNetworkName(name) == lxc.DefaultNetworkName {
 				continue
 			}
 			names = append(names, name)
@@ -580,11 +580,11 @@ func networkModeFor(rec *store.ContainerRecord) string {
 			return names[0]
 		}
 	}
-	return "gow"
+	return lxc.DefaultNetworkName
 }
 
 // networkSettingsFor builds the per-network endpoint map for a container.
-// One entry per attached network ("gow" is the daemon's managed bridge).
+// One entry per attached network; the default entry is the daemon's managed bridge.
 func networkSettingsFor(rec *store.ContainerRecord) map[string]EndpointSettings {
 	return buildContainerEndpoints(rec)
 }
@@ -2031,9 +2031,9 @@ func containerOnNetwork(rec *store.ContainerRecord, names []string) bool {
 		}
 	}
 	attached[networkModeFor(rec)] = true
-	attached["gow"] = true
+	attached[lxc.DefaultNetworkName] = true
 	for _, want := range names {
-		if attached[want] {
+		if attached[want] || attached[canonicalNetworkName(want)] {
 			return true
 		}
 	}

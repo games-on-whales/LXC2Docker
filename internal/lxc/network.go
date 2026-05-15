@@ -8,13 +8,15 @@ import (
 )
 
 const (
-	BridgeName = "gow0"
-	BridgeCIDR = "10.100.0.1/24"
-	BridgeGW   = "10.100.0.1"
-	SubnetMask = "255.255.255.0"
+	DefaultNetworkName = "veth0"
+	BridgeName         = "veth0"
+	NATTableName       = "veth_nat"
+	BridgeCIDR         = "10.100.0.1/24"
+	BridgeGW           = "10.100.0.1"
+	SubnetMask         = "255.255.255.0"
 )
 
-// EnsureBridge creates the gow0 bridge and assigns it the gateway IP if it
+// EnsureBridge creates the managed bridge and assigns it the gateway IP if it
 // does not already exist. Idempotent.
 func EnsureBridge() error {
 	iface, err := net.InterfaceByName(BridgeName)
@@ -45,18 +47,18 @@ func EnsureBridge() error {
 		}
 	}
 
-	// Ensure the gow_nat nftables table exists with the masquerade rule.
+	// Ensure the nftables table exists with the masquerade rule.
 	// Using "nft -f" with a table block is idempotent — it merges into any
 	// existing table rather than replacing it.
 	nftRule := fmt.Sprintf(`
-table ip gow_nat {
+table ip %s {
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
 		ip saddr 10.100.0.0/24 oifname != "%s" masquerade
 		ct status dnat masquerade
 	}
 }
-`, BridgeName)
+`, NATTableName, BridgeName)
 	cmd := exec.Command("nft", "-f", "-")
 	cmd.Stdin = strings.NewReader(nftRule)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -66,7 +68,7 @@ table ip gow_nat {
 	return nil
 }
 
-// TeardownBridge removes the gow0 bridge and nftables table.
+// TeardownBridge removes the managed bridge and nftables table.
 // Called on daemon shutdown. The bridge and NAT rules are left in place
 // so that containers that survive the daemon restart keep networking.
 // EnsureBridge is idempotent and will reconcile on the next startup.
@@ -76,7 +78,7 @@ func TeardownBridge() {
 	// EnsureBridge call on startup will reconcile state.
 }
 
-// AddPortForward creates an nftables DNAT rule in the gow_nat table to forward
+// AddPortForward creates an nftables DNAT rule in the managed NAT table to forward
 // traffic from hostPort to containerIP:containerPort.
 func AddPortForward(containerIP string, hostPort, containerPort int, proto string) error {
 	if proto == "" {
@@ -85,7 +87,7 @@ func AddPortForward(containerIP string, hostPort, containerPort int, proto strin
 	// prerouting handles traffic from external interfaces; output handles
 	// traffic originating on the host itself (e.g. curl localhost:8080).
 	nftRule := fmt.Sprintf(`
-table ip gow_nat {
+table ip %s {
 	chain prerouting {
 		type nat hook prerouting priority dstnat; policy accept;
 		%s dport %d dnat to %s:%d
@@ -95,7 +97,7 @@ table ip gow_nat {
 		%s dport %d dnat to %s:%d
 	}
 }
-`, proto, hostPort, containerIP, containerPort,
+`, NATTableName, proto, hostPort, containerIP, containerPort,
 		proto, hostPort, containerIP, containerPort)
 
 	cmd := exec.Command("nft", "-f", "-")
@@ -106,13 +108,13 @@ table ip gow_nat {
 	return nil
 }
 
-// RemovePortForwards removes all nftables DNAT rules in the gow_nat prerouting
+// RemovePortForwards removes all nftables DNAT rules in the managed NAT
 // chain that target the given container IP.
 func RemovePortForwards(containerIP string) error {
 	target := "dnat to " + containerIP + ":"
 	// Clean rules from both prerouting and output chains.
 	for _, chain := range []string{"prerouting", "output"} {
-		out, err := exec.Command("nft", "-a", "list", "chain", "ip", "gow_nat", chain).CombinedOutput()
+		out, err := exec.Command("nft", "-a", "list", "chain", "ip", NATTableName, chain).CombinedOutput()
 		if err != nil {
 			continue // chain may not exist
 		}
@@ -125,14 +127,14 @@ func RemovePortForwards(containerIP string) error {
 				continue
 			}
 			handle := strings.TrimSpace(parts[1])
-			exec.Command("nft", "delete", "rule", "ip", "gow_nat", chain, "handle", handle).Run()
+			exec.Command("nft", "delete", "rule", "ip", NATTableName, chain, "handle", handle).Run()
 		}
 	}
 	return nil
 }
 
 // NetworkConfig returns the lxc.conf lines needed to attach a container to
-// gow0 with the given static IP. Includes a default gateway via the bridge.
+// the managed bridge with the given static IP. Includes a default gateway via the bridge.
 func NetworkConfig(ip string) []configItem {
 	return []configItem{
 		{"lxc.net.0.type", "veth"},
@@ -145,7 +147,7 @@ func NetworkConfig(ip string) []configItem {
 
 // DualNICConfig returns lxc.conf lines for a dual-NIC container: the LAN
 // bridge as net.0 (primary — so mDNS and other services advertise the LAN IP)
-// and the internal gow0 bridge as net.1 (for inter-container traffic).
+// and the internal managed bridge as net.1 (for inter-container traffic).
 func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem {
 	// net.0 = LAN (primary): routable IP on the physical network.
 	items := []configItem{
@@ -157,7 +159,7 @@ func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem
 	if lanGateway != "" {
 		items = append(items, configItem{"lxc.net.0.ipv4.gateway", lanGateway})
 	}
-	// net.1 = internal gow0 bridge (no gateway — connected route only).
+	// net.1 = internal managed bridge (no gateway — connected route only).
 	items = append(items,
 		configItem{"lxc.net.1.type", "veth"},
 		configItem{"lxc.net.1.link", BridgeName},

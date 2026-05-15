@@ -892,7 +892,7 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 		return fmt.Errorf("manager: pct clone %d → %d: %s: %w", imgRec.TemplateVMID, vmid, out, err)
 	}
 
-	// Allocate IP for bridge networking (internal gow0).
+	// Allocate IP for bridge networking on the internal managed bridge.
 	var ip string
 	if cfg.NetworkMode != "host" {
 		ip, err = m.store.AllocateIP()
