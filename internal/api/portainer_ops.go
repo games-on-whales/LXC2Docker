@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/games-on-whales/LXC2Docker/internal/lxc"
 	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
@@ -321,7 +322,7 @@ func (h *Handler) pruneImages(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /networks/prune
-// We only manage user-defined networks in the store; the built-in "gow" is
+// We only manage user-defined networks in the store; the built-in bridge is
 // treated as system and never pruned. A network is considered unused when no
 // container in the store attaches to it.
 func (h *Handler) pruneNetworks(w http.ResponseWriter, r *http.Request) {
@@ -343,7 +344,7 @@ func (h *Handler) pruneNetworks(w http.ResponseWriter, r *http.Request) {
 	}
 	deleted := []string{}
 	for _, n := range h.store.ListNetworks() {
-		if n.Name == "gow" {
+		if canonicalNetworkName(n.Name) == lxc.DefaultNetworkName {
 			continue
 		}
 		if _, used := inUse[n.ID]; used {

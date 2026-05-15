@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/games-on-whales/LXC2Docker/internal/lxc"
 	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 	"golang.org/x/sys/unix"
@@ -397,11 +398,11 @@ func (h *Handler) ensureVolume(name string) (*store.VolumeRecord, error) {
 
 func defaultContainerNetworks(rec *store.ContainerRecord) map[string]store.NetworkAttachment {
 	return map[string]store.NetworkAttachment{
-		"gow": {
-			NetworkID:  "gow",
+		lxc.DefaultNetworkName: {
+			NetworkID:  lxc.DefaultNetworkName,
 			IPAddress:  rec.IPAddress,
 			Gateway:    "10.100.0.1",
-			EndpointID: endpointID(rec.ID, "gow"),
+			EndpointID: endpointID(rec.ID, lxc.DefaultNetworkName),
 		},
 	}
 }
@@ -409,7 +410,7 @@ func defaultContainerNetworks(rec *store.ContainerRecord) map[string]store.Netwo
 func canonicalNetworkName(name string) string {
 	switch strings.TrimSpace(name) {
 	case "", "default", "bridge":
-		return "gow"
+		return lxc.DefaultNetworkName
 	default:
 		return name
 	}
@@ -425,8 +426,8 @@ func attachRequestedNetworks(st *store.Store, rec *store.ContainerRecord, cfg Ne
 	for name, ep := range cfg.EndpointsConfig {
 		networkName := canonicalNetworkName(name)
 		networkID := networkName
-		if networkName != "gow" {
-			n := st.GetNetwork(name)
+		if networkName != lxc.DefaultNetworkName {
+			n := st.GetNetwork(networkName)
 			if n == nil {
 				return fmt.Errorf("network %q not found", name)
 			}

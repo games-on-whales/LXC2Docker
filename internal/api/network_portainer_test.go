@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/games-on-whales/LXC2Docker/internal/lxc"
 	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 )
@@ -34,7 +35,7 @@ func TestUserDefinedNetworksPersistForPortainer(t *testing.T) {
 		"Attachable":true,
 		"EnableIPv6":true,
 		"Labels":{"com.docker.compose.project":"demo"},
-		"Options":{"com.docker.network.bridge.name":"gowbr1"},
+		"Options":{"com.docker.network.bridge.name":"vethbr1"},
 		"IPAM":{"Driver":"default","Config":[{"Subnet":"10.42.0.0/24","Gateway":"10.42.0.1"}]}
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/networks/create", bytes.NewReader(body))
@@ -227,11 +228,11 @@ func TestContainerNetworkViewsUsePersistedAttachments(t *testing.T) {
 		Name:      "web",
 		IPAddress: "10.100.0.10",
 		Networks: map[string]store.NetworkAttachment{
-			"gow": {
-				NetworkID:  "gow",
+			lxc.DefaultNetworkName: {
+				NetworkID:  lxc.DefaultNetworkName,
 				IPAddress:  "10.100.0.10",
 				Gateway:    "10.100.0.1",
-				EndpointID: "ep-gow",
+				EndpointID: "ep-" + lxc.DefaultNetworkName,
 			},
 			"frontend": {
 				NetworkID:  "net-frontend",
@@ -266,16 +267,17 @@ func TestContainerNetworkViewsUsePersistedAttachments(t *testing.T) {
 	}
 }
 
-func TestCanonicalNetworkNameMapsDockerBridgeAliasesToGow(t *testing.T) {
+func TestCanonicalNetworkNameMapsDockerBridgeAliasesToManagedBridge(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
 		in   string
 		want string
 	}{
-		{in: "", want: "gow"},
-		{in: "default", want: "gow"},
-		{in: "bridge", want: "gow"},
+		{in: "", want: lxc.DefaultNetworkName},
+		{in: "default", want: lxc.DefaultNetworkName},
+		{in: "bridge", want: lxc.DefaultNetworkName},
+		{in: lxc.DefaultNetworkName, want: lxc.DefaultNetworkName},
 		{in: "gow", want: "gow"},
 		{in: "frontend", want: "frontend"},
 	} {
@@ -285,7 +287,7 @@ func TestCanonicalNetworkNameMapsDockerBridgeAliasesToGow(t *testing.T) {
 	}
 }
 
-func TestBuiltInNetworkAliasesInspectAsGow(t *testing.T) {
+func TestBuiltInNetworkAliasesInspectAsManagedBridge(t *testing.T) {
 	t.Parallel()
 
 	st, err := store.NewAt(t.TempDir())
@@ -299,7 +301,7 @@ func TestBuiltInNetworkAliasesInspectAsGow(t *testing.T) {
 		events:     newEventBroker(),
 	}
 
-	for _, alias := range []string{"bridge", "default", "gow"} {
+	for _, alias := range []string{"bridge", "default", lxc.DefaultNetworkName} {
 		req := httptest.NewRequest(http.MethodGet, "/networks/"+alias, nil)
 		req = mux.SetURLVars(req, map[string]string{"id": alias})
 		rr := httptest.NewRecorder()
@@ -311,13 +313,36 @@ func TestBuiltInNetworkAliasesInspectAsGow(t *testing.T) {
 		if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 			t.Fatalf("decode inspect response for %q: %v", alias, err)
 		}
-		if got["Name"] != "gow" || got["Id"] != "gow" {
-			t.Fatalf("expected %q to resolve to gow network, got %#v", alias, got)
+		if got["Name"] != lxc.DefaultNetworkName || got["Id"] != lxc.DefaultNetworkName {
+			t.Fatalf("expected %q to resolve to managed bridge network, got %#v", alias, got)
 		}
 	}
 }
 
-func TestAttachRequestedNetworksMapsDockerBridgeAliasesToGow(t *testing.T) {
+func TestGowIsNotBuiltInNetworkAlias(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store init: %v", err)
+	}
+	h := &Handler{
+		store:      st,
+		attachPTYs: map[string]*os.File{},
+		execs:      newExecStore(),
+		events:     newEventBroker(),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/networks/gow", nil)
+	req = mux.SetURLVars(req, map[string]string{"id": "gow"})
+	rr := httptest.NewRecorder()
+	h.inspectNetwork(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected gow to be rejected as a built-in alias, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAttachRequestedNetworksMapsDockerBridgeAliasesToManagedBridge(t *testing.T) {
 	t.Parallel()
 
 	st, err := store.NewAt(t.TempDir())
@@ -341,18 +366,18 @@ func TestAttachRequestedNetworksMapsDockerBridgeAliasesToGow(t *testing.T) {
 		t.Fatalf("attachRequestedNetworks: %v", err)
 	}
 
-	gow, ok := rec.Networks["gow"]
+	managed, ok := rec.Networks[lxc.DefaultNetworkName]
 	if !ok {
-		t.Fatalf("expected gow attachment, got %#v", rec.Networks)
+		t.Fatalf("expected managed bridge attachment, got %#v", rec.Networks)
 	}
-	if gow.NetworkID != "gow" || gow.IPAddress != "10.100.0.10" {
-		t.Fatalf("expected gow attachment details to use default bridge values, got %#v", gow)
+	if managed.NetworkID != lxc.DefaultNetworkName || managed.IPAddress != "10.100.0.10" {
+		t.Fatalf("expected managed bridge attachment details to use default bridge values, got %#v", managed)
 	}
-	if len(gow.Aliases) != 1 || gow.Aliases[0] != "web" {
-		t.Fatalf("expected bridge alias attachment to preserve aliases, got %#v", gow)
+	if len(managed.Aliases) != 1 || managed.Aliases[0] != "web" {
+		t.Fatalf("expected bridge alias attachment to preserve aliases, got %#v", managed)
 	}
-	if gow.DriverOpts["mode"] != "bridge" {
-		t.Fatalf("expected latest gow attachment to preserve endpoint config, got %#v", gow)
+	if managed.DriverOpts["mode"] != "bridge" {
+		t.Fatalf("expected latest managed bridge attachment to preserve endpoint config, got %#v", managed)
 	}
 }
 

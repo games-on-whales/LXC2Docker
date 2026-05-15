@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/games-on-whales/LXC2Docker/internal/lxc"
 	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
 	"golang.org/x/sys/unix"
@@ -229,7 +230,7 @@ func detectCgroupDriver() string {
 
 // --- networks ---
 //
-// The daemon runs a single managed bridge (gow0) plus the usual Docker meta
+// The daemon runs a single managed bridge plus the usual Docker meta
 // networks (host/none). Portainer's Networks tab lists these; its container
 // create form reads Driver/Scope/IPAM to populate fields. We return a
 // realistic snapshot rather than an empty array so the UI doesn't show the
@@ -330,7 +331,7 @@ func (h *Handler) inspectNetwork(w http.ResponseWriter, r *http.Request) {
 }
 
 // networksWithContainers returns the default network snapshot with the
-// gow bridge's Containers map populated from the store. Portainer's
+// managed bridge's Containers map populated from the store. Portainer's
 // Networks tab renders this as "containers attached" with links to each.
 func (h *Handler) networksWithContainers() []map[string]any {
 	nets := defaultNetworks()
@@ -502,7 +503,7 @@ func (h *Handler) disconnectNetwork(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "network not found")
 		return
 	}
-	if name == "gow" {
+	if name == lxc.DefaultNetworkName {
 		errResponse(w, http.StatusConflict, "primary network cannot be disconnected")
 		return
 	}
@@ -594,7 +595,7 @@ func (h *Handler) resolveNetwork(idOrName string) (name, id, gateway string, ok 
 
 func isBuiltInNetwork(name string) bool {
 	switch canonicalNetworkName(name) {
-	case "gow", "host", "none", "bridge":
+	case lxc.DefaultNetworkName, "host", "none", "bridge":
 		return true
 	}
 	return false
@@ -796,14 +797,14 @@ func (h *Handler) volumeInUse(name string) bool {
 const apiVersion = "1.43"
 
 // defaultNetworks returns the static network snapshot reported to Docker
-// clients. The daemon's real bridge is gow0 (see internal/lxc/network.go);
+// clients. The daemon's real bridge is managed by internal/lxc/network.go;
 // host/none are synthetic entries that match Docker's built-ins so
 // NetworkMode="host" and similar references resolve without errors.
 func defaultNetworks() []map[string]any {
 	return []map[string]any{
 		{
-			"Name":       "gow",
-			"Id":         "gow",
+			"Name":       lxc.DefaultNetworkName,
+			"Id":         lxc.DefaultNetworkName,
 			"Driver":     "bridge",
 			"Scope":      "local",
 			"EnableIPv6": false,
@@ -816,7 +817,7 @@ func defaultNetworks() []map[string]any {
 					{"Subnet": "10.100.0.0/24", "Gateway": "10.100.0.1"},
 				},
 			},
-			"Options":    map[string]string{"com.docker.network.bridge.name": "gow0"},
+			"Options":    map[string]string{"com.docker.network.bridge.name": lxc.BridgeName},
 			"Labels":     map[string]string{},
 			"Containers": map[string]any{},
 		},
