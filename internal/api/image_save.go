@@ -1,3 +1,5 @@
+//go:build legacy_api_extras
+
 package api
 
 import (

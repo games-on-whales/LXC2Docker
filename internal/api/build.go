@@ -1,3 +1,5 @@
+//go:build legacy_api_extras
+
 package api
 
 import (
@@ -788,6 +790,7 @@ func buildContainerConfigFromState(state buildState) lxc.ContainerConfig {
 		Env:        append([]string{}, state.env...),
 		Entrypoint: append([]string{}, state.entrypoint...),
 		Cmd:        append([]string{}, state.cmd...),
+		User:       state.user,
 		WorkingDir: state.workdir,
 	}
 }

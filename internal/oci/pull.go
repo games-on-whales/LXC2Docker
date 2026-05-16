@@ -22,10 +22,20 @@ type ImageConfig struct {
 	Entrypoint []string
 	Cmd        []string
 	Env        []string
+	User       string
 	WorkingDir string
 	Ports      []string          // e.g. ["80/tcp", "443/tcp"]
 	Labels     map[string]string // OCI image labels (rendered in Portainer's image detail)
 	Digest     string            // manifest digest, "sha256:..." (empty if unknown)
+}
+
+// ImageHealthcheck holds Docker/OCI image healthcheck metadata.
+type ImageHealthcheck struct {
+	Test        []string
+	Interval    int64
+	Timeout     int64
+	StartPeriod int64
+	Retries     int
 }
 
 // ProgressEvent represents a single line of pull progress emitted to the
@@ -359,6 +369,7 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 			Entrypoint   []string            `json:"Entrypoint"`
 			Cmd          []string            `json:"Cmd"`
 			Env          []string            `json:"Env"`
+			User         string              `json:"User"`
 			WorkingDir   string              `json:"WorkingDir"`
 			ExposedPorts map[string]struct{} `json:"ExposedPorts"`
 			Labels       map[string]string   `json:"Labels"`
@@ -377,6 +388,7 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 		Entrypoint: imgCfg.Config.Entrypoint,
 		Cmd:        imgCfg.Config.Cmd,
 		Env:        imgCfg.Config.Env,
+		User:       imgCfg.Config.User,
 		WorkingDir: imgCfg.Config.WorkingDir,
 		Ports:      ports,
 		Labels:     imgCfg.Config.Labels,

@@ -38,6 +38,7 @@ type ContainerConfig struct {
 	Ulimits           []Ulimit     // Docker-style ulimits (lxc.prlimit.<name>)
 	ShmSize           int64        // /dev/shm tmpfs size in bytes (0 = kernel default)
 	BlkioWeight       uint16       // Block I/O weight (10-1000, mapped to io.weight)
+	User              string       // Docker/OCI user spec; maps to lxc.init.uid/gid
 	WorkingDir        string       // container cwd; maps to lxc.init.cwd
 	// Security. Privileged grants full capabilities + unrestricted device
 	// access; equivalent to Docker's --privileged. CapAdd/CapDrop extend
@@ -187,15 +188,6 @@ func rewriteConfig(path string, cfg *ContainerConfig, ip, containerName string, 
 		return fmt.Errorf("scan config: %w", err)
 	}
 
-	items := append([]configItem{
-		{"lxc.apparmor.profile", "unconfined"},
-		// Override common.conf's cgroup:mixed which fails on Proxmox cgroup v2.
-		// An empty value clears the inherited list; then we set what we need.
-		{"lxc.mount.auto", ""},
-		{"lxc.mount.auto", "proc:mixed sys:mixed"},
-	}, buildItems(cfg, ip)...)
-	// Note: buildItems may populate cfg.SocketLinks (for socket bind mounts).
-
 	// Resolve mount entry destinations against the container's rootfs so that
 	// any symlinks (e.g. /var/run → /run) are followed. LXC rejects mount
 	// entries whose destination paths traverse symlinks in the rootfs.
@@ -217,6 +209,18 @@ func rewriteConfig(path string, cfg *ContainerConfig, ip, containerName string, 
 			}
 		}
 	}
+	managed, err := buildItems(cfg, ip, rootfs)
+	if err != nil {
+		return err
+	}
+	items := append([]configItem{
+		{"lxc.apparmor.profile", "unconfined"},
+		// Override common.conf's cgroup:mixed which fails on Proxmox cgroup v2.
+		// An empty value clears the inherited list; then we set what we need.
+		{"lxc.mount.auto", ""},
+		{"lxc.mount.auto", "proc:mixed sys:mixed"},
+	}, managed...)
+	// Note: buildItems may populate cfg.SocketLinks (for socket bind mounts).
 	for i, item := range items {
 		if item.key == "lxc.mount.entry" {
 			items[i].value = resolveMountDest(rootfs, item.value)
@@ -303,7 +307,7 @@ func resolveInRootfs(rootfs, containerPath string) (string, error) {
 	return current, nil
 }
 
-func buildItems(cfg *ContainerConfig, ip string) []configItem {
+func buildItems(cfg *ContainerConfig, ip, rootfs string) ([]configItem, error) {
 	var items []configItem
 
 	// Docker-compatible default mounts: /dev/shm (shared memory) is required
@@ -358,6 +362,11 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	if cfg.WorkingDir != "" {
 		items = append(items, configItem{"lxc.init.cwd", cfg.WorkingDir})
 	}
+	userItems, err := userConfigItems(rootfs, cfg.User)
+	if err != nil {
+		return nil, err
+	}
+	items = append(items, userItems...)
 
 	// Bind mounts
 	for _, m := range cfg.Mounts {
@@ -527,7 +536,7 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 		items = append(items, configItem{"lxc.console.logfile", cfg.LogFile})
 	}
 
-	return items
+	return items, nil
 }
 
 // capabilityItems translates Docker's Privileged / CapAdd / CapDrop into LXC
@@ -668,6 +677,103 @@ func tmpfsItems(cfg *ContainerConfig) []configItem {
 		items = append(items, configItem{"lxc.mount.entry", entry})
 	}
 	return items
+}
+
+func userConfigItems(rootfs, spec string) ([]configItem, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil, nil
+	}
+	userPart, groupPart, hasGroup := strings.Cut(spec, ":")
+	if userPart == "" {
+		return nil, fmt.Errorf("resolve user %q: empty user", spec)
+	}
+	uid, gid, err := resolveUserSpec(rootfs, userPart)
+	if err != nil {
+		return nil, fmt.Errorf("resolve user %q: %w", spec, err)
+	}
+	if hasGroup && groupPart != "" {
+		gid, err = resolveGroupSpec(rootfs, groupPart)
+		if err != nil {
+			return nil, fmt.Errorf("resolve user %q: %w", spec, err)
+		}
+	}
+	return []configItem{
+		{"lxc.init.uid", uid},
+		{"lxc.init.gid", gid},
+	}, nil
+}
+
+func resolveUserSpec(rootfs, user string) (uid, gid string, err error) {
+	if isNumericID(user) {
+		if _, foundGID, ok := passwdEntryByUID(rootfs, user); ok {
+			return user, foundGID, nil
+		}
+		return user, "0", nil
+	}
+	foundUID, foundGID, ok := passwdEntryByName(rootfs, user)
+	if !ok {
+		return "", "", fmt.Errorf("user %q not found in /etc/passwd", user)
+	}
+	return foundUID, foundGID, nil
+}
+
+func resolveGroupSpec(rootfs, group string) (string, error) {
+	if isNumericID(group) {
+		return group, nil
+	}
+	data, err := os.ReadFile(filepath.Join(rootfs, "etc", "group"))
+	if err != nil {
+		return "", fmt.Errorf("read /etc/group: %w", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Split(line, ":")
+		if len(parts) >= 3 && parts[0] == group {
+			return parts[2], nil
+		}
+	}
+	return "", fmt.Errorf("group %q not found in /etc/group", group)
+}
+
+func passwdEntryByName(rootfs, name string) (uid, gid string, ok bool) {
+	return passwdEntry(rootfs, func(parts []string) bool { return parts[0] == name })
+}
+
+func passwdEntryByUID(rootfs, uid string) (name, gid string, ok bool) {
+	foundName, foundGID, ok := passwdEntry(rootfs, func(parts []string) bool { return parts[2] == uid })
+	return foundName, foundGID, ok
+}
+
+func passwdEntry(rootfs string, match func([]string) bool) (first, gid string, ok bool) {
+	data, err := os.ReadFile(filepath.Join(rootfs, "etc", "passwd"))
+	if err != nil {
+		return "", "", false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Split(line, ":")
+		if len(parts) >= 4 && match(parts) {
+			return parts[2], parts[3], true
+		}
+	}
+	return "", "", false
+}
+
+func isNumericID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // combinedCmd merges entrypoint and cmd the same way Docker does.
@@ -849,7 +955,10 @@ func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg *Cont
 	lines = append(lines, "tags: "+ManagedTag)
 
 	// Raw lxc.* pass-through items (including network config).
-	items := buildPVEItems(cfg, ip)
+	items, err := buildPVEItems(cfg, ip, rootfsPath)
+	if err != nil {
+		return err
+	}
 
 	// Resolve mount entry destinations against the container rootfs so
 	// symlinks (e.g. /var/run → /run) are followed. LXC rejects mount
@@ -871,7 +980,7 @@ func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg *Cont
 // Uses raw lxc.* directives for all settings including networking, since
 // Proxmox-native net0: doesn't reliably configure interfaces in unmanaged
 // OS-type containers.
-func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
+func buildPVEItems(cfg *ContainerConfig, ip, rootfs string) ([]configItem, error) {
 	var items []configItem
 
 	items = append(items, configItem{"lxc.apparmor.profile", "unconfined"})
@@ -919,6 +1028,11 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	if cfg.WorkingDir != "" {
 		items = append(items, configItem{"lxc.init.cwd", cfg.WorkingDir})
 	}
+	userItems, err := userConfigItems(rootfs, cfg.User)
+	if err != nil {
+		return nil, err
+	}
+	items = append(items, userItems...)
 
 	// Bind mounts — use raw lxc.mount.entry (works in Proxmox configs).
 	for _, m := range cfg.Mounts {
@@ -1040,7 +1154,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 		items = append(items, configItem{"lxc.console.logfile", cfg.LogFile})
 	}
 
-	return items
+	return items, nil
 }
 
 // LogFilePath returns the canonical console log file path for a container.

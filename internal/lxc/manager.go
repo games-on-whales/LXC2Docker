@@ -21,12 +21,23 @@ import (
 	liblxc "github.com/lxc/go-lxc"
 )
 
+// BridgeSpec describes a single LAN bridge known to the daemon.
+type BridgeSpec struct {
+	Name    string // bridge name (e.g. "vmbr0")
+	Bridge  string // physical bridge name (e.g. "vmbr0"); empty = disabled
+	Prefix  string // IP prefix (e.g. "192.168.1"); VMID becomes last octet
+	Gateway string // LAN gateway (e.g. "192.168.1.1")
+	Subnet  int    // prefix length (e.g. 23 for /23)
+}
+
 // LANConfig holds daemon-level LAN bridge settings for dual-NIC containers.
 type LANConfig struct {
 	Bridge  string // physical bridge name (e.g. "vmbr0"); empty = disabled
 	Prefix  string // IP prefix (e.g. "192.168.1"); VMID becomes last octet
 	Gateway string // LAN gateway (e.g. "192.168.1.1")
 	Subnet  int    // prefix length (e.g. 23 for /23)
+	Bridges map[string]BridgeSpec
+	Default string
 }
 
 // Manager owns all LXC operations on behalf of the daemon.
@@ -462,6 +473,9 @@ func (m *Manager) gc() {
 			if _, ok := rec.Labels["com.docker.compose.service"]; ok {
 				continue
 			}
+			if rec.Labels["io.smoothnas.managed"] == "true" {
+				continue
+			}
 		}
 
 		state, _ := m.State(rec.ID)
@@ -545,7 +559,7 @@ func (m *Manager) PullImage(ref, arch string, progress func(string)) error {
 // opts.OnEvent. Distro and app pulls ignore credentials — they're fetched
 // from images.linuxcontainers.org which is public.
 func (m *Manager) PullImageWith(ref, arch string, opts PullOpts) error {
-	resolved, err := image.Resolve(ref, arch)
+	resolved, err := image.Resolve(ref, arch, m.UsePVE())
 	if err != nil {
 		return err
 	}
@@ -613,7 +627,7 @@ func (m *Manager) pullDistro(r *image.ResolvedImage, progress func(string)) erro
 func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 	// 1. Ensure the base distro template exists.
 	progress(fmt.Sprintf("Pulling base image %s for %s", r.BaseRef, r.Ref))
-	baseResolved, err := image.Resolve(r.BaseRef, r.Arch)
+	baseResolved, err := image.Resolve(r.BaseRef, r.Arch, false)
 	if err != nil {
 		return err
 	}
@@ -647,7 +661,7 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 	}
 	defer m.store.FreeIP(ip) // Template doesn't need a permanent IP.
 
-	if err := rewriteConfig(templateCfgPath, &templateCfg, ip, r.TemplateContainerName); err != nil {
+	if err := rewriteConfig(templateCfgPath, &templateCfg, ip, r.TemplateContainerName, false); err != nil {
 		return fmt.Errorf("manager: rewrite app template config: %w", err)
 	}
 	templateRootfs := filepath.Join(m.lxcPath, r.TemplateContainerName, "rootfs")
@@ -798,7 +812,7 @@ func (m *Manager) pullOCI(r *image.ResolvedImage, opts PullOpts) error {
 lxc.arch = linux64
 lxc.rootfs.path = dir:%s
 lxc.uts.name = %s
-`, templateRootfs, r.TemplateContainerName)
+`, templateRootfs, sanitizeHostname("tmpl-"+oci.SafeDirName(r.Ref)))
 
 		configPath := filepath.Join(templateDir, "config")
 		if err := os.WriteFile(configPath, []byte(minimalConfig), 0o644); err != nil {
@@ -820,6 +834,7 @@ lxc.uts.name = %s
 			OCIEntrypoint: cfg.Entrypoint,
 			OCICmd:        cfg.Cmd,
 			OCIEnv:        cfg.Env,
+			OCIUser:       cfg.User,
 			OCIWorkingDir: cfg.WorkingDir,
 			OCIPorts:      cfg.Ports,
 			OCILabels:     cfg.Labels,
@@ -839,6 +854,7 @@ lxc.uts.name = %s
 		OCIEntrypoint: cfg.Entrypoint,
 		OCICmd:        cfg.Cmd,
 		OCIEnv:        cfg.Env,
+		OCIUser:       cfg.User,
 		OCIWorkingDir: cfg.WorkingDir,
 		OCIPorts:      cfg.Ports,
 		OCILabels:     cfg.Labels,
@@ -979,6 +995,7 @@ lxc.uts.name = %s
 	// Allocate IP for bridge networking.
 	var ip string
 	if cfg.NetworkMode != "host" {
+		var err error
 		ip, err = m.store.AllocateIP()
 		if err != nil {
 			exec.Command("zfs", "destroy", cloneDataset).Run()
@@ -995,7 +1012,7 @@ lxc.uts.name = %s
 
 	// Rewrite config with full daemon-managed settings.
 	// Note: rewriteConfig may populate cfg.SocketLinks for socket bind mounts.
-	if err := rewriteConfig(configPath, &cfg, ip, id); err != nil {
+	if err := rewriteConfig(configPath, &cfg, ip, id, true); err != nil {
 		return fmt.Errorf("manager: rewrite config: %w", err)
 	}
 
@@ -1010,22 +1027,29 @@ lxc.uts.name = %s
 	return nil
 }
 
-// createLegacyContainer clones via lxc-copy (no Proxmox, no ZFS).
+// createLegacyContainer clones a template into a direct LXC container.
 func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
-	log.Printf("CreateContainer[legacy]: cloning %s → %s", imgRec.TemplateName, id)
-	out, err := exec.Command("lxc-copy",
-		"-n", imgRec.TemplateName,
-		"-N", id,
-		"--lxcpath", m.lxcPath,
-		"--newpath", m.lxcPath,
-	).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("manager: clone %s → %s: %s: %w", imgRec.TemplateName, id, out, err)
+	log.Printf("CreateContainer[legacy]: cloning %s -> %s", imgRec.TemplateName, id)
+	if strings.HasPrefix(imgRec.TemplateName, "__template_oci_") {
+		if err := m.cloneLegacyOCITemplate(imgRec.TemplateName, id); err != nil {
+			return err
+		}
+	} else {
+		out, err := exec.Command("lxc-copy",
+			"-n", imgRec.TemplateName,
+			"-N", id,
+			"--lxcpath", m.lxcPath,
+			"--newpath", m.lxcPath,
+		).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("manager: clone %s -> %s: %s: %w", imgRec.TemplateName, id, out, err)
+		}
 	}
 
 	// Allocate IP for bridge networking.
 	var ip string
 	if cfg.NetworkMode != "host" {
+		var err error
 		ip, err = m.store.AllocateIP()
 		if err != nil {
 			m.destroyOrphan(id)
@@ -1041,7 +1065,7 @@ func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cf
 
 	// Rewrite the cloned config.
 	configPath := filepath.Join(m.lxcPath, id, "config")
-	if err := rewriteConfig(configPath, &cfg, ip, id); err != nil {
+	if err := rewriteConfig(configPath, &cfg, ip, id, true); err != nil {
 		return fmt.Errorf("manager: rewrite config: %w", err)
 	}
 
@@ -1053,6 +1077,30 @@ func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cf
 	if storeRec := m.store.GetContainer(id); storeRec != nil {
 		storeRec.IPAddress = ip
 		return m.store.AddContainer(storeRec)
+	}
+	return nil
+}
+
+func (m *Manager) cloneLegacyOCITemplate(templateName, id string) error {
+	srcRootfs := filepath.Join(m.lxcPath, templateName, "rootfs")
+	dstDir := filepath.Join(m.lxcPath, id)
+	dstRootfs := filepath.Join(dstDir, "rootfs")
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		return fmt.Errorf("manager: mkdir container dir: %w", err)
+	}
+	out, err := exec.Command("cp", "-a", srcRootfs, dstRootfs).CombinedOutput()
+	if err != nil {
+		os.RemoveAll(dstDir)
+		return fmt.Errorf("manager: copy OCI template %s -> %s: %s: %w", templateName, id, out, err)
+	}
+	minimalConfig := fmt.Sprintf(`lxc.include = /usr/share/lxc/config/common.conf
+lxc.arch = linux64
+lxc.rootfs.path = dir:%s
+lxc.uts.name = %s
+`, dstRootfs, sanitizeHostname(id))
+	if err := os.WriteFile(filepath.Join(dstDir, "config"), []byte(minimalConfig), 0o644); err != nil {
+		os.RemoveAll(dstDir)
+		return fmt.Errorf("manager: write cloned OCI config: %w", err)
 	}
 	return nil
 }

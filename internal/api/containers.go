@@ -111,7 +111,8 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	entrypoint := req.Entrypoint
 	cmd := req.Cmd
 	env := req.Env
-	if imgRec := h.store.GetImage(normalizeImageRef(req.Image)); imgRec != nil {
+	imgRec := h.store.GetImage(normalizeImageRef(req.Image))
+	if imgRec != nil {
 		// OCI image defaults.
 		if len(entrypoint) == 0 && len(imgRec.OCIEntrypoint) > 0 {
 			entrypoint = imgRec.OCIEntrypoint
@@ -126,7 +127,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		// App registry defaults (if no OCI config and no user-provided cmd).
 		if len(entrypoint) == 0 && len(cmd) == 0 {
-			if resolved, err := image.Resolve(imgRec.Ref, "amd64"); err == nil && resolved.App != nil && resolved.App.DefaultCmd != "" {
+			if resolved, err := image.Resolve(imgRec.Ref, "amd64", false); err == nil && resolved.App != nil && resolved.App.DefaultCmd != "" {
 				cmd = []string{"/bin/sh", "-c", resolved.App.DefaultCmd}
 			}
 		}
@@ -135,15 +136,20 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	// Working directory: request overrides image default.
 	workingDir := req.WorkingDir
 	if workingDir == "" {
-		if imgRec := h.store.GetImage(normalizeImageRef(req.Image)); imgRec != nil {
+		if imgRec != nil {
 			workingDir = imgRec.OCIWorkingDir
 		}
+	}
+	user := req.User
+	if user == "" && imgRec != nil {
+		user = imgRec.OCIUser
 	}
 
 	cfg := lxc.ContainerConfig{
 		Entrypoint:        entrypoint,
 		Cmd:               cmd,
 		Env:               env,
+		User:              user,
 		WorkingDir:        workingDir,
 		DeviceCgroupRules: req.HostConfig.DeviceCgroupRules,
 		NetworkMode:       req.HostConfig.NetworkMode,
@@ -295,7 +301,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Labels:          req.Labels,
 		Hostname:        req.Hostname,
 		Domainname:      req.Domainname,
-		User:            req.User,
+		User:            user,
 		Tty:             req.Tty,
 		OpenStdin:       req.OpenStdin,
 		WorkingDir:      workingDir,
@@ -532,18 +538,18 @@ func networkModeFor(rec *store.ContainerRecord) string {
 	if rec.Labels["gow.lan"] == "true" {
 		return "lan"
 	}
-	return "gow"
+	return lxc.DefaultNetworkName
 }
 
 // networkSettingsFor builds the per-network endpoint map for a container.
-// One entry per attached network ("gow" is the daemon's managed bridge).
+// One entry per attached network; the default entry is the daemon's managed bridge.
 func networkSettingsFor(rec *store.ContainerRecord) map[string]EndpointSettings {
 	if rec.IPAddress == "" {
 		return map[string]EndpointSettings{}
 	}
 	return map[string]EndpointSettings{
-		"gow": {
-			NetworkID:   "gow",
+		lxc.DefaultNetworkName: {
+			NetworkID:   lxc.DefaultNetworkName,
 			EndpointID:  rec.ID,
 			Gateway:     lxc.BridgeGW,
 			IPAddress:   rec.IPAddress,
@@ -1897,7 +1903,7 @@ func containerExposes(exposed map[string]struct{}, wants []string) bool {
 }
 
 func containerOnNetwork(rec *store.ContainerRecord, names []string) bool {
-	attached := map[string]bool{networkModeFor(rec): true, "gow": true}
+	attached := map[string]bool{networkModeFor(rec): true, lxc.DefaultNetworkName: true, "gow": true}
 	for _, want := range names {
 		if attached[want] {
 			return true

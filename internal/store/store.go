@@ -109,25 +109,41 @@ type MountSpec struct {
 // ImageRecord holds metadata for a pulled image (backed by a Proxmox CT
 // template on ZFS, or a legacy LXC template container).
 type ImageRecord struct {
-	ID           string    `json:"id"`            // e.g. "ubuntu_22.04"
-	Ref          string    `json:"ref"`           // original "ubuntu:22.04"
-	Distro       string    `json:"distro"`        // "ubuntu"
-	Release      string    `json:"release"`       // "jammy"
-	Arch         string    `json:"arch"`          // "amd64"
-	TemplateName string    `json:"template_name"` // LXC container used as clone source (legacy)
-	TemplateVMID int       `json:"template_vmid"` // Proxmox CT VMID of the template (0 = legacy)
-	Created      time.Time `json:"created"`
+	ID           string `json:"id"`            // e.g. "ubuntu_22.04"
+	Ref          string `json:"ref"`           // original "ubuntu:22.04"
+	Distro       string `json:"distro"`        // "ubuntu"
+	Release      string `json:"release"`       // "jammy"
+	Arch         string `json:"arch"`          // "amd64"
+	TemplateName string `json:"template_name"` // LXC container used as clone source (legacy)
+	TemplateVMID int    `json:"template_vmid"` // Proxmox CT VMID of the template (0 = legacy)
+	// TemplateDataset is the ZFS dataset backing a PVE-mode template.
+	TemplateDataset string    `json:"template_dataset,omitempty"`
+	Created         time.Time `json:"created"`
 	// OCI image metadata (populated only for OCI-pulled images).
-	OCIEntrypoint []string          `json:"oci_entrypoint,omitempty"`
-	OCICmd        []string          `json:"oci_cmd,omitempty"`
-	OCIEnv        []string          `json:"oci_env,omitempty"`
-	OCIWorkingDir string            `json:"oci_working_dir,omitempty"`
-	OCIPorts      []string          `json:"oci_ports,omitempty"`
-	OCILabels     map[string]string `json:"oci_labels,omitempty"`
+	OCIEntrypoint  []string           `json:"oci_entrypoint,omitempty"`
+	OCICmd         []string           `json:"oci_cmd,omitempty"`
+	OCIEnv         []string           `json:"oci_env,omitempty"`
+	OCIUser        string             `json:"oci_user,omitempty"`
+	OCIWorkingDir  string             `json:"oci_working_dir,omitempty"`
+	OCIPorts       []string           `json:"oci_ports,omitempty"`
+	OCILabels      map[string]string  `json:"oci_labels,omitempty"`
+	OCIStopSignal  string             `json:"oci_stop_signal,omitempty"`
+	OCIHealthcheck *HealthcheckConfig `json:"oci_healthcheck,omitempty"`
+	OCIVolumes     []string           `json:"oci_volumes,omitempty"`
+	OCIShell       []string           `json:"oci_shell,omitempty"`
 	// RepoDigest holds the image manifest digest ("sha256:...") when
 	// known. Populated by skopeo inspect after pull. Used to surface a
 	// canonical reference on the image detail page.
 	RepoDigest string `json:"repo_digest,omitempty"`
+}
+
+// HealthcheckConfig mirrors Docker's image/container healthcheck metadata.
+type HealthcheckConfig struct {
+	Test        []string `json:"test,omitempty"`
+	Interval    int64    `json:"interval,omitempty"`
+	Timeout     int64    `json:"timeout,omitempty"`
+	StartPeriod int64    `json:"start_period,omitempty"`
+	Retries     int      `json:"retries,omitempty"`
 }
 
 // VolumeRecord is a Docker-style named volume backed by a plain directory on

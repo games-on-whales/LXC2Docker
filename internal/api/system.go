@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
 	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
 	"github.com/gorilla/mux"
 	"golang.org/x/sys/unix"
@@ -397,7 +398,7 @@ func (h *Handler) knownNetwork(id string) bool {
 func (h *Handler) removeNetwork(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	switch id {
-	case "gow", "host", "none", "bridge":
+	case lxc.DefaultNetworkName, "gow", "host", "none", "bridge":
 		errResponse(w, http.StatusForbidden, id+" is a pre-defined network and cannot be removed")
 		return
 	}
@@ -783,14 +784,14 @@ func (h *Handler) auth(w http.ResponseWriter, r *http.Request) {
 const apiVersion = "1.43"
 
 // defaultNetworks returns the static network snapshot reported to Docker
-// clients. The daemon's real bridge is gow0 (see internal/lxc/network.go);
+// clients. The daemon's real bridge is managed by internal/lxc/network.go;
 // host/none are synthetic entries that match Docker's built-ins so
 // NetworkMode="host" and similar references resolve without errors.
 func defaultNetworks() []map[string]any {
 	return []map[string]any{
 		{
-			"Name":       "gow",
-			"Id":         "gow",
+			"Name":       lxc.DefaultNetworkName,
+			"Id":         lxc.DefaultNetworkName,
 			"Driver":     "bridge",
 			"Scope":      "local",
 			"EnableIPv6": false,
@@ -803,7 +804,7 @@ func defaultNetworks() []map[string]any {
 					{"Subnet": "10.100.0.0/24", "Gateway": "10.100.0.1"},
 				},
 			},
-			"Options":    map[string]string{"com.docker.network.bridge.name": "gow0"},
+			"Options":    map[string]string{"com.docker.network.bridge.name": lxc.BridgeName},
 			"Labels":     map[string]string{},
 			"Containers": map[string]any{},
 		},

@@ -144,6 +144,10 @@ func buildLANConfig(specs []string, legacyName, legacyPrefix, legacyGateway stri
 		cfg.Bridges[spec.Name] = spec
 		if cfg.Default == "" {
 			cfg.Default = spec.Name
+			cfg.Bridge = spec.Name
+			cfg.Prefix = spec.Prefix
+			cfg.Gateway = spec.Gateway
+			cfg.Subnet = spec.Subnet
 		}
 	}
 	if legacyName != "" {
@@ -156,6 +160,10 @@ func buildLANConfig(specs []string, legacyName, legacyPrefix, legacyGateway stri
 			}
 			if cfg.Default == "" {
 				cfg.Default = legacyName
+				cfg.Bridge = legacyName
+				cfg.Prefix = legacyPrefix
+				cfg.Gateway = legacyGateway
+				cfg.Subnet = legacySubnet
 			}
 		}
 	}
@@ -184,6 +192,7 @@ func parseBridgeSpec(raw string) (lxc.BridgeSpec, error) {
 	}
 	return lxc.BridgeSpec{
 		Name:    name,
+		Bridge:  name,
 		Prefix:  prefSub[0],
 		Gateway: netGw[1],
 		Subnet:  subnet,

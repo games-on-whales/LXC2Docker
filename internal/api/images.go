@@ -301,6 +301,7 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 		Env:        rec.OCIEnv,
 		Cmd:        rec.OCICmd,
 		Entrypoint: rec.OCIEntrypoint,
+		User:       rec.OCIUser,
 		WorkingDir: rec.OCIWorkingDir,
 		Labels:     labels,
 	}
