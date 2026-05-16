@@ -3,14 +3,17 @@ package lxc
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
 const (
-	DefaultNetworkName = "veth0"
-	BridgeName         = "veth0"
-	NATTableName       = "veth_nat"
+	DefaultNetworkName = "gow"
+	BridgeName         = "br-gow0"
+	legacyBridgeName   = "veth0"
+	NATTableName       = "gow_nat"
 	BridgeCIDR         = "10.100.0.1/24"
 	BridgeGW           = "10.100.0.1"
 	SubnetMask         = "255.255.255.0"
@@ -19,18 +22,29 @@ const (
 // EnsureBridge creates the managed bridge and assigns it the gateway IP if it
 // does not already exist. Idempotent.
 func EnsureBridge() error {
+	if _, err := net.InterfaceByName(BridgeName); err != nil {
+		if err := migrateLegacyBridge(); err != nil {
+			return err
+		}
+	}
 	iface, err := net.InterfaceByName(BridgeName)
 	if err != nil || iface == nil {
-		// Bridge doesn't exist — create it.
-		cmds := [][]string{
-			{"ip", "link", "add", "name", BridgeName, "type", "bridge"},
-			{"ip", "addr", "add", BridgeCIDR, "dev", BridgeName},
-			{"ip", "link", "set", BridgeName, "up"},
+		if out, err := exec.Command("ip", "link", "add", "name", BridgeName, "type", "bridge").CombinedOutput(); err != nil {
+			return fmt.Errorf("network: create bridge %s: %s: %w", BridgeName, out, err)
 		}
-		for _, args := range cmds {
-			if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
-				return fmt.Errorf("network: %v: %s: %w", args, out, err)
-			}
+	} else if !isLinuxBridge(BridgeName) {
+		return fmt.Errorf("network: interface %s already exists but is not a bridge", BridgeName)
+	}
+	// Keep the managed bridge independent even if a broad networkd match
+	// briefly enslaved it to an appliance bond before this daemon started.
+	_ = exec.Command("ip", "link", "set", "dev", BridgeName, "nomaster").Run()
+	cmds := [][]string{
+		{"ip", "addr", "replace", BridgeCIDR, "dev", BridgeName},
+		{"ip", "link", "set", BridgeName, "up"},
+	}
+	for _, args := range cmds {
+		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+			return fmt.Errorf("network: %v: %s: %w", args, out, err)
 		}
 	}
 
@@ -66,6 +80,33 @@ table ip %s {
 	}
 
 	return nil
+}
+
+func migrateLegacyBridge() error {
+	if legacyBridgeName == BridgeName {
+		return nil
+	}
+	if _, err := net.InterfaceByName(legacyBridgeName); err != nil {
+		return nil
+	}
+	if !isLinuxBridge(legacyBridgeName) {
+		return nil
+	}
+	_ = exec.Command("ip", "link", "set", "dev", legacyBridgeName, "nomaster").Run()
+	if out, err := exec.Command("ip", "link", "set", "dev", legacyBridgeName, "down").CombinedOutput(); err != nil {
+		return fmt.Errorf("network: bring legacy bridge %s down for rename: %s: %w", legacyBridgeName, out, err)
+	}
+	if out, err := exec.Command("ip", "link", "set", "dev", legacyBridgeName, "name", BridgeName).CombinedOutput(); err != nil {
+		return fmt.Errorf("network: rename legacy bridge %s to %s: %s: %w", legacyBridgeName, BridgeName, out, err)
+	}
+	return nil
+}
+
+func isLinuxBridge(name string) bool {
+	if _, err := os.Stat(filepath.Join("/sys/class/net", name, "bridge")); err == nil {
+		return true
+	}
+	return false
 }
 
 // TeardownBridge leaves the managed bridge and nftables table in place.
@@ -147,7 +188,7 @@ func NetworkConfig(ip string) []configItem {
 
 // DualNICConfig returns lxc.conf lines for a dual-NIC container: the LAN
 // bridge as net.0 (primary — so mDNS and other services advertise the LAN IP)
-// and the internal gow0 bridge as net.1 (for inter-container traffic).
+// and the internal managed bridge as net.1 (for inter-container traffic).
 func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem {
 	// net.0 = LAN (primary): routable IP on the physical network.
 	items := []configItem{
@@ -159,7 +200,7 @@ func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem
 	if lanGateway != "" {
 		items = append(items, configItem{"lxc.net.0.ipv4.gateway", lanGateway})
 	}
-	// net.1 = internal gow0 bridge (no gateway — connected route only).
+	// net.1 = internal managed bridge (no gateway — connected route only).
 	items = append(items,
 		configItem{"lxc.net.1.type", "veth"},
 		configItem{"lxc.net.1.link", BridgeName},

@@ -1768,6 +1768,9 @@ func normalizeHostConfig(hc *HostConfig) {
 	if hc.DeviceCgroupRules == nil {
 		hc.DeviceCgroupRules = []string{}
 	}
+	if hc.DeviceRequests == nil {
+		hc.DeviceRequests = []DeviceRequest{}
+	}
 	if hc.CapAdd == nil {
 		hc.CapAdd = []string{}
 	}
@@ -1903,7 +1906,7 @@ func containerExposes(exposed map[string]struct{}, wants []string) bool {
 }
 
 func containerOnNetwork(rec *store.ContainerRecord, names []string) bool {
-	attached := map[string]bool{networkModeFor(rec): true, lxc.DefaultNetworkName: true, "gow": true}
+	attached := map[string]bool{networkModeFor(rec): true, lxc.DefaultNetworkName: true}
 	for _, want := range names {
 		if attached[want] {
 			return true

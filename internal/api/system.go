@@ -221,7 +221,7 @@ func detectCgroupDriver() string {
 
 // --- networks ---
 //
-// The daemon runs a single managed bridge (gow0) plus the usual Docker meta
+// The daemon runs a single managed bridge plus the usual Docker meta
 // networks (host/none). Portainer's Networks tab lists these; its container
 // create form reads Driver/Scope/IPAM to populate fields. We return a
 // realistic snapshot rather than an empty array so the UI doesn't show the
@@ -315,7 +315,7 @@ func (h *Handler) networksWithContainers() []map[string]any {
 		}
 	}
 	for _, n := range nets {
-		if n["Name"] == "gow" {
+		if n["Name"] == lxc.DefaultNetworkName {
 			n["Containers"] = members
 		}
 	}
@@ -398,7 +398,7 @@ func (h *Handler) knownNetwork(id string) bool {
 func (h *Handler) removeNetwork(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 	switch id {
-	case lxc.DefaultNetworkName, "gow", "host", "none", "bridge":
+	case lxc.DefaultNetworkName, "host", "none", "bridge":
 		errResponse(w, http.StatusForbidden, id+" is a pre-defined network and cannot be removed")
 		return
 	}

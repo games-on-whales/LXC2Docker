@@ -70,6 +70,7 @@ type HostConfig struct {
 	// Devices & capabilities
 	Devices           []DeviceMapping   `json:"Devices"`
 	DeviceCgroupRules []string          `json:"DeviceCgroupRules"`
+	DeviceRequests    []DeviceRequest   `json:"DeviceRequests,omitempty"`
 	CapAdd            []string          `json:"CapAdd"`
 	CapDrop           []string          `json:"CapDrop"`
 	Privileged        bool              `json:"Privileged"`
@@ -146,6 +147,17 @@ type DeviceMapping struct {
 	PathOnHost        string `json:"PathOnHost"`
 	PathInContainer   string `json:"PathInContainer"`
 	CgroupPermissions string `json:"CgroupPermissions"`
+}
+
+// DeviceRequest mirrors Docker's generic accelerator request shape.
+// LXC2Docker does not run alternate OCI runtimes, but preserving this
+// field lets clients round-trip requests such as NVIDIA GPU reservations.
+type DeviceRequest struct {
+	Driver       string            `json:"Driver"`
+	Count        int               `json:"Count"`
+	DeviceIDs    []string          `json:"DeviceIDs"`
+	Capabilities [][]string        `json:"Capabilities"`
+	Options      map[string]string `json:"Options"`
 }
 
 // PortBinding maps a container port to a host port.
