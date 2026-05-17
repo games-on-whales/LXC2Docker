@@ -64,6 +64,10 @@ type ContainerConfig struct {
 	// LogFile is where the container console output is written.
 	// Set automatically by the manager.
 	LogFile string
+	// RawConfig contains vetted lxc.* directives to append to the generated
+	// config. SmoothNAS plugin profiles use this for runtime-specific binds
+	// that have no Docker API equivalent.
+	RawConfig []string
 	// SocketLinks records symlinks to create in prepareRootfs for socket
 	// bind mounts. Maps in-container destination path → symlink target
 	// (absolute in-container path inside the directory mount). Populated
@@ -522,6 +526,7 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	items = append(items, sysctlItems(cfg)...)
 	items = append(items, tmpfsItems(cfg)...)
 	items = append(items, ulimitItems(cfg)...)
+	items = append(items, rawConfigItems(cfg.RawConfig)...)
 
 	// Console log so we can serve it via the logs API
 	if cfg.LogFile != "" {
@@ -1105,6 +1110,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	items = append(items, sysctlItems(cfg)...)
 	items = append(items, tmpfsItems(cfg)...)
 	items = append(items, ulimitItems(cfg)...)
+	items = append(items, rawConfigItems(cfg.RawConfig)...)
 
 	// Console log.
 	if cfg.LogFile != "" {
@@ -1112,6 +1118,34 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	}
 
 	return items
+}
+
+func rawConfigItems(lines []string) []configItem {
+	items := make([]configItem, 0, len(lines))
+	for _, line := range lines {
+		key, value, ok := parseRawConfigLine(line)
+		if !ok {
+			continue
+		}
+		items = append(items, configItem{key: key, value: value})
+	}
+	return items
+}
+
+func parseRawConfigLine(line string) (string, string, bool) {
+	if strings.ContainsAny(line, "\x00\n\r") {
+		return "", "", false
+	}
+	key, value, ok := strings.Cut(line, "=")
+	if !ok {
+		return "", "", false
+	}
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(key, "lxc.") {
+		return "", "", false
+	}
+	return key, value, true
 }
 
 // LogFilePath returns the canonical console log file path for a container.
