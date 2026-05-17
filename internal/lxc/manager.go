@@ -1653,6 +1653,8 @@ var hostResolvConfPaths = []string{
 
 const defaultDNSOptions = "use-vc timeout:2 attempts:2"
 
+var fallbackNameservers = []string{"1.1.1.1", "8.8.8.8"}
+
 func buildResolvConf(cfg ContainerConfig) string {
 	var b strings.Builder
 	if len(cfg.DNS) == 0 {
@@ -1692,7 +1694,9 @@ func buildResolvConf(cfg ContainerConfig) string {
 func defaultResolvConf() string {
 	servers := hostNameservers()
 	if len(servers) == 0 {
-		servers = []string{"8.8.8.8", "1.1.1.1"}
+		servers = fallbackNameservers
+	} else {
+		servers = appendMissingNameservers(servers, fallbackNameservers...)
 	}
 	var b strings.Builder
 	for _, server := range servers {
@@ -1704,6 +1708,20 @@ func defaultResolvConf() string {
 	b.WriteString(defaultDNSOptions)
 	b.WriteByte('\n')
 	return b.String()
+}
+
+func appendMissingNameservers(servers []string, fallbacks ...string) []string {
+	seen := map[string]bool{}
+	for _, server := range servers {
+		seen[server] = true
+	}
+	for _, server := range fallbacks {
+		if !seen[server] {
+			servers = append(servers, server)
+			seen[server] = true
+		}
+	}
+	return servers
 }
 
 func hostNameservers() []string {
