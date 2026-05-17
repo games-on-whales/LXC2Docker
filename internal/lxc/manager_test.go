@@ -114,6 +114,23 @@ func TestSmoothNASPluginLabelsAreGCProtected(t *testing.T) {
 	}
 }
 
+func TestLXCInfoLinkParsesHostVeth(t *testing.T) {
+	t.Parallel()
+
+	out := `Name:           abc123
+State:          RUNNING
+PID:            1234
+IP:             10.100.0.2
+Link:           vethABCDEF
+`
+	if got := lxcInfoLink(out); got != "vethABCDEF" {
+		t.Fatalf("lxcInfoLink = %q", got)
+	}
+	if got := lxcInfoLink("State: RUNNING\n"); got != "" {
+		t.Fatalf("expected empty link, got %q", got)
+	}
+}
+
 func TestBuildResolvConfUsesHostNameservers(t *testing.T) {
 	dir := t.TempDir()
 	hostResolv := filepath.Join(dir, "resolv.conf")
