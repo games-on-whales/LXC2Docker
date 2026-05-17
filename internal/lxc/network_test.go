@@ -1,22 +1,15 @@
 package lxc
 
 import (
-	"strings"
 	"testing"
 )
 
-func TestManagedNetworkNamesAvoidVethPrefix(t *testing.T) {
-	if strings.HasPrefix(DefaultNetworkName, "veth") {
-		t.Fatalf("DefaultNetworkName = %q, must not look like an LXC veth", DefaultNetworkName)
+func TestManagedNetworkNamesUseVethBridge(t *testing.T) {
+	if DefaultNetworkName != "veth" {
+		t.Fatalf("DefaultNetworkName = %q, want veth", DefaultNetworkName)
 	}
-	if strings.HasPrefix(BridgeName, "veth") {
-		t.Fatalf("BridgeName = %q, must not look like an LXC veth", BridgeName)
-	}
-	if DefaultNetworkName != "gow" {
-		t.Fatalf("DefaultNetworkName = %q, want gow", DefaultNetworkName)
-	}
-	if BridgeName != "br-gow0" {
-		t.Fatalf("BridgeName = %q, want br-gow0", BridgeName)
+	if BridgeName != "veth0" {
+		t.Fatalf("BridgeName = %q, want veth0", BridgeName)
 	}
 }
 

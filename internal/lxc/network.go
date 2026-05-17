@@ -10,10 +10,10 @@ import (
 )
 
 const (
-	DefaultNetworkName = "gow"
-	BridgeName         = "br-gow0"
-	legacyBridgeName   = "veth0"
-	NATTableName       = "gow_nat"
+	DefaultNetworkName = "veth"
+	BridgeName         = "veth0"
+	legacyBridgeName   = "br-gow0"
+	NATTableName       = "veth_nat"
 	BridgeCIDR         = "10.100.0.1/24"
 	BridgeGW           = "10.100.0.1"
 	SubnetMask         = "255.255.255.0"

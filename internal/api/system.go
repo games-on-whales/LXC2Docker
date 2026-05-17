@@ -297,7 +297,7 @@ func (h *Handler) inspectNetwork(w http.ResponseWriter, r *http.Request) {
 }
 
 // networksWithContainers returns the default network snapshot with the
-// gow bridge's Containers map populated from the store. Portainer's
+// managed bridge's Containers map populated from the store. Portainer's
 // Networks tab renders this as "containers attached" with links to each.
 func (h *Handler) networksWithContainers() []map[string]any {
 	nets := defaultNetworks()
