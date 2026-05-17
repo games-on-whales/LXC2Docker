@@ -1651,7 +1651,7 @@ var hostResolvConfPaths = []string{
 	"/etc/resolv.conf",
 }
 
-const defaultDNSOptions = "use-vc timeout:2 attempts:2"
+const defaultDNSOptions = "timeout:2 attempts:2 rotate"
 
 var fallbackNameservers = []string{"1.1.1.1", "8.8.8.8"}
 
