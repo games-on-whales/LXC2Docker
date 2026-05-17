@@ -114,6 +114,49 @@ func TestSmoothNASPluginLabelsAreGCProtected(t *testing.T) {
 	}
 }
 
+func TestBuildResolvConfUsesHostNameservers(t *testing.T) {
+	dir := t.TempDir()
+	hostResolv := filepath.Join(dir, "resolv.conf")
+	if err := os.WriteFile(hostResolv, []byte("nameserver 192.168.1.1\nsearch lan\n"), 0o644); err != nil {
+		t.Fatalf("write host resolv: %v", err)
+	}
+	old := hostResolvConfPaths
+	hostResolvConfPaths = []string{hostResolv}
+	t.Cleanup(func() { hostResolvConfPaths = old })
+
+	got := buildResolvConf(ContainerConfig{})
+	if got != "nameserver 192.168.1.1\n" {
+		t.Fatalf("resolv.conf = %q", got)
+	}
+}
+
+func TestBuildResolvConfSkipsHostLoopbackStub(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "stub.conf")
+	uplink := filepath.Join(dir, "uplink.conf")
+	if err := os.WriteFile(stub, []byte("nameserver 127.0.0.53\n"), 0o644); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	if err := os.WriteFile(uplink, []byte("nameserver 192.168.1.1\nnameserver 1.1.1.1\n"), 0o644); err != nil {
+		t.Fatalf("write uplink: %v", err)
+	}
+	old := hostResolvConfPaths
+	hostResolvConfPaths = []string{stub, uplink}
+	t.Cleanup(func() { hostResolvConfPaths = old })
+
+	got := buildResolvConf(ContainerConfig{})
+	if got != "nameserver 192.168.1.1\nnameserver 1.1.1.1\n" {
+		t.Fatalf("resolv.conf = %q", got)
+	}
+}
+
+func TestBuildResolvConfPreservesExplicitDockerDNS(t *testing.T) {
+	got := buildResolvConf(ContainerConfig{DNS: []string{"9.9.9.9"}})
+	if got != "nameserver 9.9.9.9\n" {
+		t.Fatalf("resolv.conf = %q", got)
+	}
+}
+
 func TestRemoveContainerMissingLXCDropsStoreEntry(t *testing.T) {
 	t.Parallel()
 
