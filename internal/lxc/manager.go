@@ -463,11 +463,17 @@ func (m *Manager) gc() {
 				continue
 			}
 		}
+		if smoothNASManagedContainer(rec) {
+			continue
+		}
 
 		state, _ := m.State(rec.ID)
 		if state == "exited" {
 			stopped = append(stopped, rec)
 		} else if state == "running" {
+			if smoothNASRunnerWorker(rec) {
+				continue
+			}
 			// Session containers have unique per-session names (Wolf-UI_<id>,
 			// WolfSteam_<id>). Support containers are generic (WolfPulseAudio).
 			if strings.Contains(rec.Name, "_") {
@@ -521,6 +527,20 @@ func (m *Manager) gc() {
 			}
 		}
 	}
+}
+
+func smoothNASManagedContainer(rec *store.ContainerRecord) bool {
+	if rec == nil || rec.Labels == nil {
+		return false
+	}
+	return rec.Labels["io.smoothnas.managed"] == "true"
+}
+
+func smoothNASRunnerWorker(rec *store.ContainerRecord) bool {
+	if rec == nil || rec.Labels == nil {
+		return false
+	}
+	return rec.Labels["io.smoothnas.gh-runner.worker"] == "true"
 }
 
 // PullOpts controls a PullImage invocation. Credentials (if non-empty) are
@@ -1020,7 +1040,12 @@ func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cf
 		"--newpath", m.lxcPath,
 	).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: clone %s → %s: %s: %w", imgRec.TemplateName, id, out, err)
+		log.Printf("CreateContainer[legacy]: lxc-copy failed for %s → %s; trying directory copy fallback: %s: %v",
+			imgRec.TemplateName, id, out, err)
+		if copyErr := m.cloneLegacyTemplateByCopy(imgRec.TemplateName, id); copyErr != nil {
+			return fmt.Errorf("manager: clone %s → %s: %s: %w; directory copy fallback: %v",
+				imgRec.TemplateName, id, out, err, copyErr)
+		}
 	}
 
 	// Allocate IP for bridge networking.
@@ -1053,6 +1078,41 @@ func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cf
 	if storeRec := m.store.GetContainer(id); storeRec != nil {
 		storeRec.IPAddress = ip
 		return m.store.AddContainer(storeRec)
+	}
+	return nil
+}
+
+func (m *Manager) cloneLegacyTemplateByCopy(templateName, id string) error {
+	templateRootfs := filepath.Join(m.lxcPath, templateName, "rootfs")
+	if info, err := os.Stat(templateRootfs); err != nil {
+		return fmt.Errorf("stat template rootfs %s: %w", templateRootfs, err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("template rootfs %s is not a directory", templateRootfs)
+	}
+
+	containerDir := filepath.Join(m.lxcPath, id)
+	containerRootfs := filepath.Join(containerDir, "rootfs")
+	if err := os.RemoveAll(containerDir); err != nil {
+		return fmt.Errorf("remove partial container dir %s: %w", containerDir, err)
+	}
+	if err := os.MkdirAll(containerDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir container dir %s: %w", containerDir, err)
+	}
+
+	out, err := exec.Command("cp", "-a", templateRootfs, containerRootfs).CombinedOutput()
+	if err != nil {
+		_ = os.RemoveAll(containerDir)
+		return fmt.Errorf("copy rootfs %s → %s: %s: %w", templateRootfs, containerRootfs, out, err)
+	}
+
+	minimalConfig := fmt.Sprintf(`lxc.include = /usr/share/lxc/config/common.conf
+lxc.arch = linux64
+lxc.rootfs.path = dir:%s
+lxc.uts.name = %s
+`, containerRootfs, sanitizeHostname(id))
+	if err := os.WriteFile(filepath.Join(containerDir, "config"), []byte(minimalConfig), 0o644); err != nil {
+		_ = os.RemoveAll(containerDir)
+		return fmt.Errorf("write fallback config: %w", err)
 	}
 	return nil
 }
