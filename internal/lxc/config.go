@@ -120,6 +120,10 @@ type MountSpec struct {
 	Source      string
 	Destination string
 	ReadOnly    bool
+	// Initialize requests Docker-style first-use initialization for an
+	// empty directory source: copy the image destination contents and apply
+	// the destination owner/mode before the bind mount hides it.
+	Initialize bool
 }
 
 // DeviceSpec describes a host device to expose inside the container.

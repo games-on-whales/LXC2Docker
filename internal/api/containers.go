@@ -23,6 +23,8 @@ import (
 	"github.com/gorilla/mux"
 )
 
+const bindMountInitLabel = "io.lxc2docker.bind-mounts.init"
+
 // POST /containers/create
 func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
@@ -144,6 +146,8 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	if user == "" && imgRec != nil {
 		user = imgRec.OCIUser
 	}
+	volumes := effectiveVolumes(req.Volumes, imgRec)
+	initBindMounts := shouldInitializeBindMounts(req.Labels)
 
 	cfg := lxc.ContainerConfig{
 		Entrypoint:        entrypoint,
@@ -199,6 +203,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			Source:      parts[0],
 			Destination: parts[1],
 			ReadOnly:    len(parts) == 3 && parts[2] == "ro",
+			Initialize:  initBindMounts && !(len(parts) == 3 && parts[2] == "ro"),
 		}
 		cfg.Mounts = append(cfg.Mounts, m)
 		storeMounts = append(storeMounts, store.MountSpec{
@@ -223,7 +228,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	// containers (`VOLUME /var/lib/postgresql/data` in the Dockerfile)
 	// rely on this so state persists across container rebuilds even
 	// without an explicit --mount flag.
-	for path := range req.Volumes {
+	for path := range volumes {
 		if hasMountAt(storeMounts, path) {
 			continue
 		}
@@ -240,6 +245,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
 			Source:      mountpoint,
 			Destination: path,
+			Initialize:  true,
 		})
 	}
 
@@ -281,6 +287,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			Source:      source,
 			Destination: m.Target,
 			ReadOnly:    m.ReadOnly,
+			Initialize:  (mType == "volume") || (mType == "bind" && initBindMounts && !m.ReadOnly),
 		})
 	}
 
@@ -307,7 +314,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		WorkingDir:      workingDir,
 		StopSignal:      req.StopSignal,
 		ExposedPorts:    req.ExposedPorts,
-		Volumes:         req.Volumes,
+		Volumes:         volumes,
 		StopTimeout:     stopTimeoutValue(req.StopTimeout),
 		OomScoreAdj:     req.HostConfig.OomScoreAdj,
 		RawHostConfig:   rawHC,
@@ -2048,6 +2055,40 @@ func hasMountAt(mounts []store.MountSpec, dest string) bool {
 		}
 	}
 	return false
+}
+
+func effectiveVolumes(requested map[string]struct{}, img *store.ImageRecord) map[string]struct{} {
+	if len(requested) == 0 && (img == nil || len(img.OCIVolumes) == 0) {
+		return nil
+	}
+	capacity := len(requested)
+	if img != nil {
+		capacity += len(img.OCIVolumes)
+	}
+	out := make(map[string]struct{}, capacity)
+	for path := range requested {
+		if path != "" {
+			out[path] = struct{}{}
+		}
+	}
+	if img != nil {
+		for _, path := range img.OCIVolumes {
+			if path != "" {
+				out[path] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+func shouldInitializeBindMounts(labels map[string]string) bool {
+	value := strings.ToLower(strings.TrimSpace(labels[bindMountInitLabel]))
+	switch value {
+	case "1", "true", "yes", "image":
+		return true
+	default:
+		return false
+	}
 }
 
 // ensureVolume resolves a named volume to its backing directory, creating

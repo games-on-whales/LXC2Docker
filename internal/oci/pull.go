@@ -24,6 +24,7 @@ type ImageConfig struct {
 	Env        []string
 	User       string
 	WorkingDir string
+	Volumes    []string
 	Ports      []string          // e.g. ["80/tcp", "443/tcp"]
 	Labels     map[string]string // OCI image labels (rendered in Portainer's image detail)
 	Digest     string            // manifest digest, "sha256:..." (empty if unknown)
@@ -371,6 +372,7 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 			Env          []string            `json:"Env"`
 			User         string              `json:"User"`
 			WorkingDir   string              `json:"WorkingDir"`
+			Volumes      map[string]struct{} `json:"Volumes"`
 			ExposedPorts map[string]struct{} `json:"ExposedPorts"`
 			Labels       map[string]string   `json:"Labels"`
 		} `json:"config"`
@@ -383,6 +385,10 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 	for p := range imgCfg.Config.ExposedPorts {
 		ports = append(ports, p)
 	}
+	var volumes []string
+	for v := range imgCfg.Config.Volumes {
+		volumes = append(volumes, v)
+	}
 
 	return &ImageConfig{
 		Entrypoint: imgCfg.Config.Entrypoint,
@@ -390,6 +396,7 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 		Env:        imgCfg.Config.Env,
 		User:       imgCfg.Config.User,
 		WorkingDir: imgCfg.Config.WorkingDir,
+		Volumes:    volumes,
 		Ports:      ports,
 		Labels:     imgCfg.Config.Labels,
 	}, nil

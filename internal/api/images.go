@@ -303,6 +303,7 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 		Entrypoint: rec.OCIEntrypoint,
 		User:       rec.OCIUser,
 		WorkingDir: rec.OCIWorkingDir,
+		Volumes:    volumeMapFromSlice(rec.OCIVolumes),
 		Labels:     labels,
 	}
 	if cfg.Env == nil {
@@ -397,6 +398,19 @@ func danglingWant(vals []string) *bool {
 
 func imageIsDangling(rec *store.ImageRecord) bool {
 	return rec.Ref == "" || strings.HasSuffix(rec.Ref, "<none>:<none>")
+}
+
+func volumeMapFromSlice(paths []string) map[string]struct{} {
+	if len(paths) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path != "" {
+			out[path] = struct{}{}
+		}
+	}
+	return out
 }
 
 func (h *Handler) findImageByID(id string) *store.ImageRecord {

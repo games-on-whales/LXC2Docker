@@ -836,6 +836,7 @@ lxc.uts.name = %s
 			OCIEnv:        cfg.Env,
 			OCIUser:       cfg.User,
 			OCIWorkingDir: cfg.WorkingDir,
+			OCIVolumes:    cfg.Volumes,
 			OCIPorts:      cfg.Ports,
 			OCILabels:     cfg.Labels,
 		}); err == nil {
@@ -856,6 +857,7 @@ lxc.uts.name = %s
 		OCIEnv:        cfg.Env,
 		OCIUser:       cfg.User,
 		OCIWorkingDir: cfg.WorkingDir,
+		OCIVolumes:    cfg.Volumes,
 		OCIPorts:      cfg.Ports,
 		OCILabels:     cfg.Labels,
 		RepoDigest:    cfg.Digest,
@@ -1107,6 +1109,8 @@ lxc.uts.name = %s
 
 // prepareRootfs ensures runtime directories and resolv.conf exist in the rootfs.
 func (m *Manager) prepareRootfs(rootfs string, cfg ContainerConfig) {
+	initializeMountSources(rootfs, cfg)
+
 	// Ensure runtime directories referenced by XDG_RUNTIME_DIR.
 	for _, e := range cfg.Env {
 		if strings.HasPrefix(e, "XDG_RUNTIME_DIR=") {
