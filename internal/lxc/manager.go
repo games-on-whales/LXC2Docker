@@ -1651,6 +1651,8 @@ var hostResolvConfPaths = []string{
 	"/etc/resolv.conf",
 }
 
+const defaultDNSOptions = "use-vc timeout:2 attempts:2"
+
 func buildResolvConf(cfg ContainerConfig) string {
 	var b strings.Builder
 	if len(cfg.DNS) == 0 {
@@ -1698,6 +1700,9 @@ func defaultResolvConf() string {
 		b.WriteString(server)
 		b.WriteByte('\n')
 	}
+	b.WriteString("options ")
+	b.WriteString(defaultDNSOptions)
+	b.WriteByte('\n')
 	return b.String()
 }
 
