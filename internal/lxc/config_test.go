@@ -105,6 +105,41 @@ func TestAppendSocketMountKeepsHiddenSocketMountForTranslatedDestinations(t *tes
 	}
 }
 
+func TestBuildItemsAppendsRawConfig(t *testing.T) {
+	t.Parallel()
+
+	items := buildItems(&ContainerConfig{
+		RawConfig: []string{
+			"lxc.mount.entry = /run/smoothnas-runtime/docker.sock var/run/docker.sock none bind,optional,create=file 0 0",
+			"not-lxc = ignored",
+			"lxc.environment = BAD=true\nlxc.environment = INJECTED=true",
+		},
+	}, "10.0.0.2")
+
+	if !hasMountEntry(items, "/run/smoothnas-runtime/docker.sock var/run/docker.sock none bind,optional,create=file 0 0") {
+		t.Fatalf("expected raw mount entry, got %#v", items)
+	}
+	for _, item := range items {
+		if item.key == "not-lxc" || strings.Contains(item.value, "INJECTED") {
+			t.Fatalf("unexpected raw item accepted: %#v", item)
+		}
+	}
+}
+
+func TestBuildPVEItemsAppendsRawConfig(t *testing.T) {
+	t.Parallel()
+
+	items := buildPVEItems(&ContainerConfig{
+		RawConfig: []string{
+			"lxc.mount.entry = /dev/dri dev/dri none bind,optional,create=dir 0 0",
+		},
+	}, "10.0.0.2")
+
+	if !hasMountEntry(items, "/dev/dri dev/dri none bind,optional,create=dir 0 0") {
+		t.Fatalf("expected raw PVE mount entry, got %#v", items)
+	}
+}
+
 func hasMountEntry(items []configItem, want string) bool {
 	for _, item := range items {
 		if item.key == "lxc.mount.entry" && item.value == want {

@@ -171,6 +171,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		DNS:               req.HostConfig.DNS,
 		DNSSearch:         req.HostConfig.DNSSearch,
 		DNSOptions:        req.HostConfig.DNSOptions,
+		RawConfig:         smoothNASLXCRawConfig(req.Labels),
 		ProxmoxCT:         req.Labels["gow.pve"] == "true",
 		LAN:               req.Labels["gow.lan"] == "true",
 	}
@@ -1970,6 +1971,35 @@ func apiToLXCUlimits(u []Ulimit) []lxc.Ulimit {
 	out := make([]lxc.Ulimit, 0, len(u))
 	for _, x := range u {
 		out = append(out, lxc.Ulimit{Name: x.Name, Soft: x.Soft, Hard: x.Hard})
+	}
+	return out
+}
+
+const smoothNASLXCRawLabelPrefix = "io.smoothnas.lxc.raw."
+
+func smoothNASLXCRawConfig(labels map[string]string) []string {
+	type rawLabel struct {
+		index int
+		value string
+	}
+	raw := make([]rawLabel, 0)
+	for key, value := range labels {
+		suffix, ok := strings.CutPrefix(key, smoothNASLXCRawLabelPrefix)
+		if !ok {
+			continue
+		}
+		index, err := strconv.Atoi(suffix)
+		if err != nil || index < 0 {
+			continue
+		}
+		raw = append(raw, rawLabel{index: index, value: value})
+	}
+	sort.Slice(raw, func(i, j int) bool {
+		return raw[i].index < raw[j].index
+	})
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		out = append(out, item.value)
 	}
 	return out
 }
