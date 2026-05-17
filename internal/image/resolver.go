@@ -142,7 +142,7 @@ func appTemplateName(app, tag string) string {
 
 // ociTemplateName returns the LXC container name for an OCI image template.
 func ociTemplateName(ref string) string {
-	return "__template_oci_" + sanitize(ref)
+	return "__template_oci_" + sanitizeOCIRef(ref)
 }
 
 // sanitize replaces characters that are not safe in an LXC container name.
@@ -150,6 +150,15 @@ func sanitize(s string) string {
 	return strings.NewReplacer(
 		":", "_",
 		"/", "_",
+		" ", "_",
+	).Replace(s)
+}
+
+func sanitizeOCIRef(s string) string {
+	return strings.NewReplacer(
+		":", "_",
+		"/", "_",
+		".", "_",
 		" ", "_",
 	).Replace(s)
 }

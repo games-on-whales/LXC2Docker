@@ -798,7 +798,7 @@ func (m *Manager) pullOCI(r *image.ResolvedImage, opts PullOpts) error {
 lxc.arch = linux64
 lxc.rootfs.path = dir:%s
 lxc.uts.name = %s
-`, templateRootfs, r.TemplateContainerName)
+`, templateRootfs, sanitizeHostname("tmpl-"+oci.SafeDirName(r.Ref)))
 
 		configPath := filepath.Join(templateDir, "config")
 		if err := os.WriteFile(configPath, []byte(minimalConfig), 0o644); err != nil {
