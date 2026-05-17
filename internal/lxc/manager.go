@@ -1367,12 +1367,19 @@ func (m *Manager) KillContainer(id, signal string) error {
 // Routes to pct destroy (PVE CT), ZFS destroy (ephemeral PVE), or
 // lxc-destroy (legacy) based on container type.
 func (m *Manager) RemoveContainer(id string) error {
+	rec := m.store.GetContainer(id)
+	if rec == nil {
+		return m.store.RemoveContainer(id)
+	}
+	if !m.containerExists(id) {
+		log.Printf("RemoveContainer: %s missing from LXC; removing stale store entry", id)
+		return m.store.RemoveContainer(id)
+	}
+
 	state, _ := m.State(id)
 	if state == "running" {
 		return fmt.Errorf("manager: cannot remove running container %s; stop it first", id)
 	}
-
-	rec := m.store.GetContainer(id)
 
 	if rec != nil && rec.VMID > 0 {
 		// Proxmox CT — destroy via pct.
@@ -1399,9 +1406,18 @@ func (m *Manager) RemoveContainer(id string) error {
 	// Legacy: lxc-destroy.
 	out, err := exec.Command("lxc-destroy", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
 	if err != nil {
+		if lxcDestroyMissing(out) {
+			log.Printf("RemoveContainer: lxc-destroy reported %s missing; removing stale store entry", id)
+			return m.store.RemoveContainer(id)
+		}
 		return fmt.Errorf("manager: destroy %s: %s: %w", id, out, err)
 	}
 	return m.store.RemoveContainer(id)
+}
+
+func lxcDestroyMissing(out []byte) bool {
+	msg := strings.ToLower(string(out))
+	return strings.Contains(msg, "container is not defined") || strings.Contains(msg, "is not defined")
 }
 
 // RemoveImage destroys the template container and removes the image record.

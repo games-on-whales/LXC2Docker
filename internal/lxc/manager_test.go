@@ -113,3 +113,36 @@ func TestSmoothNASPluginLabelsAreGCProtected(t *testing.T) {
 		t.Fatal("non-owner SmoothNAS labels should not opt into GC protection")
 	}
 }
+
+func TestRemoveContainerMissingLXCDropsStoreEntry(t *testing.T) {
+	t.Parallel()
+
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store init: %v", err)
+	}
+	id := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	if err := st.AddContainer(&store.ContainerRecord{ID: id, Name: "gone"}); err != nil {
+		t.Fatalf("add container: %v", err)
+	}
+	mgr := &Manager{lxcPath: t.TempDir(), store: st}
+
+	if err := mgr.RemoveContainer(id); err != nil {
+		t.Fatalf("RemoveContainer: %v", err)
+	}
+	if got := st.GetContainer(id); got != nil {
+		t.Fatalf("container record still present: %+v", got)
+	}
+}
+
+func TestLXCDestroyMissingOutput(t *testing.T) {
+	t.Parallel()
+
+	out := []byte("lxc-destroy: abc: ../src/lxc/tools/lxc_destroy.c: lxc_destroy_main: 241 Container is not defined\n")
+	if !lxcDestroyMissing(out) {
+		t.Fatal("expected missing LXC destroy output to be recognized")
+	}
+	if lxcDestroyMissing([]byte("permission denied")) {
+		t.Fatal("unrelated destroy errors should not be treated as missing containers")
+	}
+}
