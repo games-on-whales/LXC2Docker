@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/games-on-whales/docker-lxc-daemon/internal/lxc"
 	"github.com/games-on-whales/docker-lxc-daemon/internal/store"
 	"github.com/gorilla/mux"
 	"golang.org/x/sys/unix"
@@ -443,11 +444,11 @@ func (h *Handler) ensureVolume(name string) (*store.VolumeRecord, error) {
 
 func defaultContainerNetworks(rec *store.ContainerRecord) map[string]store.NetworkAttachment {
 	return map[string]store.NetworkAttachment{
-		"gow": {
-			NetworkID:  "gow",
+		lxc.DefaultNetworkName: {
+			NetworkID:  lxc.DefaultNetworkName,
 			IPAddress:  rec.IPAddress,
 			Gateway:    "10.100.0.1",
-			EndpointID: endpointID(rec.ID, "gow"),
+			EndpointID: endpointID(rec.ID, lxc.DefaultNetworkName),
 		},
 	}
 }
@@ -462,7 +463,7 @@ func attachRequestedNetworks(st *store.Store, rec *store.ContainerRecord, cfg Ne
 	for name, ep := range cfg.EndpointsConfig {
 		networkName := name
 		networkID := name
-		if name != "gow" {
+		if name != lxc.DefaultNetworkName {
 			n := st.GetNetwork(name)
 			if n == nil {
 				return fmt.Errorf("network %q not found", name)
