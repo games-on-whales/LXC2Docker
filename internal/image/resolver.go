@@ -1,6 +1,8 @@
 package image
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 )
@@ -141,8 +143,34 @@ func appTemplateName(app, tag string) string {
 }
 
 // ociTemplateName returns the LXC container name for an OCI image template.
+// LXC also writes this value to lxc.uts.name; keep it within the Linux
+// hostname limit instead of embedding an arbitrarily long registry ref.
 func ociTemplateName(ref string) string {
-	return "__template_oci_" + sanitizeOCIRef(ref)
+	const (
+		prefix    = "__template_oci_"
+		maxLength = 63
+		hashChars = 12
+	)
+
+	safe := sanitizeOCIRef(ref)
+	if len(prefix)+len(safe) <= maxLength {
+		return prefix + safe
+	}
+
+	sum := sha256.Sum256([]byte(ref))
+	digest := hex.EncodeToString(sum[:])[:hashChars]
+	headLen := maxLength - len(prefix) - len(digest) - 1
+	if headLen < 1 {
+		headLen = 1
+	}
+	if len(safe) > headLen {
+		safe = safe[:headLen]
+	}
+	safe = strings.Trim(safe, "._-")
+	if safe == "" {
+		safe = "image"
+	}
+	return prefix + safe + "_" + digest
 }
 
 // sanitize replaces characters that are not safe in an LXC container name.

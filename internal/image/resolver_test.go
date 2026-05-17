@@ -69,7 +69,22 @@ func TestResolveOCITemplateNameSanitizesRegistryDots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve() returned error: %v", err)
 	}
-	if got.TemplateContainerName != "__template_oci_ghcr_io_rakuensoftware_smoothnas-plugin-gh-runner_0_3_1" {
+	if got.TemplateContainerName != "__template_oci_ghcr_io_rakuensoftware_smoothnas-pl_af04b6403087" {
+		t.Fatalf("unexpected template name %q", got.TemplateContainerName)
+	}
+}
+
+func TestResolveOCITemplateNameFitsHostnameLimit(t *testing.T) {
+	t.Parallel()
+
+	got, err := Resolve("ghcr.io/rakuensoftware/smoothnas-plugin-gh-runner-with-a-very-long-image-name:0.3.1", "", true)
+	if err != nil {
+		t.Fatalf("Resolve() returned error: %v", err)
+	}
+	if len(got.TemplateContainerName) > 63 {
+		t.Fatalf("template name length = %d, want <= 63: %q", len(got.TemplateContainerName), got.TemplateContainerName)
+	}
+	if got.TemplateContainerName != "__template_oci_ghcr_io_rakuensoftware_smoothnas-pl_578f464f0284" {
 		t.Fatalf("unexpected template name %q", got.TemplateContainerName)
 	}
 }
