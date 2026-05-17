@@ -62,6 +62,18 @@ func TestResolvePreferOCIOversAppShortcut(t *testing.T) {
 	}
 }
 
+func TestResolveOCITemplateNameSanitizesRegistryDots(t *testing.T) {
+	t.Parallel()
+
+	got, err := Resolve("ghcr.io/rakuensoftware/smoothnas-plugin-gh-runner:0.3.1", "", true)
+	if err != nil {
+		t.Fatalf("Resolve() returned error: %v", err)
+	}
+	if got.TemplateContainerName != "__template_oci_ghcr_io_rakuensoftware_smoothnas-plugin-gh-runner_0_3_1" {
+		t.Fatalf("unexpected template name %q", got.TemplateContainerName)
+	}
+}
+
 func TestResolveDefaultsToAMD64(t *testing.T) {
 	t.Parallel()
 

@@ -37,3 +37,15 @@ func TestImageReadyRequiresExistingTemplateSource(t *testing.T) {
 		t.Fatal("expected existing legacy template config to be reported available")
 	}
 }
+
+func TestSanitizeHostnameCapsAndRemovesInvalidChars(t *testing.T) {
+	t.Parallel()
+
+	got := sanitizeHostname("tmpl-ghcr.io_rakuensoftware_smoothnas-plugin-gh-runner_0.3.1")
+	if len(got) > 63 {
+		t.Fatalf("hostname length = %d, want <= 63: %q", len(got), got)
+	}
+	if got != "tmpl-ghcr-io-rakuensoftware-smoothnas-plugin-gh-runner-0-3-1" {
+		t.Fatalf("hostname = %q", got)
+	}
+}
