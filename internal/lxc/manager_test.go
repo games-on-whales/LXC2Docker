@@ -125,7 +125,7 @@ func TestBuildResolvConfUsesHostNameservers(t *testing.T) {
 	t.Cleanup(func() { hostResolvConfPaths = old })
 
 	got := buildResolvConf(ContainerConfig{})
-	if got != "nameserver 192.168.1.1\n" {
+	if got != "nameserver 192.168.1.1\noptions use-vc timeout:2 attempts:2\n" {
 		t.Fatalf("resolv.conf = %q", got)
 	}
 }
@@ -145,7 +145,7 @@ func TestBuildResolvConfSkipsHostLoopbackStub(t *testing.T) {
 	t.Cleanup(func() { hostResolvConfPaths = old })
 
 	got := buildResolvConf(ContainerConfig{})
-	if got != "nameserver 192.168.1.1\nnameserver 1.1.1.1\n" {
+	if got != "nameserver 192.168.1.1\nnameserver 1.1.1.1\noptions use-vc timeout:2 attempts:2\n" {
 		t.Fatalf("resolv.conf = %q", got)
 	}
 }
