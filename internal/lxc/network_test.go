@@ -11,6 +11,9 @@ func TestManagedNetworkNamesUseVethBridge(t *testing.T) {
 	if BridgeName != "veth0" {
 		t.Fatalf("BridgeName = %q, want veth0", BridgeName)
 	}
+	if !contains(legacyBridgeNames, "gow0") {
+		t.Fatalf("legacyBridgeNames must include gow0")
+	}
 }
 
 func TestNetworkConfigUsesManagedBridge(t *testing.T) {
@@ -40,4 +43,13 @@ func configValue(items []configItem, key string) string {
 		}
 	}
 	return ""
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

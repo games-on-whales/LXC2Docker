@@ -12,12 +12,13 @@ import (
 const (
 	DefaultNetworkName = "veth"
 	BridgeName         = "veth0"
-	legacyBridgeName   = "br-gow0"
 	NATTableName       = "veth_nat"
 	BridgeCIDR         = "10.100.0.1/24"
 	BridgeGW           = "10.100.0.1"
 	SubnetMask         = "255.255.255.0"
 )
+
+var legacyBridgeNames = []string{"br-gow0", "gow0"}
 
 // EnsureBridge creates the managed bridge and assigns it the gateway IP if it
 // does not already exist. Idempotent.
@@ -46,6 +47,9 @@ func EnsureBridge() error {
 		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
 			return fmt.Errorf("network: %v: %s: %w", args, out, err)
 		}
+	}
+	if err := removeLegacyBridges(); err != nil {
+		return err
 	}
 
 	// Ensure IP forwarding and allow localhost-originated packets to be
@@ -83,21 +87,48 @@ table ip %s {
 }
 
 func migrateLegacyBridge() error {
-	if legacyBridgeName == BridgeName {
+	for _, legacyBridgeName := range legacyBridgeNames {
+		if legacyBridgeName == BridgeName {
+			continue
+		}
+		if _, err := net.InterfaceByName(legacyBridgeName); err != nil {
+			continue
+		}
+		if !isLinuxBridge(legacyBridgeName) {
+			continue
+		}
+		_ = exec.Command("ip", "link", "set", "dev", legacyBridgeName, "nomaster").Run()
+		if out, err := exec.Command("ip", "link", "set", "dev", legacyBridgeName, "down").CombinedOutput(); err != nil {
+			return fmt.Errorf("network: bring legacy bridge %s down for rename: %s: %w", legacyBridgeName, out, err)
+		}
+		if out, err := exec.Command("ip", "link", "set", "dev", legacyBridgeName, "name", BridgeName).CombinedOutput(); err != nil {
+			return fmt.Errorf("network: rename legacy bridge %s to %s: %s: %w", legacyBridgeName, out, err)
+		}
 		return nil
 	}
-	if _, err := net.InterfaceByName(legacyBridgeName); err != nil {
-		return nil
-	}
-	if !isLinuxBridge(legacyBridgeName) {
-		return nil
-	}
-	_ = exec.Command("ip", "link", "set", "dev", legacyBridgeName, "nomaster").Run()
-	if out, err := exec.Command("ip", "link", "set", "dev", legacyBridgeName, "down").CombinedOutput(); err != nil {
-		return fmt.Errorf("network: bring legacy bridge %s down for rename: %s: %w", legacyBridgeName, out, err)
-	}
-	if out, err := exec.Command("ip", "link", "set", "dev", legacyBridgeName, "name", BridgeName).CombinedOutput(); err != nil {
-		return fmt.Errorf("network: rename legacy bridge %s to %s: %s: %w", legacyBridgeName, BridgeName, out, err)
+	return nil
+}
+
+func removeLegacyBridges() error {
+	for _, name := range legacyBridgeNames {
+		if name == BridgeName {
+			continue
+		}
+		if _, err := net.InterfaceByName(name); err != nil {
+			continue
+		}
+		if !isLinuxBridge(name) {
+			continue
+		}
+		if hasBridgePorts(name) {
+			return fmt.Errorf("network: legacy bridge %s still has attached interfaces; detach them before migration", name)
+		}
+		_ = exec.Command("ip", "link", "set", "dev", name, "nomaster").Run()
+		_ = exec.Command("ip", "addr", "flush", "dev", name).Run()
+		_ = exec.Command("ip", "link", "set", "dev", name, "down").Run()
+		if out, err := exec.Command("ip", "link", "delete", name, "type", "bridge").CombinedOutput(); err != nil {
+			return fmt.Errorf("network: delete legacy bridge %s: %s: %w", name, out, err)
+		}
 	}
 	return nil
 }
@@ -107,6 +138,11 @@ func isLinuxBridge(name string) bool {
 		return true
 	}
 	return false
+}
+
+func hasBridgePorts(name string) bool {
+	entries, err := os.ReadDir(filepath.Join("/sys/class/net", name, "brif"))
+	return err == nil && len(entries) > 0
 }
 
 // TeardownBridge leaves the managed bridge and nftables table in place.
