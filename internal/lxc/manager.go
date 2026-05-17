@@ -673,7 +673,7 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 	templateRootfs := filepath.Join(m.lxcPath, r.TemplateContainerName, "rootfs")
 	resolvPath := filepath.Join(templateRootfs, "etc", "resolv.conf")
 	os.Remove(resolvPath)
-	os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644)
+	os.WriteFile(resolvPath, []byte(defaultResolvConf()), 0o644)
 
 	// Start the app template container temporarily.
 	appTemplate, err := liblxc.NewContainer(r.TemplateContainerName, m.lxcPath)
@@ -791,7 +791,7 @@ func (m *Manager) pullOCI(r *image.ResolvedImage, opts PullOpts) error {
 		resolvPath := filepath.Join(templateRootfs, "etc", "resolv.conf")
 		os.Remove(resolvPath)
 		os.MkdirAll(filepath.Dir(resolvPath), 0o755)
-		os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644)
+		os.WriteFile(resolvPath, []byte(defaultResolvConf()), 0o644)
 
 		// Clean up the OCI working directory.
 		os.RemoveAll(rootfsPath)
@@ -828,7 +828,7 @@ lxc.uts.name = %s
 		resolvPath := filepath.Join(templateRootfs, "etc", "resolv.conf")
 		os.Remove(resolvPath)
 		os.MkdirAll(filepath.Dir(resolvPath), 0o755)
-		os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644)
+		os.WriteFile(resolvPath, []byte(defaultResolvConf()), 0o644)
 
 		oci.Cleanup(ociStoreDir, r.Ref)
 
@@ -1646,10 +1646,15 @@ func (m *Manager) ImageReady(rec *store.ImageRecord) bool {
 
 // --- helpers ---
 
+var hostResolvConfPaths = []string{
+	"/run/systemd/resolve/resolv.conf",
+	"/etc/resolv.conf",
+}
+
 func buildResolvConf(cfg ContainerConfig) string {
 	var b strings.Builder
 	if len(cfg.DNS) == 0 {
-		b.WriteString("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+		b.WriteString(defaultResolvConf())
 	} else {
 		for _, d := range cfg.DNS {
 			d = strings.TrimSpace(d)
@@ -1680,6 +1685,64 @@ func buildResolvConf(cfg ContainerConfig) string {
 		}
 	}
 	return b.String()
+}
+
+func defaultResolvConf() string {
+	servers := hostNameservers()
+	if len(servers) == 0 {
+		servers = []string{"8.8.8.8", "1.1.1.1"}
+	}
+	var b strings.Builder
+	for _, server := range servers {
+		b.WriteString("nameserver ")
+		b.WriteString(server)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func hostNameservers() []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, path := range hostResolvConfPaths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		for _, server := range parseNameservers(string(data)) {
+			if seen[server] {
+				continue
+			}
+			seen[server] = true
+			out = append(out, server)
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return out
+}
+
+func parseNameservers(data string) []string {
+	out := []string{}
+	for _, line := range strings.Split(data, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "nameserver" {
+			continue
+		}
+		server := strings.TrimSpace(fields[1])
+		if server == "" || strings.ContainsAny(server, "\r\n") || isLoopbackNameserver(server) {
+			continue
+		}
+		out = append(out, server)
+	}
+	return out
+}
+
+func isLoopbackNameserver(server string) bool {
+	return server == "::1" || server == "0:0:0:0:0:0:0:1" ||
+		strings.HasPrefix(server, "127.") ||
+		strings.EqualFold(server, "localhost")
 }
 
 // sanitizeHostname converts a string to a valid DNS hostname: lowercase,
