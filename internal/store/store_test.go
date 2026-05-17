@@ -23,9 +23,9 @@ func TestStorePersistenceAndLookup(t *testing.T) {
 		t.Fatalf("AddContainer failed: %v", err)
 	}
 	if err := s.AddImage(&ImageRecord{
-		ID:       "imgid",
-		Ref:      "docker.io/library/nginx:latest",
-		Created:  time.Time{},
+		ID:           "imgid",
+		Ref:          "docker.io/library/nginx:latest",
+		Created:      time.Time{},
 		TemplateName: "tmpl",
 	}); err != nil {
 		t.Fatalf("AddImage failed: %v", err)
@@ -112,6 +112,86 @@ func TestAllocateAndReuseIP(t *testing.T) {
 	s.data.NextIP = 255
 	if _, err := s.AllocateIP(); err == nil {
 		t.Fatal("expected IP exhaustion when NextIP exceeds 254 and no free IPs remain")
+	}
+}
+
+func TestAllocateIPSkipsAddressesStillInUse(t *testing.T) {
+	t.Parallel()
+
+	s, err := NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewAt failed: %v", err)
+	}
+	if err := s.AddContainer(&ContainerRecord{
+		ID:        "controller",
+		Name:      "controller",
+		IPAddress: "10.100.0.3",
+	}); err != nil {
+		t.Fatalf("AddContainer failed: %v", err)
+	}
+
+	s.data.FreeIPs = []int{3, 4}
+	ip, err := s.AllocateIP()
+	if err != nil {
+		t.Fatalf("AllocateIP failed: %v", err)
+	}
+	if ip != "10.100.0.4" {
+		t.Fatalf("expected allocator to skip in-use free-list IP, got %q", ip)
+	}
+	if len(s.data.FreeIPs) != 0 {
+		t.Fatalf("expected used free-list entry to be scrubbed, got %v", s.data.FreeIPs)
+	}
+	if err := s.AddContainer(&ContainerRecord{
+		ID:        "worker",
+		Name:      "worker",
+		IPAddress: ip,
+	}); err != nil {
+		t.Fatalf("AddContainer(worker) failed: %v", err)
+	}
+
+	s.data.NextIP = 3
+	ip, err = s.AllocateIP()
+	if err != nil {
+		t.Fatalf("AllocateIP from counter failed: %v", err)
+	}
+	if ip != "10.100.0.5" {
+		t.Fatalf("expected allocator to skip in-use counter IP, got %q", ip)
+	}
+}
+
+func TestFreeIPDoesNotFreeAddressStillInUse(t *testing.T) {
+	t.Parallel()
+
+	s, err := NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewAt failed: %v", err)
+	}
+	for _, rec := range []*ContainerRecord{
+		{ID: "one", Name: "one", IPAddress: "10.100.0.6"},
+		{ID: "two", Name: "two", IPAddress: "10.100.0.6"},
+	} {
+		if err := s.AddContainer(rec); err != nil {
+			t.Fatalf("AddContainer failed: %v", err)
+		}
+	}
+
+	s.FreeIP("10.100.0.6")
+	if len(s.data.FreeIPs) != 0 {
+		t.Fatalf("FreeIP should ignore addresses still in use, got %v", s.data.FreeIPs)
+	}
+
+	if err := s.RemoveContainer("one"); err != nil {
+		t.Fatalf("RemoveContainer(one) failed: %v", err)
+	}
+	if len(s.data.FreeIPs) != 0 {
+		t.Fatalf("RemoveContainer should not free duplicate address while still in use, got %v", s.data.FreeIPs)
+	}
+
+	if err := s.RemoveContainer("two"); err != nil {
+		t.Fatalf("RemoveContainer(two) failed: %v", err)
+	}
+	if len(s.data.FreeIPs) != 1 || s.data.FreeIPs[0] != 6 {
+		t.Fatalf("expected address to be freed after final user is removed, got %v", s.data.FreeIPs)
 	}
 }
 

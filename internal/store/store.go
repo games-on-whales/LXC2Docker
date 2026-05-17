@@ -59,11 +59,11 @@ type ContainerRecord struct {
 	OomScoreAdj  int                 `json:"oom_score_adj,omitempty"`
 	// Lifecycle policy. Hoisted out of RawHostConfig so the restart watcher
 	// doesn't have to re-decode the full JSON blob every 5 seconds.
-	RestartPolicy   string `json:"restart_policy,omitempty"`    // "always"|"on-failure"|"unless-stopped"|""
-	RestartMaxRetry int    `json:"restart_max_retry,omitempty"` // 0 = unlimited
-	RestartCount    int    `json:"restart_count,omitempty"`     // updated by the watcher
-	AutoRemove      bool   `json:"auto_remove,omitempty"`       // remove after exit
-	StoppedByUser   bool   `json:"stopped_by_user,omitempty"`   // set on explicit stop/kill to defeat unless-stopped
+	RestartPolicy   string                       `json:"restart_policy,omitempty"`    // "always"|"on-failure"|"unless-stopped"|""
+	RestartMaxRetry int                          `json:"restart_max_retry,omitempty"` // 0 = unlimited
+	RestartCount    int                          `json:"restart_count,omitempty"`     // updated by the watcher
+	AutoRemove      bool                         `json:"auto_remove,omitempty"`       // remove after exit
+	StoppedByUser   bool                         `json:"stopped_by_user,omitempty"`   // set on explicit stop/kill to defeat unless-stopped
 	Networks        map[string]NetworkAttachment `json:"networks,omitempty"`
 	// Raw HostConfig as JSON for full round-trip. Decoding happens at the
 	// API layer; the store treats this as opaque.
@@ -97,23 +97,23 @@ type HealthResult struct {
 // OCI package shape.
 type HealthcheckConfig struct {
 	Test        []string `json:"Test"`
-	Interval    int64    `json:"Interval"`     // duration in nanoseconds
-	Timeout     int64    `json:"Timeout"`      // duration in nanoseconds
-	StartPeriod int64    `json:"StartPeriod"`  // duration in nanoseconds
+	Interval    int64    `json:"Interval"`    // duration in nanoseconds
+	Timeout     int64    `json:"Timeout"`     // duration in nanoseconds
+	StartPeriod int64    `json:"StartPeriod"` // duration in nanoseconds
 	Retries     int      `json:"Retries"`
 }
 
 // NetworkAttachment captures the subset of fields we keep when persisting
 // container↔network bindings.
 type NetworkAttachment struct {
-	NetworkID  string            `json:"network_id"`
-	IPAddress  string            `json:"ip_address"`
-	Gateway    string            `json:"gateway"`
-	MacAddress string            `json:"mac_address"`
-	EndpointID string            `json:"endpoint_id"`
-	Aliases    []string          `json:"aliases"`
-	Links      []string          `json:"links"`
-	DriverOpts map[string]string `json:"driver_opts"`
+	NetworkID  string              `json:"network_id"`
+	IPAddress  string              `json:"ip_address"`
+	Gateway    string              `json:"gateway"`
+	MacAddress string              `json:"mac_address"`
+	EndpointID string              `json:"endpoint_id"`
+	Aliases    []string            `json:"aliases"`
+	Links      []string            `json:"links"`
+	DriverOpts map[string]string   `json:"driver_opts"`
 	IPAMConfig *EndpointIPAMConfig `json:"ipam_config"`
 }
 
@@ -174,36 +174,36 @@ type ImageRecord struct {
 	TemplateVMID int       `json:"template_vmid"` // Proxmox CT VMID of the template (0 = legacy)
 	Created      time.Time `json:"created"`
 	// OCI image metadata (populated only for OCI-pulled images).
-	OCIEntrypoint []string          `json:"oci_entrypoint,omitempty"`
-	OCICmd        []string          `json:"oci_cmd,omitempty"`
-	OCIEnv        []string          `json:"oci_env,omitempty"`
-	OCIWorkingDir string            `json:"oci_working_dir,omitempty"`
-	OCIHostname   string            `json:"oci_hostname,omitempty"`
-	OCIDomainname string            `json:"oci_domainname,omitempty"`
-	OCIMacAddress string            `json:"oci_mac_address,omitempty"`
-	OCIPorts      []string          `json:"oci_ports,omitempty"`
-	OCILabels     map[string]string `json:"oci_labels,omitempty"`
-	OCIUser       string            `json:"oci_user,omitempty"`
-	OCIAttachStdin bool             `json:"oci_attach_stdin,omitempty"`
-	OCIAttachStdout bool            `json:"oci_attach_stdout,omitempty"`
-	OCIAttachStderr bool            `json:"oci_attach_stderr,omitempty"`
-	OCITty        bool              `json:"oci_tty,omitempty"`
-	OCIOpenStdin  bool              `json:"oci_open_stdin,omitempty"`
-	OCIStdinOnce  bool              `json:"oci_stdin_once,omitempty"`
-	OCIArgsEscaped bool             `json:"oci_args_escaped,omitempty"`
-	OCINetworkDisabled bool         `json:"oci_network_disabled,omitempty"`
-	OCIStopSignal string            `json:"oci_stop_signal,omitempty"`
-	OCIStopTimeout int              `json:"oci_stop_timeout,omitempty"`
-	OCIHealthcheck *HealthcheckConfig `json:"oci_healthcheck,omitempty"`
-	OCIVolumes    []string          `json:"oci_volumes,omitempty"`
-	OCIOnBuild    []string          `json:"oci_onbuild,omitempty"`
-	OCIShell      []string          `json:"oci_shell,omitempty"`
-	OCIAuthor     string            `json:"oci_author,omitempty"`
-	OCIComment    string            `json:"oci_comment,omitempty"`
-	OCIContainer  string            `json:"oci_container,omitempty"`
-	OCIDockerVersion string         `json:"oci_docker_version,omitempty"`
-	OCIVariant    string            `json:"oci_variant,omitempty"`
-	TemplateDataset string           `json:"template_dataset,omitempty"`
+	OCIEntrypoint      []string           `json:"oci_entrypoint,omitempty"`
+	OCICmd             []string           `json:"oci_cmd,omitempty"`
+	OCIEnv             []string           `json:"oci_env,omitempty"`
+	OCIWorkingDir      string             `json:"oci_working_dir,omitempty"`
+	OCIHostname        string             `json:"oci_hostname,omitempty"`
+	OCIDomainname      string             `json:"oci_domainname,omitempty"`
+	OCIMacAddress      string             `json:"oci_mac_address,omitempty"`
+	OCIPorts           []string           `json:"oci_ports,omitempty"`
+	OCILabels          map[string]string  `json:"oci_labels,omitempty"`
+	OCIUser            string             `json:"oci_user,omitempty"`
+	OCIAttachStdin     bool               `json:"oci_attach_stdin,omitempty"`
+	OCIAttachStdout    bool               `json:"oci_attach_stdout,omitempty"`
+	OCIAttachStderr    bool               `json:"oci_attach_stderr,omitempty"`
+	OCITty             bool               `json:"oci_tty,omitempty"`
+	OCIOpenStdin       bool               `json:"oci_open_stdin,omitempty"`
+	OCIStdinOnce       bool               `json:"oci_stdin_once,omitempty"`
+	OCIArgsEscaped     bool               `json:"oci_args_escaped,omitempty"`
+	OCINetworkDisabled bool               `json:"oci_network_disabled,omitempty"`
+	OCIStopSignal      string             `json:"oci_stop_signal,omitempty"`
+	OCIStopTimeout     int                `json:"oci_stop_timeout,omitempty"`
+	OCIHealthcheck     *HealthcheckConfig `json:"oci_healthcheck,omitempty"`
+	OCIVolumes         []string           `json:"oci_volumes,omitempty"`
+	OCIOnBuild         []string           `json:"oci_onbuild,omitempty"`
+	OCIShell           []string           `json:"oci_shell,omitempty"`
+	OCIAuthor          string             `json:"oci_author,omitempty"`
+	OCIComment         string             `json:"oci_comment,omitempty"`
+	OCIContainer       string             `json:"oci_container,omitempty"`
+	OCIDockerVersion   string             `json:"oci_docker_version,omitempty"`
+	OCIVariant         string             `json:"oci_variant,omitempty"`
+	TemplateDataset    string             `json:"template_dataset,omitempty"`
 	// RepoDigest holds the image manifest digest ("sha256:...") when
 	// known. Populated by skopeo inspect after pull. Used to surface a
 	// canonical reference on the image detail page.
@@ -280,32 +280,49 @@ func (s *Store) AllocateIP() (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var octet int
+	used := s.usedIPOctetsLocked()
 	if len(s.data.FreeIPs) > 0 {
-		octet = s.data.FreeIPs[0]
-		s.data.FreeIPs = s.data.FreeIPs[1:]
-	} else {
-		if s.data.NextIP > 254 {
-			return "", fmt.Errorf("store: IP space exhausted")
+		var reuseOctet int
+		remaining := s.data.FreeIPs[:0]
+		for _, octet := range s.data.FreeIPs {
+			if octet < 2 || octet > 254 || used[octet] {
+				continue
+			}
+			if reuseOctet == 0 {
+				reuseOctet = octet
+				continue
+			}
+			remaining = append(remaining, octet)
 		}
-		octet = s.data.NextIP
-		s.data.NextIP++
+		s.data.FreeIPs = remaining
+		if reuseOctet != 0 {
+			ip := fmt.Sprintf("10.100.0.%d", reuseOctet)
+			return ip, s.save()
+		}
 	}
-	ip := fmt.Sprintf("10.100.0.%d", octet)
-	return ip, s.save()
+
+	for s.data.NextIP <= 254 {
+		octet := s.data.NextIP
+		s.data.NextIP++
+		if used[octet] {
+			continue
+		}
+		ip := fmt.Sprintf("10.100.0.%d", octet)
+		return ip, s.save()
+	}
+	return "", fmt.Errorf("store: IP space exhausted")
 }
 
 // FreeIP returns an IP address to the pool for reuse.
 func (s *Store) FreeIP(ip string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	parts := strings.Split(ip, ".")
-	if len(parts) == 4 {
-		if octet, err := strconv.Atoi(parts[3]); err == nil && octet >= 2 {
-			s.data.FreeIPs = append(s.data.FreeIPs, octet)
-			s.save()
-		}
+	octet, ok := parseManagedIPOctet(ip)
+	if !ok || s.usedIPOctetsLocked()[octet] {
+		return
 	}
+	s.appendFreeIPLocked(octet)
+	s.save()
 }
 
 // AddContainer persists a new container record.
@@ -321,19 +338,59 @@ func (s *Store) RemoveContainer(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	var freedOctet int
 	if rec, ok := s.data.Containers[id]; ok && rec.IPAddress != "" {
-		if ip := net.ParseIP(rec.IPAddress); ip != nil {
-			parts := strings.Split(rec.IPAddress, ".")
-			if len(parts) == 4 {
-				if octet, err := strconv.Atoi(parts[3]); err == nil && octet >= 2 {
-					s.data.FreeIPs = append(s.data.FreeIPs, octet)
-				}
-			}
+		if octet, ok := parseManagedIPOctet(rec.IPAddress); ok {
+			freedOctet = octet
 		}
 	}
 
 	delete(s.data.Containers, id)
+	if freedOctet != 0 && !s.usedIPOctetsLocked()[freedOctet] {
+		s.appendFreeIPLocked(freedOctet)
+	}
 	return s.save()
+}
+
+func (s *Store) usedIPOctetsLocked() map[int]bool {
+	used := make(map[int]bool, len(s.data.Containers))
+	for _, rec := range s.data.Containers {
+		if rec == nil {
+			continue
+		}
+		if octet, ok := parseManagedIPOctet(rec.IPAddress); ok {
+			used[octet] = true
+		}
+	}
+	return used
+}
+
+func (s *Store) appendFreeIPLocked(octet int) {
+	if octet < 2 || octet > 254 {
+		return
+	}
+	for _, free := range s.data.FreeIPs {
+		if free == octet {
+			return
+		}
+	}
+	s.data.FreeIPs = append(s.data.FreeIPs, octet)
+}
+
+func parseManagedIPOctet(ip string) (int, bool) {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return 0, false
+	}
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 || parts[0] != "10" || parts[1] != "100" || parts[2] != "0" {
+		return 0, false
+	}
+	octet, err := strconv.Atoi(parts[3])
+	if err != nil || octet < 2 || octet > 254 {
+		return 0, false
+	}
+	return octet, true
 }
 
 // GetContainer returns the record for id, or nil if not found.
