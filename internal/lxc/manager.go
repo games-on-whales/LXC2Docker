@@ -81,6 +81,11 @@ func (m *Manager) reconcile() {
 		}
 		state, _ := m.State(rec.ID)
 		if state == "running" && rec.IPAddress != "" {
+			if rec.VMID == 0 {
+				if err := m.ensureBridgeAttachment(rec.ID); err != nil {
+					log.Printf("reconcile: bridge attach for %s (%s) failed: %v", rec.Name, rec.ID[:12], err)
+				}
+			}
 			for _, pb := range rec.PortBindings {
 				if err := AddPortForward(rec.IPAddress, pb.HostPort, pb.ContainerPort, pb.Proto); err != nil {
 					log.Printf("reconcile: port forward %d->%s:%d/%s failed: %v",
@@ -1250,12 +1255,65 @@ func (m *Manager) startLXCContainer(id string) error {
 	for time.Now().Before(deadline) {
 		state, _ := m.State(id)
 		if state == "running" {
+			if err := m.ensureBridgeAttachment(id); err != nil {
+				return err
+			}
 			log.Printf("StartContainer[LXC]: %s is running", id)
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("manager: container %s did not reach RUNNING within 30s", id)
+}
+
+func (m *Manager) ensureBridgeAttachment(id string) error {
+	var link string
+	var out []byte
+	var err error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err = exec.Command("lxc-info", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("manager: inspect network link for %s: %s: %w", id, out, err)
+		}
+		link = lxcInfoLink(string(out))
+		if link != "" {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if link == "" {
+		return fmt.Errorf("manager: inspect network link for %s: no Link in lxc-info output: %s", id, out)
+	}
+
+	out, err = exec.Command("ip", "-o", "link", "show", link).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("manager: inspect host link %s: %s: %w", link, out, err)
+	}
+	if strings.Contains(string(out), " master "+BridgeName+" ") {
+		return nil
+	}
+	if out, err = exec.Command("ip", "link", "set", link, "master", BridgeName).CombinedOutput(); err != nil {
+		return fmt.Errorf("manager: attach host link %s to %s: %s: %w", link, BridgeName, out, err)
+	}
+	if out, err = exec.Command("ip", "link", "set", link, "up").CombinedOutput(); err != nil {
+		return fmt.Errorf("manager: set host link %s up: %s: %w", link, out, err)
+	}
+	log.Printf("StartContainer[LXC]: attached host link %s to %s for %s", link, BridgeName, id[:12])
+	return nil
+}
+
+func lxcInfoLink(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(key) != "Link" {
+			continue
+		}
+		if fields := strings.Fields(value); len(fields) > 0 {
+			return fields[0]
+		}
+	}
+	return ""
 }
 
 // StopContainer stops a running container gracefully, waiting up to timeout.
