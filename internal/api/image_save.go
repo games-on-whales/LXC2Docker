@@ -270,6 +270,7 @@ func synthesiseImageConfig(rec *store.ImageRecord, layerSHA string) ([]byte, str
 		"Entrypoint": append([]string{}, rec.OCIEntrypoint...),
 		"WorkingDir": rec.OCIWorkingDir,
 		"User":       rec.OCIUser,
+		"Volumes":    volumeMapFromSlice(rec.OCIVolumes),
 		"StopSignal": rec.OCIStopSignal,
 		"Labels":     copyLabels(rec.OCILabels),
 	}
@@ -349,6 +350,7 @@ type saveImageConfig struct {
 		Entrypoint   []string            `json:"Entrypoint"`
 		WorkingDir   string              `json:"WorkingDir"`
 		User         string              `json:"User"`
+		Volumes      map[string]struct{} `json:"Volumes"`
 		StopSignal   string              `json:"StopSignal"`
 		Labels       map[string]string   `json:"Labels"`
 		ExposedPorts map[string]struct{} `json:"ExposedPorts"`
@@ -471,6 +473,7 @@ func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send 
 			OCIPorts:        mapKeys(cfg.Config.ExposedPorts),
 			OCILabels:       cfg.Config.Labels,
 			OCIUser:         cfg.Config.User,
+			OCIVolumes:      mapKeys(cfg.Config.Volumes),
 			OCIStopSignal:   cfg.Config.StopSignal,
 		}
 		if hc := cfg.Config.Healthcheck; hc != nil && len(hc.Test) > 0 {
