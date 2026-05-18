@@ -104,6 +104,8 @@ func main() {
 
 	// Start background GC that removes stopped ephemeral containers.
 	mgr.StartGC(ctx)
+	// Keep bridge/NAT state present after host firewall reloads.
+	mgr.StartNetworkReconciler(ctx)
 	// Start the restart-policy / AutoRemove watcher.
 	mgr.StartRestartWatcherWithEmitter(ctx, restartEmit)
 	// Start the HEALTHCHECK runner so Portainer's health badge updates.
