@@ -122,6 +122,25 @@ func (m *Manager) StartGC(ctx context.Context) {
 	}()
 }
 
+// StartNetworkReconciler keeps the managed bridge and NAT table present even
+// if another host firewall manager reloads nftables after daemon startup.
+func (m *Manager) StartNetworkReconciler(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := EnsureBridge(); err != nil {
+					log.Printf("network reconcile: %v", err)
+				}
+			}
+		}
+	}()
+}
+
 // consoleLogMax caps each container's console.log at this size. LXC opens
 // the file with O_APPEND, so truncating in place works correctly — the next
 // write seeks to the new end-of-file (0) without corruption. 10 MB keeps
@@ -880,6 +899,11 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 	if rec == nil {
 		return fmt.Errorf("manager: image %q not found; run pull first", imageRef)
 	}
+	if cfg.NetworkMode != "host" {
+		if err := EnsureBridge(); err != nil {
+			return fmt.Errorf("manager: bridge: %w", err)
+		}
+	}
 
 	if m.UsePVE() && cfg.ProxmoxCT && rec.TemplateVMID > 0 {
 		return m.createPVEContainer(id, rec, cfg)
@@ -1209,6 +1233,11 @@ func (m *Manager) StartContainer(id string) error {
 	}
 
 	rec := m.store.GetContainer(id)
+	if rec != nil && rec.IPAddress != "" {
+		if err := EnsureBridge(); err != nil {
+			return fmt.Errorf("manager: bridge: %w", err)
+		}
+	}
 	if rec != nil && rec.VMID > 0 {
 		return m.startPVEContainer(id, rec.VMID)
 	}
@@ -1753,8 +1782,6 @@ func defaultResolvConf() string {
 	servers := hostNameservers()
 	if len(servers) == 0 {
 		servers = fallbackNameservers
-	} else {
-		servers = appendMissingNameservers(servers, fallbackNameservers...)
 	}
 	var b strings.Builder
 	for _, server := range servers {
@@ -1766,20 +1793,6 @@ func defaultResolvConf() string {
 	b.WriteString(defaultDNSOptions)
 	b.WriteByte('\n')
 	return b.String()
-}
-
-func appendMissingNameservers(servers []string, fallbacks ...string) []string {
-	seen := map[string]bool{}
-	for _, server := range servers {
-		seen[server] = true
-	}
-	for _, server := range fallbacks {
-		if !seen[server] {
-			servers = append(servers, server)
-			seen[server] = true
-		}
-	}
-	return servers
 }
 
 func hostNameservers() []string {
