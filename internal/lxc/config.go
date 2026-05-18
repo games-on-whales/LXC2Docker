@@ -526,7 +526,7 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	items = append(items, sysctlItems(cfg)...)
 	items = append(items, tmpfsItems(cfg)...)
 	items = append(items, ulimitItems(cfg)...)
-	items = append(items, rawConfigItems(cfg.RawConfig)...)
+	items = append(items, rawConfigItems(cfg, cfg.RawConfig)...)
 
 	// Console log so we can serve it via the logs API
 	if cfg.LogFile != "" {
@@ -1110,7 +1110,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	items = append(items, sysctlItems(cfg)...)
 	items = append(items, tmpfsItems(cfg)...)
 	items = append(items, ulimitItems(cfg)...)
-	items = append(items, rawConfigItems(cfg.RawConfig)...)
+	items = append(items, rawConfigItems(cfg, cfg.RawConfig)...)
 
 	// Console log.
 	if cfg.LogFile != "" {
@@ -1120,16 +1120,59 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	return items
 }
 
-func rawConfigItems(lines []string) []configItem {
+func rawConfigItems(cfg *ContainerConfig, lines []string) []configItem {
 	items := make([]configItem, 0, len(lines))
 	for _, line := range lines {
 		key, value, ok := parseRawConfigLine(line)
 		if !ok {
 			continue
 		}
+		if key == "lxc.mount.entry" {
+			if rewritten, ok := appendRawSocketMount(items, cfg, value); ok {
+				items = rewritten
+				continue
+			}
+		}
 		items = append(items, configItem{key: key, value: value})
 	}
 	return items
+}
+
+func appendRawSocketMount(items []configItem, cfg *ContainerConfig, value string) ([]configItem, bool) {
+	fields := strings.Fields(value)
+	if len(fields) < 4 {
+		return nil, false
+	}
+
+	source := unescapeMountField(fields[0])
+	if real, err := filepath.EvalSymlinks(source); err == nil {
+		source = real
+	}
+	fi, err := os.Stat(source)
+	if err != nil || fi.Mode()&os.ModeSocket == 0 {
+		return nil, false
+	}
+
+	dest := "/" + strings.TrimPrefix(unescapeMountField(fields[1]), "/")
+	mount := MountSpec{
+		Source:      source,
+		Destination: dest,
+		ReadOnly:    mountOptionsContain(fields[3], "ro"),
+	}
+	return appendSocketMount(items, cfg, source, mount), true
+}
+
+func unescapeMountField(field string) string {
+	return strings.ReplaceAll(field, `\040`, " ")
+}
+
+func mountOptionsContain(opts, want string) bool {
+	for _, opt := range strings.Split(opts, ",") {
+		if strings.TrimSpace(opt) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func parseRawConfigLine(line string) (string, string, bool) {
