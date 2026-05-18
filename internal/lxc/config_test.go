@@ -1,6 +1,8 @@
 package lxc
 
 import (
+	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -123,6 +125,36 @@ func TestBuildItemsAppendsRawConfig(t *testing.T) {
 		if item.key == "not-lxc" || strings.Contains(item.value, "INJECTED") {
 			t.Fatalf("unexpected raw item accepted: %#v", item)
 		}
+	}
+}
+
+func TestBuildItemsRewritesRawSocketMounts(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "docker.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen unix socket: %v", err)
+	}
+	defer listener.Close()
+
+	cfg := &ContainerConfig{
+		RawConfig: []string{
+			"lxc.mount.entry = " + socketPath + " var/run/docker.sock none bind,optional,create=file 0 0",
+		},
+	}
+	items := buildItems(cfg, "10.0.0.2")
+
+	wantMount := strings.ReplaceAll(dir, " ", `\040`) + " .socket-dirs/" + filepath.Base(dir) + " none bind,create=dir 0 0"
+	if !hasMountEntry(items, wantMount) {
+		t.Fatalf("expected rewritten socket dir mount %q, got %#v", wantMount, items)
+	}
+	if hasMountEntry(items, socketPath+" var/run/docker.sock none bind,optional,create=file 0 0") {
+		t.Fatalf("raw socket file mount should have been rewritten: %#v", items)
+	}
+	if got := cfg.SocketLinks["/var/run/docker.sock"]; got != "/.socket-dirs/"+filepath.Base(dir)+"/docker.sock" {
+		t.Fatalf("unexpected socket link target %q", got)
 	}
 }
 
