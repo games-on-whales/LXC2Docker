@@ -1,6 +1,6 @@
-// Package lxc wraps go-lxc to provide container lifecycle operations for the
-// docker-lxc-daemon. All container names managed here are the raw LXC names
-// (which double as Docker container IDs).
+// Package lxc wraps LXC lifecycle operations for the docker-lxc-daemon. All
+// container names managed here are the raw LXC names (which double as Docker
+// container IDs).
 package lxc
 
 import (
@@ -18,7 +18,6 @@ import (
 	"github.com/games-on-whales/LXC2Docker/internal/image"
 	"github.com/games-on-whales/LXC2Docker/internal/oci"
 	"github.com/games-on-whales/LXC2Docker/internal/store"
-	liblxc "github.com/lxc/go-lxc"
 )
 
 // LANConfig holds daemon-level LAN bridge settings for dual-NIC containers.
@@ -627,19 +626,18 @@ func (m *Manager) pullDistro(r *image.ResolvedImage, progress func(string)) erro
 	progress(fmt.Sprintf("Pulling %s %s/%s from images.linuxcontainers.org",
 		r.Ref, r.Distro, r.Release))
 
-	c, err := liblxc.NewContainer(r.TemplateContainerName, m.lxcPath)
+	out, err := exec.Command(
+		"lxc-create",
+		"-n", r.TemplateContainerName,
+		"--lxcpath", m.lxcPath,
+		"-t", "download",
+		"--",
+		"-d", r.Distro,
+		"-r", r.Release,
+		"-a", r.Arch,
+	).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: new container %s: %w", r.TemplateContainerName, err)
-	}
-
-	opts := liblxc.TemplateOptions{
-		Template: "download",
-		Distro:   r.Distro,
-		Release:  r.Release,
-		Arch:     r.Arch,
-	}
-	if err := c.Create(opts); err != nil {
-		return fmt.Errorf("manager: create template %s: %w", r.TemplateContainerName, err)
+		return fmt.Errorf("manager: create template %s: %s: %w", r.TemplateContainerName, out, err)
 	}
 
 	// Record image in store.
@@ -669,14 +667,7 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 
 	// 2. Clone base → app template.
 	progress(fmt.Sprintf("Creating app template for %s", r.Ref))
-	base, err := liblxc.NewContainer(baseResolved.TemplateContainerName, m.lxcPath)
-	if err != nil {
-		return fmt.Errorf("manager: open base template: %w", err)
-	}
-	if err := base.Clone(r.TemplateContainerName, liblxc.CloneOptions{
-		Backend:  liblxc.Directory,
-		Snapshot: false,
-	}); err != nil {
+	if err := m.cloneLegacyTemplate(baseResolved.TemplateContainerName, r.TemplateContainerName); err != nil {
 		return fmt.Errorf("manager: clone base → app template: %w", err)
 	}
 
@@ -700,16 +691,13 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 	os.WriteFile(resolvPath, []byte(defaultResolvConf()), 0o644)
 
 	// Start the app template container temporarily.
-	appTemplate, err := liblxc.NewContainer(r.TemplateContainerName, m.lxcPath)
+	out, err := exec.Command("lxc-start", "-n", r.TemplateContainerName, "--lxcpath", m.lxcPath).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: open app template: %w", err)
+		return fmt.Errorf("manager: start app template: %s: %w", out, err)
 	}
-	if err := appTemplate.Start(); err != nil {
-		return fmt.Errorf("manager: start app template: %w", err)
-	}
-	defer appTemplate.Stop()
+	defer exec.Command("lxc-stop", "-n", r.TemplateContainerName, "--lxcpath", m.lxcPath).Run()
 
-	if err := waitRunning(appTemplate, 30*time.Second); err != nil {
+	if err := m.waitRunning(r.TemplateContainerName, 30*time.Second); err != nil {
 		return fmt.Errorf("manager: app template did not start: %w", err)
 	}
 
@@ -717,7 +705,7 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 	if len(r.App.Packages) > 0 {
 		progress(fmt.Sprintf("Installing packages: %s", strings.Join(r.App.Packages, " ")))
 		installCmd := buildInstallCmd(r.Distro, r.App.Packages)
-		if err := m.runInContainer(appTemplate, installCmd); err != nil {
+		if err := m.runInContainer(r.TemplateContainerName, installCmd); err != nil {
 			return fmt.Errorf("manager: install packages: %w", err)
 		}
 	}
@@ -725,7 +713,7 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 	// 5. Run post-install script if any.
 	if r.App.PostInstall != "" {
 		progress("Running post-install")
-		if err := m.runInContainer(appTemplate, r.App.PostInstall); err != nil {
+		if err := m.runInContainer(r.TemplateContainerName, r.App.PostInstall); err != nil {
 			return fmt.Errorf("manager: post-install: %w", err)
 		}
 	}
@@ -1062,24 +1050,14 @@ lxc.uts.name = %s
 // createLegacyContainer clones via lxc-copy (no Proxmox, no ZFS).
 func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
 	log.Printf("CreateContainer[legacy]: cloning %s → %s", imgRec.TemplateName, id)
-	out, err := exec.Command("lxc-copy",
-		"-n", imgRec.TemplateName,
-		"-N", id,
-		"--lxcpath", m.lxcPath,
-		"--newpath", m.lxcPath,
-	).CombinedOutput()
-	if err != nil {
-		log.Printf("CreateContainer[legacy]: lxc-copy failed for %s → %s; trying directory copy fallback: %s: %v",
-			imgRec.TemplateName, id, out, err)
-		if copyErr := m.cloneLegacyTemplateByCopy(imgRec.TemplateName, id); copyErr != nil {
-			return fmt.Errorf("manager: clone %s → %s: %s: %w; directory copy fallback: %v",
-				imgRec.TemplateName, id, out, err, copyErr)
-		}
+	if err := m.cloneLegacyTemplate(imgRec.TemplateName, id); err != nil {
+		return err
 	}
 
 	// Allocate IP for bridge networking.
 	var ip string
 	if cfg.NetworkMode != "host" {
+		var err error
 		ip, err = m.store.AllocateIP()
 		if err != nil {
 			m.destroyOrphan(id)
@@ -1107,6 +1085,25 @@ func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cf
 	if storeRec := m.store.GetContainer(id); storeRec != nil {
 		storeRec.IPAddress = ip
 		return m.store.AddContainer(storeRec)
+	}
+	return nil
+}
+
+func (m *Manager) cloneLegacyTemplate(templateName, id string) error {
+	out, err := exec.Command("lxc-copy",
+		"-n", templateName,
+		"-N", id,
+		"--lxcpath", m.lxcPath,
+		"--newpath", m.lxcPath,
+	).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	log.Printf("lxc-copy failed for %s → %s; trying directory copy fallback: %s: %v",
+		templateName, id, out, err)
+	if copyErr := m.cloneLegacyTemplateByCopy(templateName, id); copyErr != nil {
+		return fmt.Errorf("manager: clone %s → %s: %s: %w; directory copy fallback: %v",
+			templateName, id, out, err, copyErr)
 	}
 	return nil
 }
@@ -1927,20 +1924,20 @@ func (m *Manager) containerExists(name string) bool {
 	return err == nil
 }
 
-func waitRunning(c *liblxc.Container, timeout time.Duration) error {
+func (m *Manager) waitRunning(name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if c.State() == liblxc.RUNNING {
+		if state, _ := m.State(name); state == "running" {
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("container %s did not reach RUNNING within %s", c.Name(), timeout)
+	return fmt.Errorf("container %s did not reach RUNNING within %s", name, timeout)
 }
 
-func (m *Manager) runInContainer(c *liblxc.Container, shellCmd string) error {
+func (m *Manager) runInContainer(name, shellCmd string) error {
 	out, err := exec.Command(
-		"lxc-attach", "-n", c.Name(), "--lxcpath", m.lxcPath,
+		"lxc-attach", "-n", name, "--lxcpath", m.lxcPath,
 		"--", "/bin/sh", "-c", shellCmd,
 	).CombinedOutput()
 	if err != nil {

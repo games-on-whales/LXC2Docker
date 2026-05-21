@@ -1,7 +1,6 @@
 package lxc
 
 import (
-	"net"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -129,15 +128,13 @@ func TestBuildItemsAppendsRawConfig(t *testing.T) {
 }
 
 func TestBuildItemsRewritesRawSocketMounts(t *testing.T) {
-	t.Parallel()
-
 	dir := t.TempDir()
 	socketPath := filepath.Join(dir, "docker.sock")
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatalf("listen unix socket: %v", err)
+	oldStatUnixSocket := statUnixSocket
+	statUnixSocket = func(path string) (string, bool) {
+		return path, path == socketPath
 	}
-	defer listener.Close()
+	t.Cleanup(func() { statUnixSocket = oldStatUnixSocket })
 
 	cfg := &ContainerConfig{
 		RawConfig: []string{
