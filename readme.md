@@ -6,7 +6,7 @@ or any Docker SDK without modification.
 
 ## Build
 
-Requires Go 1.21+, `liblxc-dev`, `pkg-config`.
+Requires Go 1.21+ and the LXC command-line tools on hosts that run containers.
 
 ```sh
 make build        # -> bin/docker-lxc-daemon
