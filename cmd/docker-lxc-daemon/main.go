@@ -111,18 +111,28 @@ func main() {
 	// Start the HEALTHCHECK runner so Portainer's health badge updates.
 	mgr.StartHealthWatcher(ctx, healthEmit)
 
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		log.Println("shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("http shutdown: %v", err)
+		}
+		cancel()
+		if err := mgr.StopAllContainers(30 * time.Second); err != nil {
+			log.Printf("container shutdown: %v", err)
+		}
 		lxc.TeardownBridge()
 	}()
 
 	fmt.Printf("docker-lxc-daemon listening on %s\n", *socketPath)
 	if err := srv.Serve(l); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("serve: %v", err)
+	}
+	if ctx.Err() != nil {
+		<-shutdownDone
 	}
 }
 

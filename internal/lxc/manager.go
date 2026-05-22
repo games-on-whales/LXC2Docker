@@ -6,6 +6,7 @@ package lxc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/games-on-whales/LXC2Docker/internal/image"
@@ -1346,6 +1348,60 @@ func lxcInfoLink(out string) string {
 // For Proxmox CTs uses pct shutdown; otherwise lxc-stop.
 func (m *Manager) StopContainer(id string, timeout time.Duration) error {
 	return m.StopContainerWithSignal(id, timeout, "")
+}
+
+// StopAllContainers stops every running container tracked by the daemon.
+// LXC moves monitors and payloads into their own top-level cgroups, so systemd
+// cannot clean them up by killing the daemon service cgroup alone.
+func (m *Manager) StopAllContainers(timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+
+	containers := m.store.ListContainers()
+	var wg sync.WaitGroup
+	errs := make(chan error, len(containers))
+	stopping := 0
+
+	for _, rec := range containers {
+		if rec == nil {
+			continue
+		}
+		state, err := m.State(rec.ID)
+		if err != nil {
+			log.Printf("shutdown: inspect %s (%s): %v", rec.Name, rec.ID[:12], err)
+		}
+		if state != "running" && state != "paused" {
+			continue
+		}
+
+		stopping++
+		wg.Add(1)
+		go func(rec *store.ContainerRecord, state string) {
+			defer wg.Done()
+			log.Printf("shutdown: stopping container %s (%s)", rec.Name, rec.ID[:12])
+			if state == "paused" {
+				if err := m.UnpauseContainer(rec.ID); err != nil {
+					log.Printf("shutdown: unpause %s (%s): %v", rec.Name, rec.ID[:12], err)
+				}
+			}
+			if err := m.StopContainerWithSignal(rec.ID, timeout, rec.StopSignal); err != nil {
+				errs <- fmt.Errorf("stop %s (%s): %w", rec.Name, rec.ID[:12], err)
+			}
+		}(rec, state)
+	}
+
+	wg.Wait()
+	close(errs)
+
+	var joined error
+	for err := range errs {
+		joined = errors.Join(joined, err)
+	}
+	if stopping > 0 {
+		log.Printf("shutdown: requested stop for %d container(s)", stopping)
+	}
+	return joined
 }
 
 func (m *Manager) StopContainerWithSignal(id string, timeout time.Duration, signal string) error {
