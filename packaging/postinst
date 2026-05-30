@@ -1,0 +1,22 @@
+#!/bin/sh
+# postinst for docker-lxc-daemon: prepare the docker group + systemd, but do
+# not auto-start (the daemon takes over /var/run/docker.sock, so the admin
+# opts in once the real Docker daemon is gone).
+set -e
+
+case "$1" in
+configure)
+    # Match the real Docker daemon's group convention so members of 'docker'
+    # can reach the socket without root.
+    if ! getent group docker >/dev/null 2>&1; then
+        addgroup --system docker >/dev/null 2>&1 || true
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    echo "docker-lxc-daemon installed."
+    echo "Enable it with:  systemctl enable --now docker-lxc-daemon"
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,14 @@
+#!/bin/sh
+# prerm for docker-lxc-daemon: stop the service before files are removed.
+set -e
+
+case "$1" in
+remove | deconfigure)
+    if [ -d /run/systemd/system ]; then
+        systemctl stop docker-lxc-daemon >/dev/null 2>&1 || true
+        systemctl disable docker-lxc-daemon >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0
