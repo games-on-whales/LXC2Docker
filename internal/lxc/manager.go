@@ -1059,23 +1059,19 @@ lxc.uts.name = %s
 	return nil
 }
 
-// createLegacyContainer clones via lxc-copy (no Proxmox, no ZFS).
+// createLegacyContainer clones the image template into a new container by
+// directory copy (no Proxmox, no ZFS).
+//
+// We deliberately avoid `lxc-copy`: its directory-backed storage clone rsyncs
+// through the new mount API (move_detached_mount), which newer kernels (e.g.
+// Proxmox 7.0-pve) deny in this context — so it slowly rsyncs and then fails.
+// A plain rootfs copy works regardless of the kernel's mount-API mediation.
 func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
-	log.Printf("CreateContainer[legacy]: cloning %s → %s", imgRec.TemplateName, id)
-	out, err := exec.Command("lxc-copy",
-		"-n", imgRec.TemplateName,
-		"-N", id,
-		"--lxcpath", m.lxcPath,
-		"--newpath", m.lxcPath,
-	).CombinedOutput()
-	if err != nil {
-		log.Printf("CreateContainer[legacy]: lxc-copy failed for %s → %s; trying directory copy fallback: %s: %v",
-			imgRec.TemplateName, id, out, err)
-		if copyErr := m.cloneLegacyTemplateByCopy(imgRec.TemplateName, id); copyErr != nil {
-			return fmt.Errorf("manager: clone %s → %s: %s: %w; directory copy fallback: %v",
-				imgRec.TemplateName, id, out, err, copyErr)
-		}
+	log.Printf("CreateContainer[legacy]: cloning %s → %s by directory copy", imgRec.TemplateName, id)
+	if err := m.cloneLegacyTemplateByCopy(imgRec.TemplateName, id); err != nil {
+		return fmt.Errorf("manager: clone %s → %s: %w", imgRec.TemplateName, id, err)
 	}
+	var err error
 
 	// Allocate IP for bridge networking.
 	var ip string
