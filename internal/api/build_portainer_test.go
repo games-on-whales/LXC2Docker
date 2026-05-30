@@ -103,23 +103,32 @@ func TestEvaluateBuildStagePreservesPortainerMetadata(t *testing.T) {
 	}
 }
 
-func TestBuildRunArgsHonorsDockerfileUserForPortainerBuilds(t *testing.T) {
+func TestBuildRunArgvWrapsDockerfileUserForPortainerBuilds(t *testing.T) {
 	t.Parallel()
 
-	args := buildRunArgs("/tmp/rootfs", []string{"/bin/sh", "-lc"}, "1000:1000", "echo hi")
-	want := []string{"--userspec", "1000:1000", "/tmp/rootfs", "/bin/sh", "-lc", "echo hi"}
-	if len(args) != len(want) {
-		t.Fatalf("expected %d args, got %d: %#v", len(want), len(args), args)
+	// With a USER, the RUN script is wrapped in `su` so a name resolves inside
+	// the container (lxc-attach -u only takes numeric uids).
+	argv := buildRunArgv([]string{"/bin/sh", "-lc"}, "aimee", "echo hi")
+	want := []string{"su", "-s", "/bin/sh", "-c", "echo hi", "aimee"}
+	if len(argv) != len(want) {
+		t.Fatalf("expected %d args, got %d: %#v", len(want), len(argv), argv)
 	}
 	for i := range want {
-		if args[i] != want[i] {
-			t.Fatalf("expected arg %d = %q, got %#v", i, want[i], args)
+		if argv[i] != want[i] {
+			t.Fatalf("expected arg %d = %q, got %#v", i, want[i], argv)
 		}
 	}
 
-	args = buildRunArgs("/tmp/rootfs", []string{"/bin/sh", "-lc"}, "", "echo hi")
-	if len(args) < 1 || args[0] != "/tmp/rootfs" {
-		t.Fatalf("expected rootfs first when no user is set, got %#v", args)
+	// With no USER, the script runs directly under the configured shell.
+	argv = buildRunArgv([]string{"/bin/sh", "-lc"}, "", "echo hi")
+	want = []string{"/bin/sh", "-lc", "echo hi"}
+	if len(argv) != len(want) {
+		t.Fatalf("expected %d args, got %d: %#v", len(want), len(argv), argv)
+	}
+	for i := range want {
+		if argv[i] != want[i] {
+			t.Fatalf("expected arg %d = %q, got %#v", i, want[i], argv)
+		}
 	}
 }
 

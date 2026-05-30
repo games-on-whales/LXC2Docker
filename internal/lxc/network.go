@@ -2,6 +2,7 @@ package lxc
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os/exec"
 	"strings"
@@ -73,7 +74,34 @@ table ip %s {
 		return fmt.Errorf("network: nft masquerade: %s: %w", out, err)
 	}
 
+	// Allow forwarding to and from the managed bridge. A leftover FORWARD policy
+	// of DROP — e.g. rules left behind after a previously-installed Docker is
+	// purged — blocks container outbound traffic even though NAT masquerade is
+	// configured: the container can reach the host but not the internet, so apt
+	// and DNS inside containers hang. Insert explicit ACCEPTs at the top of
+	// FORWARD so they win over the DROP policy.
+	ensureForwardAccept(BridgeName)
+
 	return nil
+}
+
+// ensureForwardAccept idempotently inserts iptables FORWARD ACCEPT rules for
+// traffic to and from the managed bridge. It is best-effort: failures are
+// logged, not fatal, since on hosts without iptables (or without a DROP policy)
+// the default FORWARD policy already permits this traffic.
+func ensureForwardAccept(bridge string) {
+	for _, args := range [][]string{
+		{"-i", bridge, "-j", "ACCEPT"},
+		{"-o", bridge, "-j", "ACCEPT"},
+	} {
+		if exec.Command("iptables", append([]string{"-C", "FORWARD"}, args...)...).Run() == nil {
+			continue // rule already present — keep this idempotent
+		}
+		if out, err := exec.Command("iptables", append([]string{"-I", "FORWARD"}, args...)...).CombinedOutput(); err != nil {
+			log.Printf("network: iptables FORWARD accept %v failed (continuing): %s: %v",
+				args, strings.TrimSpace(string(out)), err)
+		}
+	}
 }
 
 // TeardownBridge removes the managed bridge and nftables table.

@@ -491,6 +491,15 @@ func (m *Manager) gc() {
 		if smoothNASManagedContainer(rec) {
 			continue
 		}
+		// Never touch transient image-build containers. The classic builder runs
+		// each RUN step inside an ephemeral "build-<id>" LXC container; without
+		// this the GC classifies it as an orphaned support container (no "_" in
+		// the name, no session container present) and kills it mid-build —
+		// SIGKILL surfaces to the build as "RUN failed: exit status 137". The
+		// builder is torn down by the build flow itself (finalize / cleanupTemp).
+		if strings.HasPrefix(rec.ID, "build-") || strings.HasPrefix(rec.Name, "build-") {
+			continue
+		}
 
 		state, _ := m.State(rec.ID)
 		if state == "exited" {
