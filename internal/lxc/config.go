@@ -15,6 +15,17 @@ type configItem struct {
 	value string
 }
 
+var statUnixSocket = func(path string) (string, bool) {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		path = real
+	}
+	fi, err := os.Stat(path)
+	if err != nil || fi.Mode()&os.ModeSocket == 0 {
+		return "", false
+	}
+	return path, true
+}
+
 // ContainerConfig holds the Docker-layer configuration fields that we
 // translate into LXC config items. This is populated from the Docker API
 // container-create request body.
@@ -1145,13 +1156,11 @@ func appendRawSocketMount(items []configItem, cfg *ContainerConfig, value string
 	}
 
 	source := unescapeMountField(fields[0])
-	if real, err := filepath.EvalSymlinks(source); err == nil {
-		source = real
-	}
-	fi, err := os.Stat(source)
-	if err != nil || fi.Mode()&os.ModeSocket == 0 {
+	realSource, ok := statUnixSocket(source)
+	if !ok {
 		return nil, false
 	}
+	source = realSource
 
 	dest := "/" + strings.TrimPrefix(unescapeMountField(fields[1]), "/")
 	mount := MountSpec{

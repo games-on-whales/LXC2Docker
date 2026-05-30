@@ -7,8 +7,8 @@ or any Docker SDK without modification.
 ## Install
 
 The supported install is the prebuilt **`.deb`** — it depends only on the
-*runtime* LXC (`lxc-pve | lxc`, `nftables`), never a build toolchain, so a host
-already running LXC/Proxmox has everything it needs:
+*runtime* LXC command-line tools (`lxc-pve | lxc`, `nftables`), never a build
+toolchain, so a host already running LXC/Proxmox has everything it needs:
 
 ```sh
 # grab the .deb from the latest CI run / release, then:
@@ -22,8 +22,8 @@ replaces `docker.io` / `docker-ce` on the same socket.
 
 ### Build from source (maintainers / CI only)
 
-Building needs Go 1.21+, `liblxc-dev`, `pkg-config` (the dev headers are a
-**build-time** dependency — end users never need them):
+The daemon is pure Go — building needs only Go 1.21+ (no cgo, no liblxc-dev);
+containers are driven through the LXC command-line tools at runtime:
 
 ```sh
 make build        # -> bin/docker-lxc-daemon

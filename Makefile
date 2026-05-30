@@ -3,11 +3,9 @@ BUILD_DIR  := bin
 CMD_PATH   := ./cmd/docker-lxc-daemon
 GO_TEST    := go test
 
-CGO_CFLAGS  := $(shell pkg-config --cflags lxc 2>/dev/null)
-CGO_LDFLAGS := $(shell pkg-config --libs lxc 2>/dev/null || echo "-llxc")
-
-# Packaging — produces a .deb that end users install with apt. The .deb depends
-# only on the RUNTIME lxc/liblxc (no build toolchain, no liblxc-dev).
+# Packaging — produces a .deb that end users install with apt. The daemon is
+# pure Go now (no cgo / liblxc-dev), so the .deb depends only on the RUNTIME lxc
+# CLI tools + nftables, and building it needs no build toolchain on the target.
 VERSION  ?= $(shell (git describe --tags --always --dirty 2>/dev/null || echo 0.0.0) | sed 's/^v//')
 DEB_ARCH := $(shell dpkg --print-architecture 2>/dev/null || echo amd64)
 DEB_PKG  := $(BUILD_DIR)/$(BINARY)_$(VERSION)_$(DEB_ARCH).deb
@@ -20,32 +18,20 @@ all: build
 deps:
 	go mod tidy
 
-## Build the daemon binary. Requires liblxc-dev.
+## Build the daemon binary.
 build:
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="$(CGO_CFLAGS)" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 	go build -o $(BUILD_DIR)/$(BINARY) $(CMD_PATH)
 
 ## Compile all packages and verify tests are buildable.
 test-build:
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="$(CGO_CFLAGS)" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 	$(GO_TEST) -run '^$$' ./...
 
 ## Run all available unit tests.
 test-unit:
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="$(CGO_CFLAGS)" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 	$(GO_TEST) ./...
 
 ## Run integration tests with the integration build tag.
 test-integration:
-	CGO_ENABLED=1 \
-	CGO_CFLAGS="$(CGO_CFLAGS)" \
-	CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 	$(GO_TEST) -tags=integration ./...
 
 ## Run the full test matrix used by CI.
