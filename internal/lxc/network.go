@@ -21,17 +21,25 @@ const (
 func EnsureBridge() error {
 	iface, err := net.InterfaceByName(BridgeName)
 	if err != nil || iface == nil {
-		// Bridge doesn't exist — create it.
+		// Bridge doesn't exist — create it and assign the gateway IP.
 		cmds := [][]string{
 			{"ip", "link", "add", "name", BridgeName, "type", "bridge"},
 			{"ip", "addr", "add", BridgeCIDR, "dev", BridgeName},
-			{"ip", "link", "set", BridgeName, "up"},
 		}
 		for _, args := range cmds {
 			if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
 				return fmt.Errorf("network: %v: %s: %w", args, out, err)
 			}
 		}
+	}
+
+	// Always (re-)assert the bridge is administratively up. A bridge that
+	// already existed — e.g. left over from a previous daemon run — may have
+	// been brought down; without this, container veths enslave to a DOWN
+	// bridge and no traffic flows (container-to-container and host-to-container
+	// both fail). Idempotent: "set up" on an already-up link is a no-op.
+	if out, err := exec.Command("ip", "link", "set", BridgeName, "up").CombinedOutput(); err != nil {
+		return fmt.Errorf("network: bring bridge up: %s: %w", out, err)
 	}
 
 	// Ensure IP forwarding and allow localhost-originated packets to be

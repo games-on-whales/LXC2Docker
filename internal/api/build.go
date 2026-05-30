@@ -255,11 +255,19 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// Track the user for RUN steps as it changes through the stage. Using the
+		// stage's final state.user would run *every* RUN as the last USER (e.g.
+		// `USER aimee`), so an early `apt-get` RUN would fail with
+		// "chroot: invalid user" before that user is even created.
+		currentUser := ""
 		for _, inst := range stage.instructions {
 			send(map[string]string{"stream": fmt.Sprintf("Step %d: %s %s\n", step, inst.op, inst.args)})
 			step++
 			switch inst.op {
-			case "FROM", "LABEL", "ARG", "USER", "STOPSIGNAL", "HEALTHCHECK", "VOLUME", "SHELL":
+			case "USER":
+				currentUser = strings.TrimSpace(inst.args)
+				continue
+			case "FROM", "LABEL", "ARG", "STOPSIGNAL", "HEALTHCHECK", "VOLUME", "SHELL":
 				continue
 			case "WORKDIR":
 				dst := resolveContainerPath(state.workdir, inst.args)
@@ -285,9 +293,28 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 					script = fmt.Sprintf("mkdir -p %q && cd %q && %s", state.workdir, state.workdir, inst.args)
 				}
 				shellArgs := runShell(state.shell)
-				args := buildRunArgs(rootfs, shellArgs, state.user, script)
-				cmd := exec.Command("chroot", args...)
-				cmd.Env = append(os.Environ(), state.env...)
+				args := buildRunArgs(rootfs, shellArgs, currentUser, script)
+				// chroot alone has no /proc, /sys, /dev — apt/dpkg/gcc need
+				// them (gcc resolves its resource dir, where stddef.h lives, via
+				// /proc/self/exe; dpkg needs /dev/null and /proc). Run the chroot
+				// inside a private mount namespace (unshare --mount) and mount the
+				// pseudo-filesystems there, so they're torn down automatically when
+				// the step exits. Mounting in the host namespace with a lazy umount
+				// raced across RUN steps — a still-pending umount -l left /proc
+				// half-detached, breaking gcc/dpkg nondeterministically.
+				if mErr := ensureChrootDirs(rootfs); mErr != nil {
+					cleanupTemp()
+					cleanupStageImages()
+					fail("RUN mount setup failed: " + mErr.Error())
+					return
+				}
+				unshareArgs := []string{
+					"--mount", "--propagation", "private",
+					"sh", "-c", chrootMountPrelude + `; exec "$@"`, "sh", "chroot",
+				}
+				unshareArgs = append(unshareArgs, args...)
+				cmd := exec.Command("unshare", unshareArgs...)
+				cmd.Env = append(append(os.Environ(), state.env...), "AIMEE_CHROOT_ROOTFS="+rootfs)
 				out, err := cmd.CombinedOutput()
 				if len(out) > 0 {
 					send(map[string]string{"stream": string(out)})
@@ -679,6 +706,44 @@ func buildRunArgs(rootfs string, shellArgs []string, user, script string) []stri
 	args = append(args, shellArgs...)
 	args = append(args, script)
 	return args
+}
+
+// chrootMountPrelude is the sh prologue run inside the per-RUN private mount
+// namespace (see the RUN case). It mounts the pseudo-filesystems the chroot
+// needs and then the caller exec's the chroot. Because it runs in a private
+// mount namespace, every mount here is discarded when the step's process
+// exits — no explicit teardown, and nothing leaks to the host or races with
+// the next RUN step.
+//
+//   - /proc   gcc resolves its resource dir (where stddef.h lives) via
+//     /proc/self/exe; apt/dpkg read /proc too.
+//   - /sys    some maintainer scripts probe it.
+//   - /dev    recursive bind of the host /dev for /dev/null, /dev/urandom,
+//     /dev/pts.
+//   - resolv.conf  bound from the host so apt can resolve mirrors. Bound (not
+//     copied) so it isn't baked into the finished image. The RUN chroot keeps
+//     the host network namespace, so it already has a route out.
+const chrootMountPrelude = `set -e
+R="$AIMEE_CHROOT_ROOTFS"
+mount -t proc proc "$R/proc"
+mount -t sysfs sysfs "$R/sys"
+mount --rbind /dev "$R/dev"
+if [ -f /etc/resolv.conf ]; then
+  rm -f "$R/etc/resolv.conf" 2>/dev/null || true
+  : > "$R/etc/resolv.conf" 2>/dev/null || true
+  mount --bind /etc/resolv.conf "$R/etc/resolv.conf"
+fi`
+
+// ensureChrootDirs creates the mount-point directories a RUN step's chroot
+// needs before the private-namespace prelude binds onto them. Minimal base
+// images may ship without an empty /proc or /sys.
+func ensureChrootDirs(rootfs string) error {
+	for _, d := range []string{"proc", "sys", "dev", "etc"} {
+		if err := os.MkdirAll(filepath.Join(rootfs, d), 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", d, err)
+		}
+	}
+	return nil
 }
 
 // parseVolumeInstruction parses a Dockerfile VOLUME directive. Accepts
