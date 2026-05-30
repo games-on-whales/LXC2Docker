@@ -1712,7 +1712,9 @@ func archivePathStatHeader(info os.FileInfo) string {
 		"name":       info.Name(),
 		"size":       info.Size(),
 		"mode":       uint32(info.Mode()),
-		"mtime":      info.ModTime().Format(time.RFC3339Nano),
+		// UTC so the stat header is deterministic regardless of host timezone
+		// (Docker/Portainer expect a stable RFC3339 instant, not local +HH:MM).
+		"mtime":      info.ModTime().UTC().Format(time.RFC3339Nano),
 		"linkTarget": "",
 	})
 	return base64.StdEncoding.EncodeToString(statJSON)

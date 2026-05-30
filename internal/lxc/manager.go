@@ -1049,7 +1049,13 @@ lxc.uts.name = %s
 	return nil
 }
 
-// createLegacyContainer clones via lxc-copy (no Proxmox, no ZFS).
+// createLegacyContainer clones the image template into a new container by
+// directory copy (no Proxmox, no ZFS).
+//
+// We deliberately avoid `lxc-copy`: its directory-backed storage clone rsyncs
+// through the new mount API (move_detached_mount), which newer kernels (e.g.
+// Proxmox 7.0-pve) deny in this context — so it slowly rsyncs and then fails.
+// A plain rootfs copy works regardless of the kernel's mount-API mediation.
 func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
 	log.Printf("CreateContainer[legacy]: cloning %s → %s", imgRec.TemplateName, id)
 	if err := m.cloneLegacyTemplate(imgRec.TemplateName, id); err != nil {
@@ -1092,20 +1098,13 @@ func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cf
 }
 
 func (m *Manager) cloneLegacyTemplate(templateName, id string) error {
-	out, err := exec.Command("lxc-copy",
-		"-n", templateName,
-		"-N", id,
-		"--lxcpath", m.lxcPath,
-		"--newpath", m.lxcPath,
-	).CombinedOutput()
-	if err == nil {
-		return nil
-	}
-	log.Printf("lxc-copy failed for %s → %s; trying directory copy fallback: %s: %v",
-		templateName, id, out, err)
-	if copyErr := m.cloneLegacyTemplateByCopy(templateName, id); copyErr != nil {
-		return fmt.Errorf("manager: clone %s → %s: %s: %w; directory copy fallback: %v",
-			templateName, id, out, err, copyErr)
+	// Clone by directory copy rather than lxc-copy. lxc-copy's directory-backed
+	// storage clone rsyncs through the new mount API (move_detached_mount),
+	// which newer kernels (Proxmox 7.0-pve / AppArmor 4.1) deny in the daemon's
+	// context — so it slowly rsyncs and then fails, hanging container creation.
+	// A plain rootfs copy works regardless of the kernel's mount-API mediation.
+	if err := m.cloneLegacyTemplateByCopy(templateName, id); err != nil {
+		return fmt.Errorf("manager: clone %s → %s: %w", templateName, id, err)
 	}
 	return nil
 }
@@ -1267,7 +1266,10 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 
 func (m *Manager) startLXCContainer(id string) error {
 	log.Printf("StartContainer[LXC]: starting %s", id)
-	out, err := exec.Command("lxc-start", "-n", id, "--lxcpath", m.lxcPath,
+	// -d (daemonize): modern lxc-start runs in the FOREGROUND by default, which
+	// would block here until the container exits. Daemonize so the call returns
+	// and the wait-for-RUNNING loop below can do its job.
+	out, err := exec.Command("lxc-start", "-d", "-n", id, "--lxcpath", m.lxcPath,
 		"--logfile", filepath.Join(m.lxcPath, id, "lxc-start.log"),
 		"--logpriority", "DEBUG").CombinedOutput()
 	if err != nil {

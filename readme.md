@@ -4,13 +4,31 @@ A Docker-compatible API that backs containers with LXC (optionally Proxmox CTs).
 Drop-in replacement for `/var/run/docker.sock` — use `docker`, `docker-compose`,
 or any Docker SDK without modification.
 
-## Build
+## Install
 
-Requires Go 1.21+ and the LXC command-line tools on hosts that run containers.
+The supported install is the prebuilt **`.deb`** — it depends only on the
+*runtime* LXC command-line tools (`lxc-pve | lxc`, `nftables`), never a build
+toolchain, so a host already running LXC/Proxmox has everything it needs:
+
+```sh
+# grab the .deb from the latest CI run / release, then:
+sudo apt install ./docker-lxc-daemon_*.deb
+sudo systemctl enable --now docker-lxc-daemon
+```
+
+The package installs the binary to `/usr/bin`, ships the systemd unit, creates
+the `docker` group, and `Conflicts:` the real Docker packages — so it cleanly
+replaces `docker.io` / `docker-ce` on the same socket.
+
+### Build from source (maintainers / CI only)
+
+The daemon is pure Go — building needs only Go 1.21+ (no cgo, no liblxc-dev);
+containers are driven through the LXC command-line tools at runtime:
 
 ```sh
 make build        # -> bin/docker-lxc-daemon
-sudo make install # -> /usr/local/bin + systemd unit
+make deb          # -> bin/docker-lxc-daemon_<ver>_<arch>.deb  (what users install)
+sudo make install # dev convenience: -> /usr/local/bin + systemd unit
 ```
 
 ## Testing
