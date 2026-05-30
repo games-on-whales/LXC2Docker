@@ -1264,7 +1264,10 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 
 func (m *Manager) startLXCContainer(id string) error {
 	log.Printf("StartContainer[LXC]: starting %s", id)
-	out, err := exec.Command("lxc-start", "-n", id, "--lxcpath", m.lxcPath,
+	// -d (daemonize): modern lxc-start runs in the FOREGROUND by default, which
+	// would block here until the container exits. Daemonize so the call returns
+	// and the wait-for-RUNNING loop below can do its job.
+	out, err := exec.Command("lxc-start", "-d", "-n", id, "--lxcpath", m.lxcPath,
 		"--logfile", filepath.Join(m.lxcPath, id, "lxc-start.log"),
 		"--logpriority", "DEBUG").CombinedOutput()
 	if err != nil {
