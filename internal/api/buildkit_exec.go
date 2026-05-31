@@ -19,9 +19,9 @@ import (
 // is taken whenever an op mutates its input.
 //
 // This is the real "LLB solver on LXC": Op_Source pulls an image rootfs or
-// surfaces the build context, Op_Exec runs RUN steps in a chroot, and Op_File
-// applies COPY/ADD/mkdir/rm. It is intentionally a correct subset — caching,
-// secret/ssh mounts and multi-platform are layered on in Phase 3c.
+// surfaces the build context, Op_Exec runs RUN steps in an ephemeral LXC
+// container, and Op_File applies COPY/ADD/mkdir/rm.
+//
 // secretFunc fetches a build secret value by id from the client session. Solve
 // supplies it (it holds the session) so the executor can satisfy
 // RUN --mount=type=secret without knowing about gRPC sessions.
@@ -65,7 +65,14 @@ func (h *Handler) solveLLB(ctx context.Context, ctxDir string, def *llb.Definiti
 	}
 	resultEdge := last.Inputs[0]
 
-	scratch, err := os.MkdirTemp("", "llb-build-*")
+	// Snapshots live under the LXC path (not /tmp) so each RUN step's rootfs is
+	// in the area lxc-start expects — the executor runs RUN in a real container
+	// over these dirs, not a chroot.
+	scratchRoot := filepath.Join(h.mgr.LXCPath(), ".dld-build")
+	if err := os.MkdirAll(scratchRoot, 0o755); err != nil {
+		return "", nil, err
+	}
+	scratch, err := os.MkdirTemp(scratchRoot, "llb-build-*")
 	if err != nil {
 		return "", nil, err
 	}
@@ -245,9 +252,9 @@ func (e *llbExecutor) resolveImageRootfs(ref string) (string, error) {
 
 // execExec runs an LLB Exec op (a RUN step). It snapshots the root mount,
 // stages additional mounts into it (read-only binds, ephemeral cache/tmpfs,
-// and RUN --mount=type=secret files), runs the command in a chroot, then
-// deletes secret files so they never land in the built image. SSH agent mounts
-// can't be provided under the chroot model and are skipped with a warning.
+// and RUN --mount=type=secret files), runs the command in a real ephemeral LXC
+// container, then deletes secret files so they never land in the built image.
+// SSH agent mounts aren't provided and are skipped with a warning.
 func (e *llbExecutor) execExec(eop *pb.ExecOp, inputDirs []string) (map[int64]string, error) {
 	meta := eop.GetMeta()
 	if meta == nil {
@@ -385,40 +392,40 @@ func (e *llbExecutor) stageSecret(rootDir string, m *pb.Mount) (string, error) {
 // runInRoot executes meta.Args inside rootDir via chroot, honouring Cwd, Env
 // and User. meta.Args is the full argv (dockerfile2llb wraps shell-form RUN as
 // /bin/sh -c "<script>").
+// runInRoot executes a RUN step inside a real ephemeral LXC container over
+// rootDir (via mgr.RunInRootfs) rather than a chroot — chroot under the 7.0-pve
+// kernel exec's gcc/apt only intermittently, which is why the classic builder
+// moved to containers too. dockerfile2llb lowers RUN to meta.Args =
+// [shell, -c, script] (or an exec-form argv); the WORKDIR and USER are folded
+// into that command the same way the classic builder does (cd prefix + su).
 func (e *llbExecutor) runInRoot(rootDir string, meta *pb.Meta) error {
-	args := []string{}
-	if u := strings.TrimSpace(meta.GetUser()); u != "" {
-		args = append(args, "--userspec", u)
+	args := meta.GetArgs()
+	if len(args) == 0 {
+		return nil
 	}
-	args = append(args, rootDir)
 
-	cwd := meta.GetCwd()
-	if cwd == "" {
-		cwd = "/"
-	}
-	if cwd != "/" {
-		// Ensure the workdir exists and cd into it before exec'ing the command.
-		if err := os.MkdirAll(filepath.Join(rootDir, strings.TrimPrefix(cwd, "/")), 0o755); err != nil {
-			return err
+	var argv []string
+	if len(args) >= 2 {
+		// Shell form: split into the shell+flags and the script so WORKDIR/USER
+		// can be applied around the script (matching the classic builder).
+		shellArgs := args[:len(args)-1]
+		script := args[len(args)-1]
+		if cwd := meta.GetCwd(); cwd != "" && cwd != "/" {
+			script = fmt.Sprintf("mkdir -p %q && cd %q && %s", cwd, cwd, script)
 		}
-		wrapper := []string{"/bin/sh", "-c", "cd \"$1\" && shift && exec \"$@\"", "sh", cwd}
-		args = append(args, wrapper...)
-		args = append(args, meta.GetArgs()...)
+		argv = buildRunArgv(shellArgs, meta.GetUser(), script)
 	} else {
-		args = append(args, meta.GetArgs()...)
+		// Exec form (single token) — run as-is.
+		argv = args
 	}
 
-	cmd := exec.Command("chroot", args...)
-	cmd.Env = meta.GetEnv()
-	if len(cmd.Env) == 0 {
-		cmd.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
-	}
-	out, err := cmd.CombinedOutput()
+	env := append(os.Environ(), meta.GetEnv()...)
+	out, err := e.h.mgr.RunInRootfs(rootDir, argv, env)
 	if len(out) > 0 {
 		e.emit(string(out))
 	}
 	if err != nil {
-		return fmt.Errorf("RUN %s failed: %w", strings.Join(meta.GetArgs(), " "), err)
+		return fmt.Errorf("RUN %s failed: %w", strings.Join(args, " "), err)
 	}
 	return nil
 }
