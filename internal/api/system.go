@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -866,4 +868,19 @@ func (r *statusRecorder) Flush() {
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack lets streaming endpoints (container attach, exec start — and thus the
+// buildx/BuildKit gRPC tunnel that rides an exec stream) take over the raw
+// connection. The logging middleware wraps every ResponseWriter in a
+// statusRecorder; embedding http.ResponseWriter does not promote Hijack, so
+// without this passthrough those endpoints fail their `w.(http.Hijacker)`
+// assertion and return 500 ("streaming not supported"). Delegate to the
+// underlying writer when it supports hijacking.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
+	}
+	return hj.Hijack()
 }

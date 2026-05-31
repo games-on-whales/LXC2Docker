@@ -285,10 +285,31 @@ func runExecMux(cmd *exec.Cmd, conn io.ReadWriter) {
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
 
+	// Wire the client's input to the process stdin. Without this, interactive
+	// execs and — critically — `buildctl dial-stdio` (the bidirectional gRPC
+	// tunnel buildx runs inside the BuildKit container) see immediate EOF and
+	// tear the connection down ("use of closed network connection"). The
+	// process reads raw gRPC bytes from stdin and writes framed replies to
+	// stdout, which the Docker client demultiplexes.
+	stdinW, stdinErr := cmd.StdinPipe()
+	if stdinErr != nil {
+		writeLogFrame(conn, 2, []byte("error: "+stdinErr.Error()+"\n"))
+		return
+	}
+
 	if err := cmd.Start(); err != nil {
 		writeLogFrame(conn, 2, []byte("error: "+err.Error()+"\n"))
 		return
 	}
+
+	// Pump client → stdin until the connection closes (conn.Close in
+	// execStart unblocks this Read) or the input ends. Closing stdinW then
+	// lets the process observe EOF. Not joined to Wait: the copy is released
+	// when the hijacked conn is closed.
+	go func() {
+		_, _ = io.Copy(stdinW, conn)
+		_ = stdinW.Close()
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)

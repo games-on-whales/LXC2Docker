@@ -44,12 +44,91 @@ type LANConfig struct {
 type Manager struct {
 	lxcPath    string // e.g. /var/lib/lxc (legacy mode)
 	pveStorage string // Proxmox storage name (e.g. "large"); empty = legacy mode
+	pveStgType string // backend type of pveStorage: "zfspool", "lvmthin", "dir", …
 	lan        LANConfig
 	store      *store.Store
 }
 
 // UsePVE returns true when Proxmox CT mode is active.
 func (m *Manager) UsePVE() bool { return m.pveStorage != "" }
+
+// pveStorageIsZFS reports whether the configured PVE storage is a ZFS pool.
+// ZFS supports the fast raw-clone ephemeral path (zfs clone of a snapshot,
+// rootfs directly accessible at /<pool>/subvol-<vmid>-disk-0). Every other
+// backend (lvmthin, dir, btrfs, …) goes through the storage-agnostic
+// `pct clone` path instead, because its rootfs is a block device that must be
+// mounted via `pct mount` for offline preparation.
+func (m *Manager) pveStorageIsZFS() bool { return m.pveStgType == "zfspool" }
+
+// detectPVEStorageType returns the backend type of a PVE storage (e.g.
+// "zfspool", "lvmthin", "dir") by parsing `pvesm status`. Returns "" when the
+// type can't be determined, which the callers treat as non-ZFS (the safe,
+// storage-agnostic path).
+func detectPVEStorageType(storage string) string {
+	out, err := exec.Command("pvesm", "status", "-storage", storage).Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == storage {
+			return fields[1]
+		}
+	}
+	return ""
+}
+
+// PVEStorageIsZFS is the exported form of pveStorageIsZFS, used by the API
+// layer (e.g. docker-load) to choose between the ZFS-dataset template path and
+// the storage-agnostic pct-clone template path.
+func (m *Manager) PVEStorageIsZFS() bool { return m.pveStorageIsZFS() }
+
+// CreatePVETemplateFromRootfs builds a Proxmox CT template from an extracted
+// image rootfs directory and returns its VMID. It mirrors the PVE branch of
+// pullOCI (tar the rootfs → pct create → pct template) and is used by the
+// docker-load path on non-ZFS storage, where templates are pct-managed CTs
+// rather than ZFS datasets. The result can be cloned by createPVEContainer.
+func (m *Manager) CreatePVETemplateFromRootfs(ref, rootfsDir string) (int, error) {
+	tarball := filepath.Join(os.TempDir(), "dld-load-tmpl-"+oci.SafeDirName(ref)+".tar.gz")
+	defer os.Remove(tarball)
+	if out, err := exec.Command("tar", "czf", tarball, "-C", rootfsDir, ".").CombinedOutput(); err != nil {
+		return 0, fmt.Errorf("manager: tar load rootfs: %s: %w", out, err)
+	}
+	vmid, err := allocateVMID()
+	if err != nil {
+		return 0, err
+	}
+	sizeGB := dirSizeGB(rootfsDir) + 2
+	if sizeGB < 4 {
+		sizeGB = 4
+	}
+	hostname := sanitizeHostname("tmpl-" + oci.SafeDirName(ref))
+	if out, err := exec.Command("pct", "create", fmt.Sprintf("%d", vmid), tarball,
+		"--storage", m.pveStorage,
+		"--ostype", "unmanaged",
+		"--arch", "amd64",
+		"--hostname", hostname,
+		"--unprivileged", "0",
+		"--rootfs", fmt.Sprintf("%s:%d", m.pveStorage, sizeGB),
+	).CombinedOutput(); err != nil {
+		return 0, fmt.Errorf("manager: pct create load-template %d: %s: %w", vmid, out, err)
+	}
+	exec.Command("pct", "template", fmt.Sprintf("%d", vmid)).Run()
+	log.Printf("load: created Proxmox template VMID %d for %s", vmid, ref)
+	return vmid, nil
+}
+
+// dirSizeGB returns the apparent on-disk size of dir in whole gigabytes
+// (rounded up by `du -sBG`), or 0 if it can't be determined.
+func dirSizeGB(dir string) int {
+	out, err := exec.Command("du", "-sBG", dir).Output()
+	if err != nil {
+		return 0
+	}
+	var n int
+	fmt.Sscanf(string(out), "%dG", &n)
+	return n
+}
 
 // PVEStorage returns the configured Proxmox storage name, or "" when the
 // daemon isn't in PVE mode. Used by the API layer's size-of-image logic to
@@ -69,7 +148,12 @@ func NewManager(lxcPath, pveStorage string, lan LANConfig, st *store.Store) (*Ma
 	}
 	m := &Manager{lxcPath: lxcPath, pveStorage: pveStorage, lan: lan, store: st}
 	if pveStorage != "" {
-		log.Printf("Proxmox CT mode enabled (storage=%s)", pveStorage)
+		m.pveStgType = detectPVEStorageType(pveStorage)
+		log.Printf("Proxmox CT mode enabled (storage=%s, type=%s)", pveStorage, m.pveStgType)
+		if !m.pveStorageIsZFS() {
+			log.Printf("storage %q is %q (not zfs): containers use the storage-agnostic pct-clone path",
+				pveStorage, m.pveStgType)
+		}
 	}
 	if lan.Bridge != "" {
 		log.Printf("LAN bridge enabled (bridge=%s, prefix=%s, gateway=%s, /%d)",
@@ -104,15 +188,19 @@ func (m *Manager) reconcile() {
 	}
 }
 
-// StartGC launches a background goroutine that periodically removes stopped
-// ephemeral containers. Compose-managed services (those with Docker Compose
-// labels) and Proxmox CTs (VMID > 0) are left alone. This handles the common
-// case where Wolf sessions end abnormally (e.g. daemon restart) and child
-// containers (PulseAudio, Steam, Wolf-UI) are left behind.
+// StartGC launches a background maintenance goroutine that rotates oversized
+// container console logs on a fixed cadence.
+//
+// It deliberately does NOT remove stopped containers. Standard Docker keeps an
+// exited container around — visible in `docker ps -a`, available for `docker
+// logs` and `docker start` — until it is explicitly removed. The only exit-time
+// removals Docker performs automatically are `--rm` (AutoRemove) and the
+// configured RestartPolicy, both of which are owned by StartRestartWatcher.
+// A blanket reaper here would race that watcher and silently delete containers
+// the user expects to persist, so log rotation is all this loop does.
 func (m *Manager) StartGC(ctx context.Context) {
 	go func() {
-		// Run immediately on startup to clean leftovers, then periodically.
-		m.gc()
+		// Run immediately on startup, then periodically.
 		m.rotateLogs()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -121,7 +209,6 @@ func (m *Manager) StartGC(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				m.gc()
 				m.rotateLogs()
 			}
 		}
@@ -457,86 +544,6 @@ func shouldRestart(rec *store.ContainerRecord) bool {
 	}
 }
 
-func (m *Manager) gc() {
-	// Separate ephemeral containers into stopped (remove immediately) and
-	// running (check for orphans).
-	var stopped []*store.ContainerRecord
-	var runningSession []*store.ContainerRecord // Wolf-UI, WolfSteam, etc.
-	var runningSupport []*store.ContainerRecord // WolfPulseAudio, etc.
-
-	for _, rec := range m.store.ListContainers() {
-		// Never touch Proxmox CTs or compose-managed services.
-		if rec.VMID > 0 {
-			continue
-		}
-		if rec.Labels != nil {
-			if _, ok := rec.Labels["com.docker.compose.service"]; ok {
-				continue
-			}
-			if rec.Labels["io.smoothnas.managed"] == "true" {
-				continue
-			}
-		}
-
-		state, _ := m.State(rec.ID)
-		if state == "exited" {
-			stopped = append(stopped, rec)
-		} else if state == "running" {
-			// Session containers have unique per-session names (Wolf-UI_<id>,
-			// WolfSteam_<id>). Support containers are generic (WolfPulseAudio).
-			if strings.Contains(rec.Name, "_") {
-				runningSession = append(runningSession, rec)
-			} else {
-				runningSupport = append(runningSupport, rec)
-			}
-		}
-	}
-
-	// Remove all stopped ephemeral containers.
-	for _, rec := range stopped {
-		log.Printf("GC: removing stopped container %s (%s)", rec.Name, rec.ID[:12])
-		if rec.IPAddress != "" {
-			RemovePortForwards(rec.IPAddress)
-		}
-		if err := m.RemoveContainer(rec.ID); err != nil {
-			log.Printf("GC: failed to remove %s: %v", rec.ID[:12], err)
-		}
-	}
-
-	// Orphan detection: if there are support containers (PulseAudio) but
-	// no session containers AND no running Proxmox CTs, the support
-	// containers are orphans from sessions that ended abnormally.
-	// PVE CTs (like Wolf) spawn support containers (PulseAudio) via the
-	// Docker API — we must not kill them while the CT is still running.
-	if len(runningSession) == 0 && len(runningSupport) > 0 {
-		pveCTRunning := false
-		for _, rec := range m.store.ListContainers() {
-			if rec.VMID > 0 {
-				if st, _ := m.State(rec.ID); st == "running" {
-					pveCTRunning = true
-					break
-				}
-			}
-		}
-		if !pveCTRunning {
-			for _, rec := range runningSupport {
-				log.Printf("GC: stopping orphaned container %s (%s, image=%s)",
-					rec.Name, rec.ID[:12], rec.Image)
-				if err := m.StopContainer(rec.ID, 5*time.Second); err != nil {
-					log.Printf("GC: failed to stop %s: %v", rec.ID[:12], err)
-					continue
-				}
-				if rec.IPAddress != "" {
-					RemovePortForwards(rec.IPAddress)
-				}
-				if err := m.RemoveContainer(rec.ID); err != nil {
-					log.Printf("GC: failed to remove %s: %v", rec.ID[:12], err)
-				}
-			}
-		}
-	}
-}
-
 // PullOpts controls a PullImage invocation. Credentials (if non-empty) are
 // passed to skopeo as --src-creds so private registries succeed. OnEvent
 // receives structured layer-progress events so the API layer can stream
@@ -771,21 +778,28 @@ func (m *Manager) pullOCI(r *image.ResolvedImage, opts PullOpts) error {
 		// Mark it as a template so it can't be accidentally started.
 		exec.Command("pct", "template", fmt.Sprintf("%d", vmid)).Run()
 
-		// Create a ZFS snapshot for instant ephemeral container cloning.
-		// pct template converts subvol → basevol, so snapshot the basevol.
-		snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, vmid)
-		if snapOut, snapErr := exec.Command("zfs", "snapshot", snapDataset).CombinedOutput(); snapErr != nil {
-			log.Printf("pullOCI: warning: could not create ZFS snapshot %s: %s: %v", snapDataset, snapOut, snapErr)
-		} else {
-			log.Printf("pullOCI: created ZFS snapshot %s for ephemeral cloning", snapDataset)
-		}
+		// On ZFS, pre-snapshot the template's basevol so ephemeral containers
+		// can be provisioned with an instant `zfs clone`. Other backends clone
+		// the template directly via `pct clone` (no snapshot needed — and
+		// `zfs snapshot` would fail), and write resolv.conf per-container in
+		// prepareRootfs after the clone, so both steps are ZFS-only here.
+		if m.pveStorageIsZFS() {
+			// pct template converts subvol → basevol, so snapshot the basevol.
+			snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, vmid)
+			if snapOut, snapErr := exec.Command("zfs", "snapshot", snapDataset).CombinedOutput(); snapErr != nil {
+				log.Printf("pullOCI: warning: could not create ZFS snapshot %s: %s: %v", snapDataset, snapOut, snapErr)
+			} else {
+				log.Printf("pullOCI: created ZFS snapshot %s for ephemeral cloning", snapDataset)
+			}
 
-		// Write resolv.conf into the template rootfs.
-		templateRootfs := m.pveRootfsPath(vmid)
-		resolvPath := filepath.Join(templateRootfs, "etc", "resolv.conf")
-		os.Remove(resolvPath)
-		os.MkdirAll(filepath.Dir(resolvPath), 0o755)
-		os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644)
+			// Write resolv.conf into the template rootfs (directly accessible
+			// on ZFS).
+			templateRootfs := m.pveRootfsPath(vmid)
+			resolvPath := filepath.Join(templateRootfs, "etc", "resolv.conf")
+			os.Remove(resolvPath)
+			os.MkdirAll(filepath.Dir(resolvPath), 0o755)
+			os.WriteFile(resolvPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0o644)
+		}
 
 		// Clean up the OCI working directory.
 		os.RemoveAll(rootfsPath)
@@ -878,7 +892,15 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 		return m.createPVEContainer(id, rec, cfg)
 	}
 	if m.UsePVE() && rec.TemplateVMID > 0 {
-		return m.createEphemeralPVE(id, rec, cfg)
+		// ZFS supports the fast raw-clone ephemeral path (zfs clone of the
+		// template snapshot, rootfs directly accessible). Other backends
+		// (lvmthin, dir, …) have no `zfs clone`, so fall back to the
+		// storage-agnostic pct-clone path, which yields a real (lightweight)
+		// PVE CT that the VMID-aware lifecycle already manages end to end.
+		if m.pveStorageIsZFS() {
+			return m.createEphemeralPVE(id, rec, cfg)
+		}
+		return m.createPVEContainer(id, rec, cfg)
 	}
 	return m.createLegacyContainer(id, rec, cfg)
 }
@@ -933,19 +955,37 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	}
 	hostname = sanitizeHostname(hostname)
 
-	// Build rootfs spec for Proxmox config.
-	rootfsSpec := fmt.Sprintf("%s:subvol-%d-disk-0,size=4G", m.pveStorage, vmid)
-	rootfsPath := m.pveRootfsPath(vmid)
+	// Preserve the rootfs volume `pct clone` actually created. Its name is
+	// storage-specific (subvol-<vmid>-disk-0 on zfs/dir, vm-<vmid>-disk-0 on
+	// lvmthin), so we must read it back rather than assume a naming scheme.
+	rootfsSpec, err := readPVERootfsSpec(vmid)
+	if err != nil {
+		exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run()
+		return fmt.Errorf("manager: read cloned rootfs spec: %w", err)
+	}
 
-	// Write the Proxmox CT config.
+	// Make the rootfs accessible for offline preparation. On ZFS the subvol is
+	// already mounted at a stable path; on block-device backends (lvmthin, …)
+	// it must be mounted via `pct mount`.
+	rootfsPath, unmount, err := m.mountPVERootfs(vmid)
+	if err != nil {
+		exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run()
+		return fmt.Errorf("manager: mount rootfs: %w", err)
+	}
+
+	// Write the Proxmox CT config, preserving the cloned rootfs volume.
 	if err := writePVEConfig(vmid, hostname, rootfsSpec, rootfsPath, &cfg, ip); err != nil {
+		unmount()
 		exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run()
 		return fmt.Errorf("manager: write PVE config: %w", err)
 	}
 
 	// Prepare rootfs: runtime dirs, resolv.conf.
-	rootfs := m.pveRootfsPath(vmid)
-	m.prepareRootfs(rootfs, cfg)
+	m.prepareRootfs(rootfsPath, cfg)
+
+	// Unmount before the container can start (a held mount blocks `pct start`
+	// on block-device backends).
+	unmount()
 
 	// Update store record with IP and VMID.
 	if storeRec := m.store.GetContainer(id); storeRec != nil {
@@ -954,6 +994,45 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 		return m.store.AddContainer(storeRec)
 	}
 	return nil
+}
+
+// readPVERootfsSpec extracts the `rootfs:` volume spec from a CT's config —
+// e.g. "storage:vm-123-disk-0,size=4G". This is the volume `pct clone` chose
+// for the backing storage; callers preserve it verbatim when rewriting config.
+func readPVERootfsSpec(vmid int) (string, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/etc/pve/lxc/%d.conf", vmid))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "rootfs:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "rootfs:")), nil
+		}
+	}
+	return "", fmt.Errorf("no rootfs entry in CT %d config", vmid)
+}
+
+// mountPVERootfs makes a CT's rootfs available on the host for offline prep and
+// returns its path plus an unmount cleanup. On ZFS the subvol is already
+// mounted at a stable path (no-op cleanup). On block-device backends it runs
+// `pct mount` (which mounts the rootfs at /var/lib/lxc/<vmid>/rootfs) and the
+// cleanup runs `pct unmount`. The cleanup is idempotent and safe to call twice.
+func (m *Manager) mountPVERootfs(vmid int) (string, func(), error) {
+	if m.pveStorageIsZFS() {
+		return m.pveRootfsPath(vmid), func() {}, nil
+	}
+	if out, err := exec.Command("pct", "mount", fmt.Sprintf("%d", vmid)).CombinedOutput(); err != nil {
+		return "", nil, fmt.Errorf("pct mount %d: %s: %w", vmid, strings.TrimSpace(string(out)), err)
+	}
+	var once bool
+	unmount := func() {
+		if once {
+			return
+		}
+		once = true
+		exec.Command("pct", "unmount", fmt.Sprintf("%d", vmid)).Run()
+	}
+	return fmt.Sprintf("/var/lib/lxc/%d/rootfs", vmid), unmount, nil
 }
 
 // createEphemeralPVE creates a raw-LXC container by ZFS-cloning the PVE
