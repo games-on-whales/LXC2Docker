@@ -57,6 +57,35 @@ func TestReapOrphanTarballs(t *testing.T) {
 	}
 }
 
+func TestImageReadyTarball(t *testing.T) {
+	dir := t.TempDir()
+	mgr := &Manager{lxcPath: filepath.Join(dir, "lxc")}
+
+	tb := filepath.Join(dir, "img.tar.gz")
+	if err := os.WriteFile(tb, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tarball present → ready, even though the legacy template dir
+	// (lxcPath/<TemplateName>/config) does NOT exist. This is the regression
+	// guard: before the fix, a tarball image fell through to the legacy probe
+	// and was reported not-ready, triggering a duplicate re-pull.
+	ready := &store.ImageRecord{TemplateTarball: tb, TemplateName: "__template_oci_busybox"}
+	if !mgr.ImageReady(ready) {
+		t.Error("tarball-backed image with an existing tarball must be ready")
+	}
+
+	// Tarball missing → not ready.
+	missing := &store.ImageRecord{TemplateTarball: filepath.Join(dir, "gone.tar.gz"), TemplateName: "__template_oci_busybox"}
+	if mgr.ImageReady(missing) {
+		t.Error("tarball-backed image with a missing tarball must not be ready")
+	}
+
+	if mgr.ImageReady(nil) {
+		t.Error("nil record must not be ready")
+	}
+}
+
 func TestReapOrphanTarballsSkippedWhenNotPVE(t *testing.T) {
 	st, err := store.NewAt(t.TempDir())
 	if err != nil {
