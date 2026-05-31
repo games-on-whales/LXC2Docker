@@ -6,7 +6,11 @@ GO_TEST    := go test
 # Packaging — produces a .deb that end users install with apt. The daemon is
 # pure Go now (no cgo / liblxc-dev), so the .deb depends only on the RUNTIME lxc
 # CLI tools + nftables, and building it needs no build toolchain on the target.
-VERSION  ?= $(shell (git describe --tags --always --dirty 2>/dev/null || echo 0.0.0) | sed 's/^v//')
+# Debian versions must start with a digit, so we can't fall back to a bare
+# commit SHA (git describe --always). Use the tag when there is one (stripping a
+# leading "v" and flattening describe's "-N-gsha" suffix to dots so dpkg accepts
+# it); otherwise synthesise a digit-led "0.0.0+git<sha>".
+VERSION  ?= $(shell v=$$(git describe --tags --dirty 2>/dev/null | sed -e 's/^v//' -e 's/-/./g'); [ -n "$$v" ] || v="0.0.0+git$$(git rev-parse --short HEAD 2>/dev/null || echo 0)"; echo "$$v")
 DEB_ARCH := $(shell dpkg --print-architecture 2>/dev/null || echo amd64)
 DEB_PKG  := $(BUILD_DIR)/$(BINARY)_$(VERSION)_$(DEB_ARCH).deb
 
