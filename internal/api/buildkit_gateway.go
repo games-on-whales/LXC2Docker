@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	controlapi "github.com/moby/buildkit/api/services/control"
 	bktypes "github.com/moby/buildkit/api/types"
@@ -19,7 +20,6 @@ import (
 	opspb "github.com/moby/buildkit/solver/pb"
 	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	digest "github.com/opencontainers/go-digest"
-	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	fstypes "github.com/tonistiigi/fsutil/types"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -104,9 +104,17 @@ func (s *controlServer) ensureLocals(ctx context.Context, b *gatewayBuild) (map[
 }
 
 // solveGateway handles a Control.Solve with an empty frontend — buildx's
-// client-driven gateway build. It registers the build, waits for the client's
-// Return, then exports the returned ref's rootfs as the tagged image.
+// gateway build. The real build's client-side buildFunc drives our LLBBridge
+// (Solve(Frontend="dockerfile.v0") → Return); this coordinator registers the
+// build, waits for Return, then exports the returned ref's rootfs.
 func (s *controlServer) solveGateway(ctx context.Context, req *controlapi.SolveRequest) (*controlapi.SolveResponse, error) {
+	// buildx probes each node's BuildOpts/caps with an Internal build whose
+	// buildFunc just calls BuildOpts() and returns nil (build/resolver). Treat
+	// it as a no-op success — anything else aborts the build before it starts.
+	if req.Internal {
+		return &controlapi.SolveResponse{ExporterResponse: map[string]string{}}, nil
+	}
+
 	b := &gatewayBuild{
 		sessionID: req.Session,
 		refs:      map[string]string{},
@@ -124,58 +132,29 @@ func (s *controlServer) solveGateway(ctx context.Context, req *controlapi.SolveR
 	st := s.statusFor(req.Ref)
 	defer close(st.ch)
 
-	// buildx's docker driver pings and returns an empty result without driving
-	// the LLBBridge, so the daemon owns the build: fetch the context + Dockerfile
-	// from the session and run the Dockerfile frontend here.
-	localDirs, err := s.ensureLocals(ctx, b)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "fetch build context: %v", err)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-b.done:
 	}
-	ctxDir := localDirs["context"]
-	if ctxDir == "" {
-		ctxDir, err = os.MkdirTemp("", "gw-emptyctx-*")
-		if err != nil {
-			return nil, err
-		}
-		b.addCleanup(func() { os.RemoveAll(ctxDir) })
+	if b.retErr != nil {
+		return nil, b.retErr
 	}
 
-	dfName := req.FrontendAttrs["filename"]
-	if dfName == "" {
-		dfName = "Dockerfile"
+	b.mu.Lock()
+	dir := b.refs[b.result]
+	md := b.metadata
+	b.mu.Unlock()
+	if dir == "" {
+		return nil, status.Error(codes.Internal, "gateway build returned no result ref")
 	}
-	if _, statErr := os.Stat(filepath.Join(ctxDir, dfName)); statErr != nil {
-		if dfDir := localDirs["dockerfile"]; dfDir != "" {
-			if data, rerr := os.ReadFile(filepath.Join(dfDir, dfName)); rerr == nil {
-				_ = os.WriteFile(filepath.Join(ctxDir, dfName), data, 0o644)
-			}
-		}
-	}
-
-	target := req.FrontendAttrs["target"]
-	buildArgs, labels := frontendBuildArgsAndLabels(req.FrontendAttrs)
-	getSecret := func(sctx context.Context, sid string) ([]byte, error) {
-		caller, gerr := s.sm.Get(sctx, b.sessionID, false)
-		if gerr != nil {
-			return nil, gerr
-		}
-		return secrets.GetSecret(sctx, caller, sid)
-	}
-
-	dir, cleanup, img, err := s.h.buildLLBResult(ctx, ctxDir, dfName, target, buildArgs, labels, func(any) {}, getSecret)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "build: %v", err)
-	}
-	b.addCleanup(cleanup)
 
 	resp := map[string]string{}
-	if img != nil {
-		if cfg, mErr := json.Marshal(img); mErr == nil {
-			resp[exptypes.ExporterImageConfigKey] = string(cfg)
-		}
+	if cfg := md[exptypes.ExporterImageConfigKey]; len(cfg) > 0 {
+		resp[exptypes.ExporterImageConfigKey] = string(cfg)
 	}
 	if tag := exporterImageName(req); tag != "" {
-		if err := s.h.importLLBResult(dir, tag, img); err != nil {
+		if err := s.h.importLLBResult(dir, tag, imageConfigFromMetadata(md)); err != nil {
 			return nil, status.Errorf(codes.Internal, "import build result: %v", err)
 		}
 	}
@@ -206,13 +185,26 @@ type gatewayBridge struct {
 
 func (g *gatewayBridge) build(ctx context.Context) (*gatewayBuild, error) {
 	id := buildid.FromIncomingContext(ctx)
-	g.cs.gwMu.Lock()
-	b := g.cs.gwBuilds[id]
-	g.cs.gwMu.Unlock()
-	if b == nil {
-		return nil, status.Errorf(codes.NotFound, "no gateway build for id %q", id)
+	// The client-side buildFunc (LLBBridge calls) and the outer Control.Solve
+	// (which registers the build) run concurrently, so the first LLBBridge call
+	// can arrive before solveGateway registers. Wait briefly for registration.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		g.cs.gwMu.Lock()
+		b := g.cs.gwBuilds[id]
+		g.cs.gwMu.Unlock()
+		if b != nil {
+			return b, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, status.Errorf(codes.NotFound, "no gateway build for id %q", id)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
-	return b, nil
 }
 
 func (g *gatewayBridge) Inputs(ctx context.Context, req *gwpb.InputsRequest) (*gwpb.InputsResponse, error) {
@@ -242,20 +234,7 @@ func (g *gatewayBridge) ResolveImageConfig(ctx context.Context, req *gwpb.Resolv
 	if rec == nil {
 		return nil, status.Errorf(codes.NotFound, "image %s not found after pull", norm)
 	}
-	img := dockerspec.DockerOCIImage{
-		Image: ocispecs.Image{
-			Platform: ocispecs.Platform{Architecture: "amd64", OS: "linux"},
-			Config: ocispecs.ImageConfig{
-				Env:        rec.OCIEnv,
-				Cmd:        rec.OCICmd,
-				Entrypoint: rec.OCIEntrypoint,
-				WorkingDir: rec.OCIWorkingDir,
-				User:       rec.OCIUser,
-				Labels:     rec.OCILabels,
-			},
-		},
-	}
-	cfg, err := json.Marshal(img)
+	cfg, err := json.Marshal(imageRecordToOCIImage(rec))
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "marshal image config: %v", err)
 	}
@@ -485,9 +464,16 @@ func (g *gatewayBridge) Warn(context.Context, *gwpb.WarnRequest) (*gwpb.WarnResp
 // Return delivers the build's final result ref (and image-config metadata) to
 // the waiting outer Control.Solve.
 func (g *gatewayBridge) Return(ctx context.Context, req *gwpb.ReturnRequest) (*gwpb.ReturnResponse, error) {
-	b, err := g.build(ctx)
-	if err != nil {
-		return nil, err
+	// Return must not block-wait or error on an unregistered build: buildx's
+	// Internal BuildOpts probe (build/resolver) runs a buildFunc that returns
+	// nil, so grpcclient sends a Return for a build we never registered. No-op
+	// for it; erroring here fails the probe and aborts the whole build.
+	id := buildid.FromIncomingContext(ctx)
+	g.cs.gwMu.Lock()
+	b := g.cs.gwBuilds[id]
+	g.cs.gwMu.Unlock()
+	if b == nil {
+		return &gwpb.ReturnResponse{}, nil
 	}
 	if req.Error != nil {
 		b.finish("", nil, status.Errorf(codes.Code(req.Error.Code), "%s", req.Error.Message))
