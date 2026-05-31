@@ -208,7 +208,7 @@ func rewriteConfig(path string, cfg *ContainerConfig, ip, containerName string, 
 		// Override common.conf's cgroup:mixed which fails on Proxmox cgroup v2.
 		// An empty value clears the inherited list; then we set what we need.
 		{"lxc.mount.auto", ""},
-		{"lxc.mount.auto", "proc:mixed sys:mixed"},
+		{"lxc.mount.auto", "proc:mixed sys:mixed cgroup:rw"},
 	}, buildItems(cfg, ip)...)
 	// Note: buildItems may populate cfg.SocketLinks (for socket bind mounts).
 
@@ -930,6 +930,10 @@ func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg *Cont
 	lines = append(lines, "ostype: unmanaged")
 	lines = append(lines, fmt.Sprintf("rootfs: %s", rootfsSpec))
 	lines = append(lines, "unprivileged: 0")
+	// Enable nesting + keyctl so nested container runtimes (Docker/containerd,
+	// systemd-in-container) work inside the CT. These CTs are already
+	// privileged, so nesting grants no exposure beyond that.
+	lines = append(lines, "features: nesting=1,keyctl=1")
 	// Mark the CT as daemon-managed so listContainers / Portainer surface
 	// it. Removing this tag (via PVE UI or `pct set --tags ...`) releases
 	// the CT from daemon management.
@@ -963,7 +967,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 
 	items = append(items, configItem{"lxc.apparmor.profile", "unconfined"})
 	items = append(items, configItem{"lxc.mount.auto", ""})
-	items = append(items, configItem{"lxc.mount.auto", "proc:mixed sys:mixed"})
+	items = append(items, configItem{"lxc.mount.auto", "proc:mixed sys:mixed cgroup:rw"})
 
 	// /dev/shm
 	items = append(items, configItem{"lxc.mount.entry", shmMountEntry(cfg.ShmSize)})

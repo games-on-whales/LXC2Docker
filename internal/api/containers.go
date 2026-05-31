@@ -894,17 +894,40 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 	if state, _ := h.mgr.State(id); state == "running" {
 		wasRunning = true
 	}
+
+	// Send the 200 response header IMMEDIATELY, before blocking on the
+	// condition. The Docker SDK's ContainerWait (API >= 1.30) blocks on the
+	// POST until it receives the response header, and `docker run` calls
+	// ContainerWait BEFORE ContainerStart — so deferring the header until the
+	// container exits deadlocks the run flow (the start request is never sent,
+	// the container never runs, and the wait never resolves). Flushing the
+	// header now lets the client proceed to /start; the JSON result is written
+	// when the condition is met. This matches the real docker daemon.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
+	}
+	sendResult := func(rec *store.ContainerRecord) {
+		_ = json.NewEncoder(w).Encode(waitContainerResponse(rec))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	waitStart := time.Now()
 	ctx := r.Context()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(200 * time.Millisecond):
 		}
 		switch condition {
 		case "removed":
 			if h.store.GetContainer(id) == nil {
-				jsonResponse(w, http.StatusOK, waitContainerResponse(nil))
+				sendResult(nil)
 				return
 			}
 		case "next-exit":
@@ -912,14 +935,19 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 			if !wasRunning && state == "running" {
 				wasRunning = true
 			}
-			if wasRunning && state != "running" {
-				jsonResponse(w, http.StatusOK, waitContainerResponse(h.store.GetContainer(id)))
+			rec := h.store.GetContainer(id)
+			// A container that starts and exits between two polls (e.g. `echo`)
+			// is never observed "running"; detect it via StartedAt being set
+			// after the wait began.
+			startedDuringWait := rec != nil && rec.StartedAt != nil && rec.StartedAt.After(waitStart)
+			if state != "running" && (wasRunning || startedDuringWait) {
+				sendResult(rec)
 				return
 			}
 		default:
 			state, _ := h.mgr.State(id)
 			if state != "running" {
-				jsonResponse(w, http.StatusOK, waitContainerResponse(h.store.GetContainer(id)))
+				sendResult(h.store.GetContainer(id))
 				return
 			}
 		}
@@ -1501,36 +1529,87 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A container that has never been started (StartedAt nil) is being attached
+	// BEFORE it runs — the foreground `docker run` flow attaches, then starts.
+	// Stream its console from the beginning and wait for the run flow to start
+	// it (so even an instantly-exiting `echo` is captured). An already-started
+	// container (`docker attach`) streams only output produced after the attach.
+	rec := h.store.GetContainer(id)
+	freshRun := rec != nil && rec.StartedAt == nil
+
 	f, err := os.OpenFile(logPath, os.O_RDONLY|os.O_CREATE, 0o644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	f.Seek(0, io.SeekEnd)
+	if !freshRun {
+		f.Seek(0, io.SeekEnd)
+	}
 
 	ctx := r.Context()
 	buffer := make([]byte, 32*1024)
+	started := !freshRun
+	graceUntil := time.Now().Add(10 * time.Second)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		if s, _ := h.mgr.State(id); s != "running" && s != "paused" {
-			return
+
+		state, _ := h.mgr.State(id)
+		running := state == "running" || state == "paused"
+		if running {
+			started = true
+		} else if freshRun && !started {
+			// The run flow may have started the container; detect even an
+			// instant exit we never observed as "running" via StartedAt.
+			if r := h.store.GetContainer(id); r != nil && r.StartedAt != nil {
+				started = true
+			}
 		}
+
 		n, readErr := f.Read(buffer)
 		if n > 0 {
-			if _, err := conn.Write(buffer[:n]); err != nil {
+			// Non-TTY attach uses Docker's multiplexed stream framing (an
+			// 8-byte stdout/stderr header per chunk); TTY attach is raw. The
+			// console log mixes stdout+stderr, so frame everything as stdout.
+			if rec != nil && rec.Tty {
+				if _, err := conn.Write(buffer[:n]); err != nil {
+					return
+				}
+			} else {
+				var hdr [8]byte
+				hdr[0] = 1 // stdout
+				binary.BigEndian.PutUint32(hdr[4:], uint32(n))
+				if _, err := conn.Write(hdr[:]); err != nil {
+					return
+				}
+				if _, err := conn.Write(buffer[:n]); err != nil {
+					return
+				}
+			}
+		}
+		if readErr != nil && readErr != io.EOF {
+			return
+		}
+
+		if !running {
+			if started {
+				// Container has run and exited; finish once its log is drained.
+				if n == 0 {
+					return
+				}
+				continue
+			}
+			// Not started yet: wait briefly for the foreground run flow to
+			// start it; otherwise this is an attach to a stopped container.
+			if !freshRun || time.Now().After(graceUntil) {
 				return
 			}
 		}
-		if readErr == io.EOF || n == 0 {
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		if readErr != nil {
-			return
+		if n == 0 {
+			time.Sleep(150 * time.Millisecond)
 		}
 	}
 }
@@ -1709,9 +1788,9 @@ func archiveBaseName(srcPath string, info os.FileInfo) string {
 
 func archivePathStatHeader(info os.FileInfo) string {
 	statJSON, _ := json.Marshal(map[string]any{
-		"name":       info.Name(),
-		"size":       info.Size(),
-		"mode":       uint32(info.Mode()),
+		"name": info.Name(),
+		"size": info.Size(),
+		"mode": uint32(info.Mode()),
 		// UTC so the stat header is deterministic regardless of host timezone
 		// (Docker/Portainer expect a stable RFC3339 instant, not local +HH:MM).
 		"mtime":      info.ModTime().UTC().Format(time.RFC3339Nano),
