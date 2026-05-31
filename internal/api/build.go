@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -105,6 +106,28 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer os.RemoveAll(ctxDir)
+
+	ref, err := h.buildFromContext(ctxDir, dockerfilePath, tag, targetStage, buildArgs, queryLabels, send)
+	if err != nil {
+		fail(err.Error())
+		return
+	}
+	send(map[string]string{"stream": fmt.Sprintf("Successfully built %s\n", ref)})
+	send(map[string]any{"aux": map[string]string{"ID": ref}})
+}
+
+// buildFromContext executes a Dockerfile build against an already-extracted
+// build context directory and returns the resulting image ref. It is the
+// shared core behind both the classic POST /build handler and the BuildKit
+// Solve path; step-by-step progress is reported through send using Docker's
+// {"stream": ...} envelopes. On failure it returns the error after running
+// any needed cleanup, leaving each caller to surface it in its own protocol.
+func (h *Handler) buildFromContext(ctxDir, dockerfilePath, tag, targetStage string, buildArgs, queryLabels map[string]string, send func(any)) (ref string, ferr error) {
+	// fail records the build error; every failure site in the body already
+	// follows fail(...) with a bare return, which returns ("", ferr). ferr is
+	// intentionally named so it is never shadowed by the inner `err :=`
+	// declarations the build loop uses.
+	fail := func(msg string) { ferr = errors.New(msg) }
 
 	dfAbs, err := safeJoin(ctxDir, dockerfilePath)
 	if err != nil {
@@ -367,8 +390,7 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanupStageImages()
-	send(map[string]string{"stream": fmt.Sprintf("Successfully built %s\n", normalizeImageRef(tag))})
-	send(map[string]any{"aux": map[string]string{"ID": normalizeImageRef(tag)}})
+	return normalizeImageRef(tag), nil
 }
 
 func extractBuildContext(r io.Reader) (string, error) {

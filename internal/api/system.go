@@ -35,7 +35,11 @@ func (h *Handler) ping(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("OSType", "linux")
 	w.Header().Set("Ostype", "linux")
 	w.Header().Set("Docker-Experimental", "false")
-	w.Header().Set("Builder-Version", "1")
+	// Advertise BuildKit (v2) so `docker buildx build` / `docker build` use the
+	// daemon's docker driver (the /grpc Control endpoint) rather than booting a
+	// separate buildkit container. The classic POST /build handler remains for
+	// older clients that still call it directly.
+	w.Header().Set("Builder-Version", "2")
 	w.Header().Set("Swarm", "inactive")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.Header().Set("Pragma", "no-cache")
@@ -884,9 +888,9 @@ func (r *statusRecorder) Flush() {
 }
 
 // Hijack passes through to the underlying ResponseWriter so attach/exec
-// streaming (the Docker "Upgrade: tcp" connection hijack) still works behind
-// the logging middleware. Without this, w.(http.Hijacker) fails — the embedded
-// http.ResponseWriter interface does not expose Hijack — and exec/attach 500s.
+// streaming and the BuildKit /grpc endpoint (Docker connection-upgrade hijack)
+// work behind the logging middleware. Without this, w.(http.Hijacker) fails —
+// the embedded http.ResponseWriter interface does not expose Hijack.
 func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	hj, ok := r.ResponseWriter.(http.Hijacker)
 	if !ok {
