@@ -6,11 +6,128 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/games-on-whales/LXC2Docker/internal/oci"
 	"github.com/games-on-whales/LXC2Docker/internal/store"
 )
+
+// orphanCTGrace is how long a tagged-but-unreferenced CT must survive before
+// the reaper destroys it. createPVEFromTarball writes the management tag (via
+// writePVEConfig) before it sets the store record's VMID, so a CT mid-creation
+// briefly looks like an orphan; the grace window — far longer than any create
+// takes — ensures we never reap one that's still being built.
+const orphanCTGrace = 5 * time.Minute
+
+// managedCTVMIDs returns the VMIDs of every Proxmox CT tagged as daemon-managed.
+// It scans /etc/pve/lxc/*.conf for ManagedTag rather than shelling out to pct,
+// so it works regardless of CT run state. Crucially, only CTs that carry the
+// tag are returned — anything the daemon didn't create is never surfaced, which
+// keeps every caller (notably the reaper) scoped strictly to our own CTs.
+func managedCTVMIDs() []int {
+	entries, err := filepath.Glob("/etc/pve/lxc/*.conf")
+	if err != nil {
+		return nil
+	}
+	var vmids []int
+	for _, path := range entries {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if !confHasManagedTag(data) {
+			continue
+		}
+		base := strings.TrimSuffix(filepath.Base(path), ".conf")
+		vmid, err := strconv.Atoi(base)
+		if err != nil {
+			continue
+		}
+		vmids = append(vmids, vmid)
+	}
+	return vmids
+}
+
+// confHasManagedTag reports whether a CT config's "tags:" line includes the
+// daemon's ManagedTag. Proxmox stores multiple tags semicolon-separated.
+func confHasManagedTag(data []byte) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "tags:") {
+			continue
+		}
+		tags := strings.TrimSpace(strings.TrimPrefix(line, "tags:"))
+		for _, t := range strings.Split(tags, ";") {
+			if strings.TrimSpace(t) == ManagedTag {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// reapOrphanCTs destroys Proxmox CTs that carry the daemon's management tag but
+// have no backing store record. These are leaks from abnormal exits — a daemon
+// crash mid-create, or a RemoveContainer that dropped the store entry before
+// pct destroy succeeded — and otherwise linger forever in the Proxmox UI.
+//
+// Safety is layered: (1) only tagged CTs are ever considered, so nothing the
+// daemon didn't create can be touched; (2) a grace period skips CTs whose
+// config was just written (a container mid-creation); (3) the store is
+// re-checked immediately before destroy to close any remaining race.
+func (m *Manager) reapOrphanCTs() {
+	if !m.UsePVE() {
+		return
+	}
+
+	referenced := map[int]bool{}
+	for _, rec := range m.store.ListContainers() {
+		if rec.VMID > 0 {
+			referenced[rec.VMID] = true
+		}
+	}
+	for _, img := range m.store.ListImages() {
+		if img.TemplateVMID > 0 {
+			referenced[img.TemplateVMID] = true
+		}
+	}
+
+	for _, vmid := range managedCTVMIDs() {
+		if referenced[vmid] {
+			continue
+		}
+		fi, err := os.Stat(pveConfigPath(vmid))
+		if err != nil || time.Since(fi.ModTime()) < orphanCTGrace {
+			continue
+		}
+		// Final guard: re-scan the store right before destroying, in case a
+		// create completed between the snapshot above and now.
+		if m.vmidReferenced(vmid) {
+			continue
+		}
+		log.Printf("reapOrphanCTs: destroying leaked managed CT %d (no backing container)", vmid)
+		if out, err := exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").CombinedOutput(); err != nil {
+			log.Printf("reapOrphanCTs: pct destroy %d: %s: %v", vmid, out, err)
+		}
+	}
+}
+
+// vmidReferenced reports whether any current store record points at vmid.
+func (m *Manager) vmidReferenced(vmid int) bool {
+	for _, rec := range m.store.ListContainers() {
+		if rec.VMID == vmid {
+			return true
+		}
+	}
+	for _, img := range m.store.ListImages() {
+		if img.TemplateVMID == vmid {
+			return true
+		}
+	}
+	return false
+}
 
 // pveTemplateTarballPath returns the on-disk path of an image's rootfs tarball,
 // kept under the daemon state dir (not Proxmox storage, so it never shows in the

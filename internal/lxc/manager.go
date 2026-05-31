@@ -110,6 +110,7 @@ func (m *Manager) StartGC(ctx context.Context) {
 	go func() {
 		// Run immediately on startup to clean leftovers, then periodically.
 		m.gc()
+		m.reapOrphanCTs()
 		m.rotateLogs()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -119,6 +120,7 @@ func (m *Manager) StartGC(ctx context.Context) {
 				return
 			case <-ticker.C:
 				m.gc()
+				m.reapOrphanCTs()
 				m.rotateLogs()
 			}
 		}
