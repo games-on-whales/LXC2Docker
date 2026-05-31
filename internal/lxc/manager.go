@@ -1796,6 +1796,15 @@ func (m *Manager) ImageReady(rec *store.ImageRecord) bool {
 	if rec == nil {
 		return false
 	}
+	// Tarball-backed image (current PVE scheme): ready iff the rootfs tarball
+	// is on disk. Without this check ImageReady falls through to the legacy
+	// VMID/template-dir probes — which a tarball image never satisfies — so
+	// the create path treats an already-pulled image as missing and re-pulls
+	// it under the raw request ref, producing a duplicate image record.
+	if rec.TemplateTarball != "" {
+		_, err := os.Stat(rec.TemplateTarball)
+		return err == nil
+	}
 	if rec.TemplateVMID > 0 {
 		if _, err := os.Stat(pveConfigPath(rec.TemplateVMID)); err == nil {
 			return true
