@@ -1529,36 +1529,87 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A container that has never been started (StartedAt nil) is being attached
+	// BEFORE it runs — the foreground `docker run` flow attaches, then starts.
+	// Stream its console from the beginning and wait for the run flow to start
+	// it (so even an instantly-exiting `echo` is captured). An already-started
+	// container (`docker attach`) streams only output produced after the attach.
+	rec := h.store.GetContainer(id)
+	freshRun := rec != nil && rec.StartedAt == nil
+
 	f, err := os.OpenFile(logPath, os.O_RDONLY|os.O_CREATE, 0o644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	f.Seek(0, io.SeekEnd)
+	if !freshRun {
+		f.Seek(0, io.SeekEnd)
+	}
 
 	ctx := r.Context()
 	buffer := make([]byte, 32*1024)
+	started := !freshRun
+	graceUntil := time.Now().Add(10 * time.Second)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		if s, _ := h.mgr.State(id); s != "running" && s != "paused" {
-			return
+
+		state, _ := h.mgr.State(id)
+		running := state == "running" || state == "paused"
+		if running {
+			started = true
+		} else if freshRun && !started {
+			// The run flow may have started the container; detect even an
+			// instant exit we never observed as "running" via StartedAt.
+			if r := h.store.GetContainer(id); r != nil && r.StartedAt != nil {
+				started = true
+			}
 		}
+
 		n, readErr := f.Read(buffer)
 		if n > 0 {
-			if _, err := conn.Write(buffer[:n]); err != nil {
+			// Non-TTY attach uses Docker's multiplexed stream framing (an
+			// 8-byte stdout/stderr header per chunk); TTY attach is raw. The
+			// console log mixes stdout+stderr, so frame everything as stdout.
+			if rec != nil && rec.Tty {
+				if _, err := conn.Write(buffer[:n]); err != nil {
+					return
+				}
+			} else {
+				var hdr [8]byte
+				hdr[0] = 1 // stdout
+				binary.BigEndian.PutUint32(hdr[4:], uint32(n))
+				if _, err := conn.Write(hdr[:]); err != nil {
+					return
+				}
+				if _, err := conn.Write(buffer[:n]); err != nil {
+					return
+				}
+			}
+		}
+		if readErr != nil && readErr != io.EOF {
+			return
+		}
+
+		if !running {
+			if started {
+				// Container has run and exited; finish once its log is drained.
+				if n == 0 {
+					return
+				}
+				continue
+			}
+			// Not started yet: wait briefly for the foreground run flow to
+			// start it; otherwise this is an attach to a stopped container.
+			if !freshRun || time.Now().After(graceUntil) {
 				return
 			}
 		}
-		if readErr == io.EOF || n == 0 {
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		if readErr != nil {
-			return
+		if n == 0 {
+			time.Sleep(150 * time.Millisecond)
 		}
 	}
 }
