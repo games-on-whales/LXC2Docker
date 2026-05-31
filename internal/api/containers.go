@@ -894,17 +894,40 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 	if state, _ := h.mgr.State(id); state == "running" {
 		wasRunning = true
 	}
+
+	// Send the 200 response header IMMEDIATELY, before blocking on the
+	// condition. The Docker SDK's ContainerWait (API >= 1.30) blocks on the
+	// POST until it receives the response header, and `docker run` calls
+	// ContainerWait BEFORE ContainerStart — so deferring the header until the
+	// container exits deadlocks the run flow (the start request is never sent,
+	// the container never runs, and the wait never resolves). Flushing the
+	// header now lets the client proceed to /start; the JSON result is written
+	// when the condition is met. This matches the real docker daemon.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
+	}
+	sendResult := func(rec *store.ContainerRecord) {
+		_ = json.NewEncoder(w).Encode(waitContainerResponse(rec))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	waitStart := time.Now()
 	ctx := r.Context()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(200 * time.Millisecond):
 		}
 		switch condition {
 		case "removed":
 			if h.store.GetContainer(id) == nil {
-				jsonResponse(w, http.StatusOK, waitContainerResponse(nil))
+				sendResult(nil)
 				return
 			}
 		case "next-exit":
@@ -912,14 +935,19 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 			if !wasRunning && state == "running" {
 				wasRunning = true
 			}
-			if wasRunning && state != "running" {
-				jsonResponse(w, http.StatusOK, waitContainerResponse(h.store.GetContainer(id)))
+			rec := h.store.GetContainer(id)
+			// A container that starts and exits between two polls (e.g. `echo`)
+			// is never observed "running"; detect it via StartedAt being set
+			// after the wait began.
+			startedDuringWait := rec != nil && rec.StartedAt != nil && rec.StartedAt.After(waitStart)
+			if state != "running" && (wasRunning || startedDuringWait) {
+				sendResult(rec)
 				return
 			}
 		default:
 			state, _ := h.mgr.State(id)
 			if state != "running" {
-				jsonResponse(w, http.StatusOK, waitContainerResponse(h.store.GetContainer(id)))
+				sendResult(h.store.GetContainer(id))
 				return
 			}
 		}
@@ -1709,9 +1737,9 @@ func archiveBaseName(srcPath string, info os.FileInfo) string {
 
 func archivePathStatHeader(info os.FileInfo) string {
 	statJSON, _ := json.Marshal(map[string]any{
-		"name":       info.Name(),
-		"size":       info.Size(),
-		"mode":       uint32(info.Mode()),
+		"name": info.Name(),
+		"size": info.Size(),
+		"mode": uint32(info.Mode()),
 		// UTC so the stat header is deterministic regardless of host timezone
 		// (Docker/Portainer expect a stable RFC3339 instant, not local +HH:MM).
 		"mtime":      info.ModTime().UTC().Format(time.RFC3339Nano),

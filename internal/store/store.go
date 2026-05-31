@@ -204,6 +204,10 @@ type ImageRecord struct {
 	OCIDockerVersion   string             `json:"oci_docker_version,omitempty"`
 	OCIVariant         string             `json:"oci_variant,omitempty"`
 	TemplateDataset    string             `json:"template_dataset,omitempty"`
+	// TemplateTarball is the path to the image's rootfs tarball used to
+	// `pct create` PVE containers. Storage-agnostic (LVM/ZFS/dir) and keeps no
+	// Proxmox template CT, so templates never appear in the Proxmox UI.
+	TemplateTarball string `json:"template_tarball,omitempty"`
 	// RepoDigest holds the image manifest digest ("sha256:...") when
 	// known. Populated by skopeo inspect after pull. Used to surface a
 	// canonical reference on the image detail page.

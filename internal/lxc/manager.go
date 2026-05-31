@@ -34,6 +34,7 @@ type LANConfig struct {
 type Manager struct {
 	lxcPath    string // e.g. /var/lib/lxc (legacy mode)
 	pveStorage string // Proxmox storage name (e.g. "large"); empty = legacy mode
+	pveStgType string // backend type of pveStorage: "zfspool", "lvmthin", "dir", …
 	lan        LANConfig
 	store      *store.Store
 }
@@ -59,7 +60,8 @@ func NewManager(lxcPath, pveStorage string, lan LANConfig, st *store.Store) (*Ma
 	}
 	m := &Manager{lxcPath: lxcPath, pveStorage: pveStorage, lan: lan, store: st}
 	if pveStorage != "" {
-		log.Printf("Proxmox CT mode enabled (storage=%s)", pveStorage)
+		m.pveStgType = detectPVEStorageType(pveStorage)
+		log.Printf("Proxmox CT mode enabled (storage=%s, type=%s)", pveStorage, m.pveStgType)
 	}
 	if lan.Bridge != "" {
 		log.Printf("LAN bridge enabled (bridge=%s, prefix=%s, gateway=%s, /%d)",
@@ -762,65 +764,28 @@ func (m *Manager) pullOCI(r *image.ResolvedImage, opts PullOpts) error {
 	}
 
 	var templateVMID int
+	var templateTarball string
 
 	if m.UsePVE() {
 		// --- Proxmox CT mode ---
-		// Create a tarball from the rootfs, then use pct create to make a
-		// Proxmox CT template on the configured storage (ZFS).
-		progress("Creating Proxmox CT template from OCI rootfs")
+		// Store the rootfs as a tarball; containers are `pct create`d from it
+		// (storage-agnostic, and no Proxmox template CT clutters the web UI).
+		progress("Storing image rootfs")
 
-		tarball := filepath.Join(os.TempDir(), "oci-template-"+oci.SafeDirName(r.Ref)+".tar.gz")
-		defer os.Remove(tarball)
+		tarball := m.pveTemplateTarballPath(r.Ref)
+		os.MkdirAll(filepath.Dir(tarball), 0o755)
+		os.Remove(tarball) // clear any stale tarball on re-pull
 
-		out, err := exec.Command("tar", "czf", tarball, "-C", rootfsPath, ".").CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("manager: create tarball: %s: %w", out, err)
+		if out, err := exec.Command("tar", "czf", tarball, "-C", rootfsPath, ".").CombinedOutput(); err != nil {
+			return fmt.Errorf("manager: tar rootfs: %s: %w", out, err)
 		}
-
-		vmid, err := allocateVMID()
-		if err != nil {
-			return err
-		}
-		templateVMID = vmid
-
-		hostname := sanitizeHostname("tmpl-" + oci.SafeDirName(r.Ref))
-
-		out, err = exec.Command("pct", "create", fmt.Sprintf("%d", vmid), tarball,
-			"--storage", m.pveStorage,
-			"--ostype", "unmanaged",
-			"--arch", "amd64",
-			"--hostname", hostname,
-			"--unprivileged", "0",
-			"--rootfs", fmt.Sprintf("%s:4", m.pveStorage),
-		).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("manager: pct create template %d: %s: %w", vmid, out, err)
-		}
-
-		// Mark it as a template so it can't be accidentally started.
-		exec.Command("pct", "template", fmt.Sprintf("%d", vmid)).Run()
-
-		// Create a ZFS snapshot for instant ephemeral container cloning.
-		// pct template converts subvol → basevol, so snapshot the basevol.
-		snapDataset := fmt.Sprintf("%s/basevol-%d-disk-0@tmpl", m.pveStorage, vmid)
-		if snapOut, snapErr := exec.Command("zfs", "snapshot", snapDataset).CombinedOutput(); snapErr != nil {
-			log.Printf("pullOCI: warning: could not create ZFS snapshot %s: %s: %v", snapDataset, snapOut, snapErr)
-		} else {
-			log.Printf("pullOCI: created ZFS snapshot %s for ephemeral cloning", snapDataset)
-		}
-
-		// Write resolv.conf into the template rootfs.
-		templateRootfs := m.pveRootfsPath(vmid)
-		resolvPath := filepath.Join(templateRootfs, "etc", "resolv.conf")
-		os.Remove(resolvPath)
-		os.MkdirAll(filepath.Dir(resolvPath), 0o755)
-		os.WriteFile(resolvPath, []byte(defaultResolvConf()), 0o644)
+		templateTarball = tarball
 
 		// Clean up the OCI working directory.
 		os.RemoveAll(rootfsPath)
 		oci.Cleanup(ociStoreDir, r.Ref)
 
-		log.Printf("pullOCI: created Proxmox template VMID %d for %s", vmid, r.Ref)
+		log.Printf("pullOCI: stored rootfs tarball %s for %s", tarball, r.Ref)
 	} else {
 		// --- Legacy direct-LXC mode ---
 		progress("Creating LXC template from OCI rootfs")
@@ -873,19 +838,20 @@ lxc.uts.name = %s
 
 	progress("Image ready")
 	return m.store.AddImage(&store.ImageRecord{
-		ID:            "oci_" + oci.SafeDirName(r.Ref),
-		Ref:           r.Ref,
-		Arch:          r.Arch,
-		TemplateName:  r.TemplateContainerName,
-		TemplateVMID:  templateVMID,
-		Created:       time.Now(),
-		OCIEntrypoint: cfg.Entrypoint,
-		OCICmd:        cfg.Cmd,
-		OCIEnv:        cfg.Env,
-		OCIWorkingDir: cfg.WorkingDir,
-		OCIPorts:      cfg.Ports,
-		OCILabels:     cfg.Labels,
-		RepoDigest:    cfg.Digest,
+		ID:              "oci_" + oci.SafeDirName(r.Ref),
+		Ref:             r.Ref,
+		Arch:            r.Arch,
+		TemplateName:    r.TemplateContainerName,
+		TemplateVMID:    templateVMID,
+		TemplateTarball: templateTarball,
+		Created:         time.Now(),
+		OCIEntrypoint:   cfg.Entrypoint,
+		OCICmd:          cfg.Cmd,
+		OCIEnv:          cfg.Env,
+		OCIWorkingDir:   cfg.WorkingDir,
+		OCIPorts:        cfg.Ports,
+		OCILabels:       cfg.Labels,
+		RepoDigest:      cfg.Digest,
 	})
 }
 
@@ -904,6 +870,13 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 		}
 	}
 
+	// New images store a rootfs tarball and are created storage-agnostically
+	// via `pct create` (no Proxmox template CT — templates stay out of the UI).
+	if m.UsePVE() && rec.TemplateTarball != "" {
+		return m.createPVEFromTarball(id, rec, cfg)
+	}
+	// Backward compatibility: images pulled before the tarball change still use
+	// the VMID-based pct-template clone paths.
 	if m.UsePVE() && cfg.ProxmoxCT && rec.TemplateVMID > 0 {
 		return m.createPVEContainer(id, rec, cfg)
 	}
@@ -1268,6 +1241,13 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 			log.Printf("StartContainer[PVE]: VMID %d (%s) is running", vmid, id[:12])
 			return nil
 		}
+		if state == "exited" {
+			// `pct start` returned 0 (the start succeeded) but the container's
+			// command already exited — a short-lived `echo`/`true`. That's a
+			// normal fast-exit container, not a start failure.
+			log.Printf("StartContainer[PVE]: VMID %d (%s) started and exited quickly", vmid, id[:12])
+			return nil
+		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("manager: VMID %d did not reach RUNNING within 30s", vmid)
@@ -1298,6 +1278,13 @@ func (m *Manager) startLXCContainer(id string) error {
 				return err
 			}
 			log.Printf("StartContainer[LXC]: %s is running", id)
+			return nil
+		}
+		if state == "exited" {
+			// lxc-start succeeded but the command already exited (short-lived
+			// `echo`/`true`). A normal fast-exit container — no bridge to
+			// attach since it's already gone.
+			log.Printf("StartContainer[LXC]: %s started and exited quickly", id)
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -1576,6 +1563,13 @@ func (m *Manager) RemoveImage(ref string) error {
 	rec := m.store.GetImage(ref)
 	if rec == nil {
 		return fmt.Errorf("manager: image %q not found", ref)
+	}
+
+	if rec.TemplateTarball != "" {
+		// Tarball-backed image (current scheme): just remove the tarball. No
+		// Proxmox template CT exists, so there is nothing to pct-destroy.
+		os.Remove(rec.TemplateTarball)
+		return m.store.RemoveImage(ref)
 	}
 
 	if rec.TemplateVMID > 0 {
