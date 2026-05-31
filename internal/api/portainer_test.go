@@ -381,7 +381,13 @@ func TestAdditionalPortainerRoutesExist(t *testing.T) {
 	}
 }
 
-func TestSessionRouteIsExplicitlyNotImplemented(t *testing.T) {
+// TestSessionRouteServesBuildkitSession verifies POST /session is wired to the
+// BuildKit session handler — buildx's docker driver opens it for build-context
+// FileSync — rather than the old not-implemented stub. This Handler has no
+// session manager wired, so serveSession degrades to 501; the key assertion is
+// that POST is *routed* (not 404). The end-to-end happy path (a real `docker
+// build` over a live session) is covered by the on-host build test.
+func TestSessionRouteServesBuildkitSession(t *testing.T) {
 	t.Parallel()
 
 	h := &Handler{
@@ -390,17 +396,14 @@ func TestSessionRouteIsExplicitlyNotImplemented(t *testing.T) {
 	}
 	r := mustMuxRouter(t, h.routes())
 
-	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost} {
-		method := method
-		t.Run(method, func(t *testing.T) {
-			t.Parallel()
-			req := httptest.NewRequest(method, "/v1.45/session", nil)
-			rr := httptest.NewRecorder()
-			r.ServeHTTP(rr, req)
-			if rr.Code != http.StatusNotImplemented {
-				t.Fatalf("expected 501 for %s /session, got %d body=%s", method, rr.Code, rr.Body.String())
-			}
-		})
+	req := httptest.NewRequest(http.MethodPost, "/v1.45/session", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code == http.StatusNotFound {
+		t.Fatalf("POST /session must be routed to the session handler, got 404")
+	}
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("POST /session with no session manager should degrade to 501, got %d body=%s", rr.Code, rr.Body.String())
 	}
 }
 

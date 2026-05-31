@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -37,6 +38,10 @@ func newBuildkitControlServer(h *Handler) *grpc.Server {
 		sm:       sm,
 		statuses: map[string]*solveStatus{},
 	}
+	// Share the session manager with the HTTP layer so the /session endpoint
+	// (buildx's docker driver opens it for build-context FileSync) registers
+	// connections into the same manager that Solve reads from.
+	h.buildkitSM = sm
 	// buildx Solve uses the real LLB executor; the classic POST /build handler
 	// keeps using buildFromContext directly.
 	cs.buildFn = h.buildViaLLB
@@ -44,6 +49,24 @@ func newBuildkitControlServer(h *Handler) *grpc.Server {
 	srv := grpc.NewServer()
 	controlapi.RegisterControlServer(srv, cs)
 	return srv
+}
+
+// serveSession handles buildx's POST /session. buildx's docker driver opens a
+// long-lived session connection here (separate from the /grpc Control channel)
+// and serves its FileSync/auth/secrets attachables over it; Solve later dials
+// back through the session manager to pull the build context. The buildkit
+// session manager owns the HTTP hijack + h2c upgrade, so we just hand it the
+// request — mirroring how the real moby daemon wires its /session route.
+func (h *Handler) serveSession(w http.ResponseWriter, r *http.Request) {
+	if h.buildkitSM == nil {
+		errResponse(w, http.StatusNotImplemented, "buildkit session manager unavailable")
+		return
+	}
+	if err := h.buildkitSM.HandleHTTPRequest(r.Context(), w, r); err != nil {
+		// The connection is already hijacked by the time most errors occur, so
+		// an HTTP error response is no longer possible — log for diagnosis.
+		log.Printf("buildkit session: %v", err)
+	}
 }
 
 // controlServer implements moby.buildkit.v1.Control on top of the LXC daemon.

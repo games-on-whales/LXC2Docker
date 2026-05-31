@@ -254,6 +254,49 @@ func (m *Manager) mountPVERootfs(vmid int) (string, func(), error) {
 	return fmt.Sprintf("/var/lib/lxc/%d/rootfs", vmid), unmount, nil
 }
 
+// BuildTarballFromContainer captures a stopped build container's rootfs as an
+// image tarball under pve-templates/, then destroys the build CT. The classic
+// builder's finalize step uses it on PVE: a build container is a CT (an LVM/ZFS
+// volume), not a plain directory, so its rootfs is reached via pct mount and
+// tarred — yielding the same tarball-backed image scheme as pullOCI (hidden
+// from the Proxmox UI, reaped by reapOrphanTarballs, run via
+// createPVEFromTarball). Returns the tarball path on success.
+func (m *Manager) BuildTarballFromContainer(tmpID, ref string) (string, error) {
+	rec := m.store.GetContainer(tmpID)
+	if rec == nil || rec.VMID == 0 {
+		return "", fmt.Errorf("manager: build container %s has no PVE CT to capture", tmpID)
+	}
+
+	tarball := m.pveTemplateTarballPath(ref)
+	if err := os.MkdirAll(filepath.Dir(tarball), 0o755); err != nil {
+		return "", fmt.Errorf("manager: mkdir tarball dir: %w", err)
+	}
+	os.Remove(tarball) // clear any stale tarball from a prior build of this ref
+
+	rootfsPath, unmount, err := m.mountPVERootfs(rec.VMID)
+	if err != nil {
+		return "", fmt.Errorf("manager: mount build rootfs: %w", err)
+	}
+	tarErr := func() error {
+		if out, err := exec.Command("tar", "czf", tarball, "-C", rootfsPath, ".").CombinedOutput(); err != nil {
+			return fmt.Errorf("tar build rootfs: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+		return nil
+	}()
+	unmount() // must release the mount before pct destroy on block-device backends
+	if tarErr != nil {
+		os.Remove(tarball)
+		return "", fmt.Errorf("manager: %w", tarErr)
+	}
+
+	// The rootfs is captured; destroy the build CT (pct destroy via RemoveContainer).
+	if err := m.RemoveContainer(tmpID); err != nil {
+		log.Printf("BuildTarballFromContainer: remove build CT %s: %v (continuing)", tmpID, err)
+	}
+	log.Printf("BuildTarballFromContainer: stored built image tarball %s for %s", tarball, ref)
+	return tarball, nil
+}
+
 // dirSizeGB returns the apparent on-disk size of a tarball's contents in whole
 // gigabytes. We size the CT rootfs from the tarball file size as a cheap proxy,
 // padded generously, with a 4G floor.

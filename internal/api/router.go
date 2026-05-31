@@ -11,6 +11,7 @@ import (
 	"github.com/games-on-whales/LXC2Docker/internal/lxc"
 	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
+	"github.com/moby/buildkit/session"
 	"google.golang.org/grpc"
 )
 
@@ -25,6 +26,10 @@ type Handler struct {
 	attachMu   sync.Mutex
 	attachPTYs map[string]*os.File
 	grpcServer *grpc.Server
+	// buildkitSM is the BuildKit session manager shared with the Control
+	// server. The /session endpoint hands hijacked client connections to it
+	// so Solve can FileSync the build context back.
+	buildkitSM *session.Manager
 }
 
 // NewHandler wires up the Handler and returns an http.Handler ready to serve.
@@ -135,11 +140,6 @@ func (h *Handler) routes() http.Handler {
 		// Distribution (registry manifest probe used by Portainer's pull modal)
 		sub.HandleFunc("/distribution/{name:.*}/json", h.distributionInspect).Methods(http.MethodGet, http.MethodHead)
 
-		// Polite errors for engine features that this daemon doesn't
-		// implement. Portainer surfaces these as UI tabs; returning a
-		// service-unavailable style response is the closest shape for
-		// uninitialized swarm.
-		ni := notImplementedFunc("not supported by docker-lxc-daemon")
 		sub.HandleFunc("/build", h.buildImage).Methods(http.MethodPost)
 		sub.HandleFunc("/build/prune", h.pruneBuildCache).Methods(http.MethodPost)
 		// BuildKit gRPC endpoint — buildx's "docker" driver dials this and
@@ -147,7 +147,9 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/grpc", h.serveGRPC).Methods(http.MethodPost)
 		sub.HandleFunc("/images/load", h.loadImage).Methods(http.MethodPost)
 		sub.HandleFunc("/commit", h.commitContainer).Methods(http.MethodPost)
-		sub.HandleFunc("/session", ni).Methods(http.MethodGet, http.MethodHead, http.MethodPost)
+		// BuildKit session endpoint — buildx's docker driver opens this for the
+		// build-context FileSync. Handed to the shared session manager.
+		sub.HandleFunc("/session", h.serveSession).Methods(http.MethodPost)
 		sub.HandleFunc("/plugins", h.listPlugins).Methods(http.MethodGet, http.MethodHead)
 		sub.HandleFunc("/plugins/create", h.createPlugin).Methods(http.MethodPost)
 		sub.HandleFunc("/plugins/privileges", h.pluginPrivileges).Methods(http.MethodGet, http.MethodHead)
@@ -213,18 +215,6 @@ func (h *Handler) routes() http.Handler {
 	})
 
 	return r
-}
-
-// notImplementedFunc returns an HTTP handler that responds 501 with a
-// structured error body. Used for Docker Engine endpoints that Portainer
-// probes but this daemon has no analog for (build, swarm, services, …).
-// 501 is the spec-correct code — it tells clients the feature is missing
-// rather than the path being wrong, which prevents retry storms and
-// surfaces a clearer message in Portainer's console.
-func notImplementedFunc(msg string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		errResponse(w, http.StatusNotImplemented, msg)
-	}
 }
 
 func buildNotImplemented(w http.ResponseWriter, r *http.Request) {
