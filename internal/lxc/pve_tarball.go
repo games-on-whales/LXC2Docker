@@ -129,6 +129,61 @@ func (m *Manager) vmidReferenced(vmid int) bool {
 	return false
 }
 
+// reapOrphanTarballs deletes image rootfs tarballs under pve-templates/ that no
+// image record references. This is the tarball analogue of reapOrphanCTs: if an
+// image record is lost (a crash, or a scheme migration) RemoveImage never runs
+// for it and the .tar.gz would otherwise linger forever, consuming disk.
+//
+// pullOCI writes the tarball before it AddImage's the record, so a pull in
+// flight briefly has an unreferenced tarball; the same grace window used for
+// CTs (orphanCTGrace) skips recently-written tarballs, and the store is
+// re-checked immediately before each delete.
+func (m *Manager) reapOrphanTarballs() {
+	if !m.UsePVE() {
+		return
+	}
+	dir := filepath.Join(m.store.RootDir(), "pve-templates")
+	entries, err := filepath.Glob(filepath.Join(dir, "*.tar.gz"))
+	if err != nil {
+		return
+	}
+
+	referenced := map[string]bool{}
+	for _, img := range m.store.ListImages() {
+		if img.TemplateTarball != "" {
+			referenced[img.TemplateTarball] = true
+		}
+	}
+
+	for _, path := range entries {
+		if referenced[path] {
+			continue
+		}
+		fi, err := os.Stat(path)
+		if err != nil || time.Since(fi.ModTime()) < orphanCTGrace {
+			continue
+		}
+		// Final guard: re-scan in case an AddImage landed since the snapshot.
+		if m.tarballReferenced(path) {
+			continue
+		}
+		log.Printf("reapOrphanTarballs: deleting leaked image tarball %s (no backing image record)", path)
+		if err := os.Remove(path); err != nil {
+			log.Printf("reapOrphanTarballs: remove %s: %v", path, err)
+		}
+	}
+}
+
+// tarballReferenced reports whether any current image record points at path.
+func (m *Manager) tarballReferenced(path string) bool {
+	for _, img := range m.store.ListImages() {
+		if img.TemplateTarball == path {
+			return true
+		}
+	}
+	return false
+}
+
 // pveTemplateTarballPath returns the on-disk path of an image's rootfs tarball,
 // kept under the daemon state dir (not Proxmox storage, so it never shows in the
 // Proxmox UI).
