@@ -111,6 +111,7 @@ func (m *Manager) StartGC(ctx context.Context) {
 		// Run immediately on startup to clean leftovers, then periodically.
 		m.gc()
 		m.reapOrphanCTs()
+		m.reapOrphanTarballs()
 		m.rotateLogs()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -121,6 +122,7 @@ func (m *Manager) StartGC(ctx context.Context) {
 			case <-ticker.C:
 				m.gc()
 				m.reapOrphanCTs()
+				m.reapOrphanTarballs()
 				m.rotateLogs()
 			}
 		}
@@ -1580,8 +1582,13 @@ func (m *Manager) RemoveImage(ref string) error {
 
 	if rec.TemplateTarball != "" {
 		// Tarball-backed image (current scheme): just remove the tarball. No
-		// Proxmox template CT exists, so there is nothing to pct-destroy.
-		os.Remove(rec.TemplateTarball)
+		// Proxmox template CT exists, so there is nothing to pct-destroy. Log
+		// (don't fail) on a real removal error so a left-behind tarball is
+		// visible — reapOrphanTarballs is the backstop that eventually clears
+		// it once the store record is gone.
+		if err := os.Remove(rec.TemplateTarball); err != nil && !os.IsNotExist(err) {
+			log.Printf("RemoveImage: remove tarball %s: %v", rec.TemplateTarball, err)
+		}
 		return m.store.RemoveImage(ref)
 	}
 
