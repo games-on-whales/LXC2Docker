@@ -121,40 +121,65 @@ func (s *controlServer) solveGateway(ctx context.Context, req *controlapi.SolveR
 		s.gwMu.Unlock()
 		b.cleanupAll()
 	}()
-
 	st := s.statusFor(req.Ref)
 	defer close(st.ch)
 
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-b.done:
+	// buildx's docker driver pings and returns an empty result without driving
+	// the LLBBridge, so the daemon owns the build: fetch the context + Dockerfile
+	// from the session and run the Dockerfile frontend here.
+	localDirs, err := s.ensureLocals(ctx, b)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "fetch build context: %v", err)
 	}
-	if b.retErr != nil {
-		return nil, b.retErr
-	}
-
-	b.mu.Lock()
-	dir := b.refs[b.result]
-	md := b.metadata
-	b.mu.Unlock()
-	if dir == "" {
-		return nil, status.Error(codes.Internal, "gateway build returned no result ref")
-	}
-
-	tag := exporterImageName(req)
-	if tag == "" {
-		// No image export requested (e.g. --output type=cacheonly); nothing to store.
-		return &controlapi.SolveResponse{ExporterResponse: map[string]string{}}, nil
+	ctxDir := localDirs["context"]
+	if ctxDir == "" {
+		ctxDir, err = os.MkdirTemp("", "gw-emptyctx-*")
+		if err != nil {
+			return nil, err
+		}
+		b.addCleanup(func() { os.RemoveAll(ctxDir) })
 	}
 
-	img := imageConfigFromMetadata(md)
-	if err := s.h.importLLBResult(dir, tag, img); err != nil {
-		return nil, status.Errorf(codes.Internal, "import build result: %v", err)
+	dfName := req.FrontendAttrs["filename"]
+	if dfName == "" {
+		dfName = "Dockerfile"
 	}
-	return &controlapi.SolveResponse{ExporterResponse: map[string]string{
-		exptypes.ExporterImageConfigKey: string(md[exptypes.ExporterImageConfigKey]),
-	}}, nil
+	if _, statErr := os.Stat(filepath.Join(ctxDir, dfName)); statErr != nil {
+		if dfDir := localDirs["dockerfile"]; dfDir != "" {
+			if data, rerr := os.ReadFile(filepath.Join(dfDir, dfName)); rerr == nil {
+				_ = os.WriteFile(filepath.Join(ctxDir, dfName), data, 0o644)
+			}
+		}
+	}
+
+	target := req.FrontendAttrs["target"]
+	buildArgs, labels := frontendBuildArgsAndLabels(req.FrontendAttrs)
+	getSecret := func(sctx context.Context, sid string) ([]byte, error) {
+		caller, gerr := s.sm.Get(sctx, b.sessionID, false)
+		if gerr != nil {
+			return nil, gerr
+		}
+		return secrets.GetSecret(sctx, caller, sid)
+	}
+
+	dir, cleanup, img, err := s.h.buildLLBResult(ctx, ctxDir, dfName, target, buildArgs, labels, func(any) {}, getSecret)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "build: %v", err)
+	}
+	b.addCleanup(cleanup)
+
+	resp := map[string]string{}
+	if img != nil {
+		if cfg, mErr := json.Marshal(img); mErr == nil {
+			resp[exptypes.ExporterImageConfigKey] = string(cfg)
+		}
+	}
+	if tag := exporterImageName(req); tag != "" {
+		if err := s.h.importLLBResult(dir, tag, img); err != nil {
+			return nil, status.Errorf(codes.Internal, "import build result: %v", err)
+		}
+	}
+	return &controlapi.SolveResponse{ExporterResponse: resp}, nil
 }
 
 // imageConfigFromMetadata extracts the OCI image config the frontend places in
@@ -248,7 +273,18 @@ func (g *gatewayBridge) Solve(ctx context.Context, req *gwpb.SolveRequest) (*gwp
 	if err != nil {
 		return nil, err
 	}
+
+	// buildx's docker driver asks the daemon to run the Dockerfile frontend by
+	// calling Solve with Frontend="dockerfile.v0" (and no Definition). Run the
+	// build server-side and return the result ref plus the image config.
+	if req.Frontend == dockerfileFrontend {
+		return g.solveDockerfileFrontend(ctx, b, req)
+	}
+
 	if req.Definition == nil || len(req.Definition.Def) == 0 {
+		if req.Frontend != "" {
+			return nil, status.Errorf(codes.Unimplemented, "unsupported frontend %q", req.Frontend)
+		}
 		// An empty solve (e.g. scratch) yields an empty dir.
 		dir, derr := os.MkdirTemp("", "gw-empty-*")
 		if derr != nil {
@@ -288,6 +324,71 @@ func (g *gatewayBridge) Solve(ctx context.Context, req *gwpb.SolveRequest) (*gwp
 	b.refs[id] = dir
 	b.mu.Unlock()
 	return &gwpb.SolveResponse{Ref: id}, nil
+}
+
+// solveDockerfileFrontend runs the Dockerfile frontend server-side: it fetches
+// the build context + Dockerfile from the client session, runs the LLB build,
+// and returns a result ref whose Result carries the image config in metadata
+// (the exptypes key buildx reads to export the image).
+func (g *gatewayBridge) solveDockerfileFrontend(ctx context.Context, b *gatewayBuild, req *gwpb.SolveRequest) (*gwpb.SolveResponse, error) {
+	localDirs, err := g.cs.ensureLocals(ctx, b)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "fetch build context: %v", err)
+	}
+	ctxDir := localDirs["context"]
+	if ctxDir == "" {
+		return nil, status.Error(codes.Internal, "build context not provided over session")
+	}
+
+	dfName := req.FrontendOpt["filename"]
+	if dfName == "" {
+		dfName = "Dockerfile"
+	}
+	// The Dockerfile may have synced into the "dockerfile" local rather than the
+	// context; stage it into the context dir so buildLLBResult finds it.
+	if _, statErr := os.Stat(filepath.Join(ctxDir, dfName)); statErr != nil {
+		if dfDir := localDirs["dockerfile"]; dfDir != "" {
+			if data, rerr := os.ReadFile(filepath.Join(dfDir, dfName)); rerr == nil {
+				_ = os.WriteFile(filepath.Join(ctxDir, dfName), data, 0o644)
+			}
+		}
+	}
+
+	target := req.FrontendOpt["target"]
+	buildArgs, labels := frontendBuildArgsAndLabels(req.FrontendOpt)
+	send := func(any) {}
+	getSecret := func(sctx context.Context, sid string) ([]byte, error) {
+		caller, gerr := g.cs.sm.Get(sctx, b.sessionID, false)
+		if gerr != nil {
+			return nil, gerr
+		}
+		return secrets.GetSecret(sctx, caller, sid)
+	}
+
+	dir, cleanup, img, err := g.cs.h.buildLLBResult(ctx, ctxDir, dfName, target, buildArgs, labels, send, getSecret)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "dockerfile build: %v", err)
+	}
+	b.addCleanup(cleanup)
+
+	id := "ref-" + generateID()[:12]
+	b.mu.Lock()
+	b.refs[id] = dir
+	b.mu.Unlock()
+
+	md := map[string][]byte{}
+	if img != nil {
+		if cfg, mErr := json.Marshal(img); mErr == nil {
+			md[exptypes.ExporterImageConfigKey] = cfg
+		}
+	}
+	return &gwpb.SolveResponse{
+		Ref: id,
+		Result: &gwpb.Result{
+			Result:   &gwpb.Result_Ref{Ref: &gwpb.Ref{Id: id}},
+			Metadata: md,
+		},
+	}, nil
 }
 
 func (g *gatewayBridge) refDir(ctx context.Context, refID string) (string, error) {
