@@ -1133,11 +1133,20 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 	}
 
 	if h.mgr.UsePVE() {
-		// On PVE the build container is a CT (LVM/ZFS volume), not a plain
-		// directory — capture its rootfs as a tarball image, matching the
-		// pullOCI scheme (storage-agnostic, hidden from the Proxmox UI, reaped
-		// by reapOrphanTarballs, instantiated via createPVEFromTarball).
-		tarball, err := h.mgr.BuildTarballFromContainer(tmpID, ref)
+		// Capture the built rootfs as a tarball image, matching the pullOCI
+		// scheme (storage-agnostic, hidden from the Proxmox UI, reaped by
+		// reapOrphanTarballs, instantiated via createPVEFromTarball). The
+		// classic builder's rootfs is a CT (mount+tar); the BuildKit LLB path
+		// stages a plain directory under lxcPath/<tmpID>/rootfs.
+		var tarball string
+		var err error
+		if tmpRec.VMID > 0 {
+			tarball, err = h.mgr.BuildTarballFromContainer(tmpID, ref)
+		} else {
+			rootfs := filepath.Join(h.mgr.LXCPath(), tmpID, "rootfs")
+			tarball, err = h.mgr.TarballFromDir(rootfs, ref)
+			_ = os.RemoveAll(filepath.Join(h.mgr.LXCPath(), tmpID))
+		}
 		if err != nil {
 			return err
 		}

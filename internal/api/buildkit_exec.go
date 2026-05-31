@@ -30,10 +30,11 @@ type secretFunc func(ctx context.Context, id string) ([]byte, error)
 type llbExecutor struct {
 	h         *Handler
 	ctx       context.Context
-	ctxDir    string       // local://context root (FileSync'd build context)
-	scratch   string       // parent dir for all snapshots, removed after the build
-	emit      func(string) // progress log sink
-	getSecret secretFunc   // RUN --mount=type=secret resolver (may be nil)
+	ctxDir    string            // local://context root (FileSync'd build context)
+	localDirs map[string]string // every local://<name> source root (gateway builds use "context" + "dockerfile")
+	scratch   string            // parent dir for all snapshots, removed after the build
+	emit      func(string)      // progress log sink
+	getSecret secretFunc        // RUN --mount=type=secret resolver (may be nil)
 
 	byDigest map[digest.Digest]*pb.Op
 	// opOutputs memoises every output directory of an op, keyed by output index.
@@ -50,6 +51,14 @@ type llbExecutor struct {
 // returns the directory holding the final build result. The caller imports it
 // as an image.
 func (h *Handler) solveLLB(ctx context.Context, ctxDir string, def *llb.Definition, emit func(string), getSecret secretFunc) (resultDir string, cleanup func(), err error) {
+	return h.solveLLBLocals(ctx, map[string]string{"context": ctxDir}, def, emit, getSecret)
+}
+
+// solveLLBLocals is solveLLB with arbitrary named local sources. The classic
+// dockerfile path has only "context"; gateway builds (buildx's client-side
+// dockerfile frontend) also reference "dockerfile". The "context" entry, if
+// present, doubles as the legacy ctxDir.
+func (h *Handler) solveLLBLocals(ctx context.Context, localDirs map[string]string, def *llb.Definition, emit func(string), getSecret secretFunc) (resultDir string, cleanup func(), err error) {
 	verts, byDigest, err := llbOps(def)
 	if err != nil {
 		return "", nil, err
@@ -86,7 +95,8 @@ func (h *Handler) solveLLB(ctx context.Context, ctxDir string, def *llb.Definiti
 	e := &llbExecutor{
 		h:             h,
 		ctx:           ctx,
-		ctxDir:        ctxDir,
+		ctxDir:        localDirs["context"],
+		localDirs:     localDirs,
 		scratch:       scratch,
 		emit:          emit,
 		getSecret:     getSecret,
@@ -200,9 +210,13 @@ func (e *llbExecutor) execSource(src *pb.SourceOp) (string, error) {
 	id := src.GetIdentifier()
 	switch {
 	case strings.HasPrefix(id, "local://"):
-		// The build context (and any named context) — surfaced read-only.
+		// The build context and any named local (gateway builds also send
+		// "dockerfile") — surfaced read-only from the FileSync'd dirs.
 		name := strings.TrimPrefix(id, "local://")
-		if name == "context" {
+		if dir, ok := e.localDirs[name]; ok {
+			return dir, nil
+		}
+		if name == "context" && e.ctxDir != "" {
 			return e.ctxDir, nil
 		}
 		return "", fmt.Errorf("unsupported local source %q", name)
