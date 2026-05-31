@@ -1133,41 +1133,33 @@ func (h *Handler) finalizeBuiltImage(tmpID, ref string, state buildState) error 
 	}
 
 	if h.mgr.UsePVE() {
-		storage := h.mgr.PVEStorage()
-		if storage == "" {
-			storage = "large"
+		// On PVE the build container is a CT (LVM/ZFS volume), not a plain
+		// directory — capture its rootfs as a tarball image, matching the
+		// pullOCI scheme (storage-agnostic, hidden from the Proxmox UI, reaped
+		// by reapOrphanTarballs, instantiated via createPVEFromTarball).
+		tarball, err := h.mgr.BuildTarballFromContainer(tmpID, ref)
+		if err != nil {
+			return err
 		}
-		sourceDS := fmt.Sprintf("%s/lxc-%s", storage, tmpID)
-		targetDS := fmt.Sprintf("%s/dld-templates/%s", storage, strings.TrimPrefix(safeTemplateName(ref), "__template_build_"))
-		if err := exec.Command("zfs", "list", "-H", "-o", "name", sourceDS).Run(); err == nil {
-			_, _ = exec.Command("zfs", "destroy", "-r", targetDS).CombinedOutput()
-			if out, err := exec.Command("zfs", "rename", sourceDS, targetDS).CombinedOutput(); err != nil {
-				return fmt.Errorf("zfs rename %s -> %s: %s: %w", sourceDS, targetDS, out, err)
-			}
-			if out, err := exec.Command("zfs", "snapshot", targetDS+"@tmpl").CombinedOutput(); err != nil {
-				return fmt.Errorf("zfs snapshot %s@tmpl: %s: %w", targetDS, out, err)
-			}
-			_ = os.RemoveAll(filepath.Join(h.mgr.LXCPath(), tmpID))
-			_ = h.store.RemoveContainer(tmpID)
-			return h.store.AddImage(&store.ImageRecord{
-				ID:              "build_" + strings.TrimPrefix(safeTemplateName(ref), "__template_build_"),
-				Ref:             ref,
-				Arch:            "amd64",
-				TemplateDataset: targetDS,
-				Created:         time.Now(),
-				OCIEntrypoint:   state.entrypoint,
-				OCICmd:          state.cmd,
-				OCIEnv:          state.env,
-				OCIWorkingDir:   state.workdir,
-				OCIPorts:        state.exposed,
-				OCILabels:       state.labels,
-				OCIUser:         state.user,
-				OCIStopSignal:   state.stopSignal,
-				OCIHealthcheck:  state.healthcheck,
-				OCIVolumes:      append([]string{}, state.volumes...),
-				OCIShell:        append([]string{}, state.shell...),
-			})
-		}
+		_ = h.store.RemoveContainer(tmpID)
+		return h.store.AddImage(&store.ImageRecord{
+			ID:              "build_" + strings.TrimPrefix(safeTemplateName(ref), "__template_build_"),
+			Ref:             ref,
+			Arch:            "amd64",
+			TemplateTarball: tarball,
+			Created:         time.Now(),
+			OCIEntrypoint:   state.entrypoint,
+			OCICmd:          state.cmd,
+			OCIEnv:          state.env,
+			OCIWorkingDir:   state.workdir,
+			OCIPorts:        state.exposed,
+			OCILabels:       state.labels,
+			OCIUser:         state.user,
+			OCIStopSignal:   state.stopSignal,
+			OCIHealthcheck:  state.healthcheck,
+			OCIVolumes:      append([]string{}, state.volumes...),
+			OCIShell:        append([]string{}, state.shell...),
+		})
 	}
 
 	targetName := safeTemplateName(ref)
