@@ -1228,7 +1228,18 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 	log.Printf("StartContainer[PVE]: pct start %d (%s)", vmid, id[:12])
 	out, err := exec.Command("pct", "start", fmt.Sprintf("%d", vmid)).CombinedOutput()
 	if err != nil {
-		// Dump config for debugging.
+		// pct start launches the container, then queries its init PID. When the
+		// container's command exits instantly (`echo`, `true`), that query fails
+		// ("Failed to receive ... get_init_pid" / "not running?") and pct exits
+		// non-zero — even though the container DID start and run. That's a normal
+		// fast-exit container, not a start failure. (A genuine launch failure —
+		// bad config/rootfs — errors earlier with a different message.)
+		so := string(out)
+		if strings.Contains(so, "get_init_pid") || strings.Contains(so, "not running?") {
+			log.Printf("StartContainer[PVE]: VMID %d (%s) started and exited immediately", vmid, id[:12])
+			return nil
+		}
+		// Dump config for debugging a real failure.
 		if cfgData, readErr := os.ReadFile(pveConfigPath(vmid)); readErr == nil {
 			log.Printf("StartContainer[PVE]: FAILED config for VMID %d:\n%s", vmid, cfgData)
 		}
