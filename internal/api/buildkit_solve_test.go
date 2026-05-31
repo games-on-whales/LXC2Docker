@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/session"
 	"google.golang.org/grpc"
@@ -37,7 +38,12 @@ func newSolveTestClient(t *testing.T, rec *recordedBuild, buildErr error) (contr
 	if err != nil {
 		t.Fatalf("session manager: %v", err)
 	}
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
 	cs := &controlServer{
+		h:        &Handler{store: st},
 		sm:       sm,
 		statuses: map[string]*solveStatus{},
 		fetchFn: func(ctx context.Context, sessionID, dfName string) (string, func(), error) {

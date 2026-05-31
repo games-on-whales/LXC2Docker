@@ -57,8 +57,6 @@ github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI
 github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+oQHNcck=
 github.com/klauspost/compress v1.18.6 h1:2jupLlAwFm95+YDR+NwD2MEfFO9d4z4Prjl1XXDjuao=
 github.com/klauspost/compress v1.18.6/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
-github.com/lxc/go-lxc v0.0.0-20260316180011-3af4ce000ed7 h1:MXZvjx5IYff3AacumHgmaJqWXyfROImWfJzmMP1ye4o=
-github.com/lxc/go-lxc v0.0.0-20260316180011-3af4ce000ed7/go.mod h1:3UTWXVcHfgxE7JM4ZUnsy6bDA8L1vuzwJbJRF6dlB90=
 github.com/moby/buildkit v0.30.0 h1:OsK8T3BaYH52UNStpKd7gytDtHWWt2Fawak/lAPWatU=
 github.com/moby/buildkit v0.30.0/go.mod h1:k2wuw5ddaOqzh58RLt+mBn2XhK34gi6+gd0faONQ1xU=
 github.com/moby/docker-image-spec v1.3.1 h1:jMKff3w6PgbfSa69GfNg+zN/XLhfXJGnEx3Nl2EsFP0=

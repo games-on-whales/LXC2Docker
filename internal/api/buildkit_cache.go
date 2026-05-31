@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"google.golang.org/grpc"
@@ -15,9 +17,10 @@ func (s *controlServer) DiskUsage(ctx context.Context, req *controlapi.DiskUsage
 	return &controlapi.DiskUsageResponse{}, nil
 }
 
-// Prune clears the BuildKit build cache. With no cache to clear it streams no
-// records, mirroring the classic /build/prune handler so `docker builder prune`
-// succeeds (reclaiming nothing) instead of erroring.
+// Prune clears the persistent LLB op-output cache (see buildkit_cache_store.go)
+// so `docker builder prune` reclaims build-cache disk. It streams no usage
+// records — the daemon doesn't track per-entry sizes.
 func (s *controlServer) Prune(req *controlapi.PruneRequest, stream grpc.ServerStreamingServer[controlapi.UsageRecord]) error {
+	_ = os.RemoveAll(filepath.Join(s.h.store.RootDir(), buildCacheSubdir))
 	return nil
 }

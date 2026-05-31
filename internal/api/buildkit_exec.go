@@ -40,6 +40,10 @@ type llbExecutor struct {
 	opOutputs map[digest.Digest]map[int64]string
 	// images caches resolved base-image rootfs dirs within a single build.
 	images map[string]string
+
+	// cacheDir is the persistent cross-build op-output cache (empty = off).
+	cacheDir      string
+	cacheableMemo map[digest.Digest]bool
 }
 
 // solveLLB executes a converted Dockerfile (LLB definition + image config) and
@@ -67,16 +71,23 @@ func (h *Handler) solveLLB(ctx context.Context, ctxDir string, def *llb.Definiti
 	}
 	cleanup = func() { os.RemoveAll(scratch) }
 
+	cacheDir := filepath.Join(h.store.RootDir(), buildCacheSubdir)
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		cacheDir = "" // disable caching rather than fail the build
+	}
+
 	e := &llbExecutor{
-		h:         h,
-		ctx:       ctx,
-		ctxDir:    ctxDir,
-		scratch:   scratch,
-		emit:      emit,
-		getSecret: getSecret,
-		byDigest:  byDigest,
-		opOutputs: map[digest.Digest]map[int64]string{},
-		images:    map[string]string{},
+		h:             h,
+		ctx:           ctx,
+		ctxDir:        ctxDir,
+		scratch:       scratch,
+		emit:          emit,
+		getSecret:     getSecret,
+		byDigest:      byDigest,
+		opOutputs:     map[digest.Digest]map[int64]string{},
+		images:        map[string]string{},
+		cacheDir:      cacheDir,
+		cacheableMemo: map[digest.Digest]bool{},
 	}
 	dir, err := e.inputDir(resultEdge)
 	if err != nil {
@@ -112,6 +123,19 @@ func (e *llbExecutor) outputsOf(dgst digest.Digest) (map[int64]string, error) {
 		return nil, fmt.Errorf("unknown LLB op %s", dgst)
 	}
 
+	// Cache lookup happens BEFORE evaluating inputs so a hit skips the whole
+	// upstream subtree (e.g. the base image pull and earlier RUN steps). Only
+	// Exec/File ops are cached — Source ops are already cheap references into
+	// the image store.
+	_, isSource := op.GetOp().(*pb.Op_Source)
+	cacheable := !isSource && e.cacheDir != "" && e.isCacheable(dgst)
+	if cacheable {
+		if outs, ok := e.cacheGet(dgst); ok {
+			e.opOutputs[dgst] = outs
+			return outs, nil
+		}
+	}
+
 	inputDirs := make([]string, len(op.Inputs))
 	for i, in := range op.Inputs {
 		d, err := e.inputDir(in)
@@ -139,6 +163,9 @@ func (e *llbExecutor) outputsOf(dgst digest.Digest) (map[int64]string, error) {
 		return nil, err
 	}
 	e.opOutputs[dgst] = outs
+	if cacheable {
+		e.cachePut(dgst, outs)
+	}
 	return outs, nil
 }
 
