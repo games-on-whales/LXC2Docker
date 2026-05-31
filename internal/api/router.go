@@ -11,6 +11,7 @@ import (
 	"github.com/games-on-whales/LXC2Docker/internal/lxc"
 	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
+	"google.golang.org/grpc"
 )
 
 // Handler is the root HTTP handler. It holds references to the LXC manager
@@ -23,6 +24,7 @@ type Handler struct {
 	events     *eventBroker
 	attachMu   sync.Mutex
 	attachPTYs map[string]*os.File
+	grpcServer *grpc.Server
 }
 
 // NewHandler wires up the Handler and returns an http.Handler ready to serve.
@@ -47,6 +49,7 @@ func newHandler(mgr *lxc.Manager, st *store.Store) *Handler {
 		events:     newEventBroker(),
 		attachPTYs: make(map[string]*os.File),
 	}
+	h.grpcServer = newBuildkitControlServer(h)
 	// Periodically prune completed exec records to prevent memory leaks.
 	go func() {
 		for {
@@ -139,6 +142,9 @@ func (h *Handler) routes() http.Handler {
 		ni := notImplementedFunc("not supported by docker-lxc-daemon")
 		sub.HandleFunc("/build", h.buildImage).Methods(http.MethodPost)
 		sub.HandleFunc("/build/prune", h.pruneBuildCache).Methods(http.MethodPost)
+		// BuildKit gRPC endpoint — buildx's "docker" driver dials this and
+		// drives the whole build over the moby.buildkit.v1.Control service.
+		sub.HandleFunc("/grpc", h.serveGRPC).Methods(http.MethodPost)
 		sub.HandleFunc("/images/load", h.loadImage).Methods(http.MethodPost)
 		sub.HandleFunc("/commit", h.commitContainer).Methods(http.MethodPost)
 		sub.HandleFunc("/session", ni).Methods(http.MethodGet, http.MethodHead, http.MethodPost)
