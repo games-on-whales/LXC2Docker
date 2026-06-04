@@ -169,6 +169,65 @@ func TestBuildPVEItemsAppendsRawConfig(t *testing.T) {
 	}
 }
 
+func TestBuildItemsBindMountDefaultsToPrivatePropagation(t *testing.T) {
+	t.Parallel()
+
+	src := t.TempDir()
+	items := buildItems(&ContainerConfig{
+		Mounts: []MountSpec{{Source: src, Destination: "/dev"}},
+	}, "10.0.0.2")
+
+	want := strings.ReplaceAll(src, " ", `\040`) + " dev none bind,create=dir,rprivate 0 0"
+	if !hasMountEntry(items, want) {
+		t.Fatalf("expected rprivate bind mount %q, got %#v", want, items)
+	}
+}
+
+func TestBuildItemsBindMountHonorsExplicitPropagation(t *testing.T) {
+	t.Parallel()
+
+	src := t.TempDir()
+	items := buildItems(&ContainerConfig{
+		Mounts: []MountSpec{{Source: src, Destination: "/data", Propagation: "rslave"}},
+	}, "10.0.0.2")
+
+	want := strings.ReplaceAll(src, " ", `\040`) + " data none bind,create=dir,rslave 0 0"
+	if !hasMountEntry(items, want) {
+		t.Fatalf("expected rslave bind mount %q, got %#v", want, items)
+	}
+}
+
+func TestBuildPVEItemsBindMountDefaultsToPrivatePropagation(t *testing.T) {
+	t.Parallel()
+
+	src := t.TempDir()
+	items := buildPVEItems(&ContainerConfig{
+		Mounts: []MountSpec{{Source: src, Destination: "/dev"}},
+	}, "10.0.0.2")
+
+	want := strings.ReplaceAll(src, " ", `\040`) + " dev none bind,create=dir,rprivate 0 0"
+	if !hasMountEntry(items, want) {
+		t.Fatalf("expected rprivate bind mount %q, got %#v", want, items)
+	}
+}
+
+func TestMountPropagationOpt(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		"":         "rprivate",
+		"bogus":    "rprivate",
+		"rslave":   "rslave",
+		"shared":   "shared",
+		"rprivate": "rprivate",
+	}
+	for in, want := range cases {
+		if got := mountPropagationOpt(in); got != want {
+			t.Fatalf("mountPropagationOpt(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func hasMountEntry(items []configItem, want string) bool {
 	for _, item := range items {
 		if item.key == "lxc.mount.entry" && item.value == want {
