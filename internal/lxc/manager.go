@@ -910,7 +910,7 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	// Fill in LAN config from daemon settings before any networking setup.
 	if cfg.LAN && m.lan.Bridge != "" {
 		cfg.LANBridge = m.lan.Bridge
-		cfg.LANIP = fmt.Sprintf("%s.%d/%d", m.lan.Prefix, vmid, m.lan.Subnet)
+		cfg.LANIP = resolveLANIP(&cfg, m.lan, vmid)
 		cfg.LANGateway = m.lan.Gateway
 		log.Printf("CreateContainer[PVE]: LAN NIC on %s with IP %s", cfg.LANBridge, cfg.LANIP)
 	}

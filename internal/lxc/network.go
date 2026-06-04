@@ -169,6 +169,21 @@ func RemovePortForwards(containerIP string) error {
 	return nil
 }
 
+// resolveLANIP returns the LAN IP in CIDR form for a container. An explicit
+// cfg.LANIPRequest (from the "gow.lan.ip" label) overrides the default
+// VMID-derived address: a bare IP inherits the bridge subnet, while a value
+// that already carries a "/prefixlen" is used as-is. Empty falls back to the
+// historical "<prefix>.<vmid>/<subnet>" derivation.
+func resolveLANIP(cfg *ContainerConfig, lan LANConfig, vmid int) string {
+	if req := strings.TrimSpace(cfg.LANIPRequest); req != "" {
+		if strings.Contains(req, "/") {
+			return req
+		}
+		return fmt.Sprintf("%s/%d", req, lan.Subnet)
+	}
+	return fmt.Sprintf("%s.%d/%d", lan.Prefix, vmid, lan.Subnet)
+}
+
 // NetworkConfig returns the lxc.conf lines needed to attach a container to
 // the managed bridge with the given static IP. Includes a default gateway via the bridge.
 func NetworkConfig(ip string) []configItem {

@@ -323,9 +323,23 @@ func (m *Manager) createPVEFromTarball(id string, imgRec *store.ImageRecord, cfg
 		return fmt.Errorf("manager: %w", err)
 	}
 
+	// Record the VMID in the store record immediately. The `pct create` below
+	// takes several seconds before the CT is started; until the VMID is
+	// recorded, the periodic gc() sees a VMID==0 record in the "exited" state
+	// and reaps it mid-create, so the subsequent start fails with "No such
+	// container". Recording it up front makes gc() treat the record as a
+	// Proxmox CT (rec.VMID > 0) and skip it. A genuinely failed create is
+	// cleaned up by the caller's error path and the reapOrphanCTs grace window.
+	if storeRec := m.store.GetContainer(id); storeRec != nil {
+		storeRec.VMID = vmid
+		if err := m.store.AddContainer(storeRec); err != nil {
+			return fmt.Errorf("manager: persist vmid: %w", err)
+		}
+	}
+
 	if cfg.LAN && m.lan.Bridge != "" {
 		cfg.LANBridge = m.lan.Bridge
-		cfg.LANIP = fmt.Sprintf("%s.%d/%d", m.lan.Prefix, vmid, m.lan.Subnet)
+		cfg.LANIP = resolveLANIP(&cfg, m.lan, vmid)
 		cfg.LANGateway = m.lan.Gateway
 	}
 
