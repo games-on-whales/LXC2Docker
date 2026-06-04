@@ -304,6 +304,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			Source:      source,
 			Destination: m.Target,
 			ReadOnly:    m.ReadOnly,
+			Propagation: propagationFromBindOptions(m.BindOptions),
 		})
 	}
 

@@ -139,6 +139,15 @@ type MountSpec struct {
 	Source      string
 	Destination string
 	ReadOnly    bool
+	// Propagation is the mount propagation mode (Docker's BindOptions.Propagation:
+	// "rprivate", "private", "rshared", "shared", "rslave", "slave"). Empty means
+	// the Docker default, rprivate. It is emitted as an lxc.mount.entry option so
+	// that mounts the container creates underneath a bind cannot leak back to the
+	// host. Without it the bind inherits the host's (usually shared) propagation,
+	// which let a container bind-mounting the whole /dev replace the host's
+	// /dev/pts and /dev/ptmx when it mounted its own devpts — breaking PTY
+	// allocation for the Proxmox console and SSH.
+	Propagation string
 }
 
 // DeviceSpec describes a host device to expose inside the container.
@@ -415,6 +424,9 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 		if m.ReadOnly {
 			opts += ",ro"
 		}
+		// Propagation (default rprivate) keeps mounts the container creates
+		// under this bind from leaking back to the host. See MountSpec.Propagation.
+		opts += "," + mountPropagationOpt(m.Propagation)
 		// lxc.mount.entry format (fstab-style, space-delimited):
 		//   <source> <dest-relative-to-rootfs> <fs-type> <options> 0 0
 		// Spaces in paths must be escaped as \040 (octal, like /etc/fstab).
@@ -668,6 +680,27 @@ func sysctlItems(cfg *ContainerConfig) []configItem {
 		items = append(items, configItem{"lxc.sysctl." + k, v})
 	}
 	return items
+}
+
+// validPropagation is the set of mount propagation modes LXC accepts as an
+// lxc.mount.entry option. Anything outside this set (including the empty
+// string) falls back to the Docker default, rprivate.
+var validPropagation = map[string]struct{}{
+	"rprivate": {}, "private": {},
+	"rshared": {}, "shared": {},
+	"rslave": {}, "slave": {},
+}
+
+// mountPropagationOpt returns the propagation option to append to a bind
+// mount's lxc.mount.entry options. It defaults to rprivate (Docker's default)
+// so a container's own mounts underneath a bind never propagate back to the
+// host. An explicit "shared"/"rshared" request is honored but would re-open
+// the leak, so callers should only set it deliberately.
+func mountPropagationOpt(p string) string {
+	if _, ok := validPropagation[p]; ok {
+		return p
+	}
+	return "rprivate"
 }
 
 func shmMountEntry(size int64) string {
@@ -1043,6 +1076,9 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 		if m.ReadOnly {
 			opts += ",ro"
 		}
+		// Propagation (default rprivate) keeps mounts the container creates
+		// under this bind from leaking back to the host. See MountSpec.Propagation.
+		opts += "," + mountPropagationOpt(m.Propagation)
 		dest := strings.TrimPrefix(m.Destination, "/")
 		escapedSource := strings.ReplaceAll(source, " ", `\040`)
 		escapedDest := strings.ReplaceAll(dest, " ", `\040`)
