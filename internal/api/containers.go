@@ -2409,12 +2409,24 @@ func mergeEnv(imageEnv, requestEnv []string) []string {
 // A container can launch sibling containers through the runtime's Docker
 // socket (Games-on-Whales Wolf does this for every app/compositor it
 // streams). When it cannot introspect its own container it passes one of
-// its OWN in-container paths (e.g. /etc/wolf/<session>/<app>) as the bind
-// source. The runtime would otherwise take that literally as a host path,
-// which does not exist, and lxc-start aborts the sibling container. We only
-// rewrite when the literal source is missing on the host AND it falls under
-// some managed container's mount destination whose translated host path does
-// exist, so valid host binds are never touched.
+// its OWN in-container paths as the bind source. The runtime would otherwise
+// take that literally as a host path, which does not exist, and lxc-start
+// aborts the sibling container. We only rewrite when the literal source is
+// missing on the host, so valid host binds are never touched.
+//
+// Two kinds of in-container path are handled, in order of preference:
+//
+//  1. A path under some managed container's bind-mount destination
+//     (e.g. /etc/wolf/<session>/<app> when Wolf binds a host dir at /etc/wolf).
+//     The host path is stable and lives outside any container, so it is the
+//     safest translation.
+//
+//  2. A path that only exists *inside* a managed container's rootfs — most
+//     notably an XDG_RUNTIME_DIR such as Wolf's /run/user/wolf, which Wolf
+//     creates at runtime and shares with its PulseAudio/app siblings. No host
+//     bind backs it, so it is resolved against the owning container's rootfs
+//     (or, for storage layouts where the rootfs is only mounted while the
+//     container runs, its live mount namespace via /proc/<pid>/root).
 func (h *Handler) translateSiblingBindSource(source string) string {
 	if !strings.HasPrefix(source, "/") {
 		return source
@@ -2422,6 +2434,19 @@ func (h *Handler) translateSiblingBindSource(source string) string {
 	if _, err := os.Stat(source); err == nil {
 		return source
 	}
+	if t := h.translateViaBindDest(source); t != "" {
+		return t
+	}
+	if t := h.translateViaContainerRootfs(source); t != "" {
+		return t
+	}
+	return source
+}
+
+// translateViaBindDest maps source to a host path when it falls under some
+// managed container's bind-mount destination (case 1 above). Returns "" when
+// no destination matches or the translated path does not exist on the host.
+func (h *Handler) translateViaBindDest(source string) string {
 	var bestDst, bestSrc string
 	for _, rec := range h.store.ListContainers() {
 		for _, m := range rec.Mounts {
@@ -2436,11 +2461,70 @@ func (h *Handler) translateSiblingBindSource(source string) string {
 		}
 	}
 	if bestDst == "" {
-		return source
+		return ""
 	}
 	translated := bestSrc + source[len(bestDst):]
 	if _, err := os.Stat(translated); err != nil {
-		return source
+		return ""
 	}
 	return translated
+}
+
+// rootfsPathFor returns the host-side rootfs path for a managed container.
+// Indirected through a variable so tests can supply a path without standing up
+// a real LXC manager (NewManager performs privileged bridge setup).
+var rootfsPathFor = func(h *Handler, id string) string {
+	if h.mgr == nil {
+		return ""
+	}
+	return h.mgr.RootfsPath(id)
+}
+
+// initPIDFor returns the host init PID for a managed container (0 if stopped).
+// Indirected for the same reason as rootfsPathFor. Uses the manager's
+// name-scheme-aware lookup so it works for Proxmox CTs (addressed by VMID) as
+// well as legacy containers.
+var initPIDFor = func(h *Handler, id string) int {
+	if h.mgr == nil {
+		return 0
+	}
+	return h.mgr.InitPID(id)
+}
+
+// translateViaContainerRootfs maps source to a host path when it exists inside
+// a managed container's rootfs (case 2 above). It first tries each container's
+// static rootfs path (stable across restarts) and, failing that, the live
+// mount namespace of any running container via /proc/<pid>/root — which works
+// regardless of the backing storage (ZFS subvol, dir-backed raw image, etc.).
+// Returns "" when no container exposes the path.
+func (h *Handler) translateViaContainerRootfs(source string) string {
+	rel := strings.TrimPrefix(source, "/")
+
+	// Pass 1: static rootfs paths. Preferred because they stay valid even if
+	// the owning container restarts (its PID would change).
+	for _, rec := range h.store.ListContainers() {
+		root := rootfsPathFor(h, rec.ID)
+		if root == "" {
+			continue
+		}
+		cand := filepath.Join(root, rel)
+		if _, err := os.Stat(cand); err == nil {
+			return cand
+		}
+	}
+
+	// Pass 2: live mount namespaces of running containers. Resolves the path
+	// regardless of backing storage (e.g. dir-backed raw images whose rootfs
+	// is only mounted, inside the container's namespace, while it runs).
+	for _, rec := range h.store.ListContainers() {
+		pid := initPIDFor(h, rec.ID)
+		if pid <= 0 {
+			continue
+		}
+		cand := fmt.Sprintf("/proc/%d/root/%s", pid, rel)
+		if _, err := os.Stat(cand); err == nil {
+			return cand
+		}
+	}
+	return ""
 }
