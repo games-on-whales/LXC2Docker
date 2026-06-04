@@ -94,6 +94,10 @@ type ContainerConfig struct {
 	// Proxmox CTs. The bridge is selected by Bridge (or daemon default
 	// if Bridge is empty); the IP is derived from VMID and the bridge spec.
 	LAN bool
+	// LANIPRequest, when set, overrides the VMID-derived LAN IP. Accepts a
+	// bare IP ("192.168.1.50") — which inherits the bridge subnet — or a full
+	// CIDR ("192.168.1.50/23"). Set from the "gow.lan.ip" label.
+	LANIPRequest string
 	// Bridge names which configured LAN bridge to attach when LAN is true.
 	// Empty means use the daemon's default bridge. Set from "dld.bridge"
 	// label.

@@ -174,6 +174,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		RawConfig:         smoothNASLXCRawConfig(req.Labels),
 		ProxmoxCT:         req.Labels["gow.pve"] == "true",
 		LAN:               req.Labels["gow.lan"] == "true",
+		LANIPRequest:      strings.TrimSpace(req.Labels["gow.lan.ip"]),
 	}
 	// LAN bridge replaces host networking: the container gets its own network
 	// namespace with dual NICs (internal + LAN) instead of sharing the host's.
