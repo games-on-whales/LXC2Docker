@@ -504,21 +504,31 @@ func (m *Manager) gc() {
 	}
 
 	// Orphan detection: if there are support containers (PulseAudio) but
-	// no session containers AND no running Proxmox CTs, the support
-	// containers are orphans from sessions that ended abnormally.
-	// PVE CTs (like Wolf) spawn support containers (PulseAudio) via the
-	// Docker API — we must not kill them while the CT is still running.
+	// no session containers AND no running owner, the support containers
+	// are orphans from sessions that ended abnormally.
+	//
+	// A long-running owner spawns support containers (PulseAudio) via the
+	// Docker API and keeps them for the lifetime of the owner, even while
+	// idle (before any session). We must not reap them while the owner runs.
+	// Two owner deployment models exist:
+	//   - a Proxmox CT (VMID > 0), e.g. Wolf running as a PVE CT; and
+	//   - a SmoothNAS-managed container (io.smoothnas.managed=true), e.g.
+	//     Wolf running as a managed LXC2Docker container rather than a PVE
+	//     CT. That same label already exempts the owner itself from GC above.
 	if len(runningSession) == 0 && len(runningSupport) > 0 {
-		pveCTRunning := false
+		ownerRunning := false
 		for _, rec := range m.store.ListContainers() {
-			if rec.VMID > 0 {
-				if st, _ := m.State(rec.ID); st == "running" {
-					pveCTRunning = true
-					break
-				}
+			isOwner := rec.VMID > 0 ||
+				(rec.Labels != nil && rec.Labels["io.smoothnas.managed"] == "true")
+			if !isOwner {
+				continue
+			}
+			if st, _ := m.State(rec.ID); st == "running" {
+				ownerRunning = true
+				break
 			}
 		}
-		if !pveCTRunning {
+		if !ownerRunning {
 			for _, rec := range runningSupport {
 				log.Printf("GC: stopping orphaned container %s (%s, image=%s)",
 					rec.Name, rec.ID[:12], rec.Image)
