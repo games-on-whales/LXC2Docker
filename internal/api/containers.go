@@ -186,24 +186,41 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	// record can echo the original semantic back on inspect (Portainer's
 	// Mounts tab distinguishes bind/volume/tmpfs by a colored badge).
 	var storeMounts []store.MountSpec
-	// Parse legacy Binds ("host:container[:ro]").
+	// Parse legacy Binds ("source:container[:ro]"). Following Docker's `-v`
+	// semantics, a source without a leading "/" is a named (or anonymous)
+	// volume rather than a host path: resolve it to the volume's backing
+	// directory. Without this, the volume name was passed through verbatim as
+	// the LXC mount source, which LXC resolved relative to "/" — silently
+	// bind-mounting the host root into the container.
 	for _, bind := range req.HostConfig.Binds {
 		parts := strings.SplitN(bind, ":", 3)
 		if len(parts) < 2 {
 			continue
 		}
-		m := lxc.MountSpec{
-			Source:      parts[0],
-			Destination: parts[1],
-			ReadOnly:    len(parts) == 3 && parts[2] == "ro",
+		source := parts[0]
+		mType := "bind"
+		volName := ""
+		if !strings.HasPrefix(source, "/") {
+			volumeRec, err := h.ensureVolume(source)
+			if err != nil {
+				continue
+			}
+			volName = source
+			source = volumeRec.Mountpoint
+			mType = "volume"
 		}
-		cfg.Mounts = append(cfg.Mounts, m)
+		ro := len(parts) == 3 && parts[2] == "ro"
+		cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
+			Source:      source,
+			Destination: parts[1],
+			ReadOnly:    ro,
+		})
 		storeMounts = append(storeMounts, store.MountSpec{
-			Name:        "",
-			Type:        "bind",
-			Source:      m.Source,
-			Destination: m.Destination,
-			ReadOnly:    m.ReadOnly,
+			Name:        volName,
+			Type:        mType,
+			Source:      source,
+			Destination: parts[1],
+			ReadOnly:    ro,
 		})
 	}
 
