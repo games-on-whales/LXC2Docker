@@ -210,6 +210,9 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			mType = "volume"
 		}
 		ro := len(parts) == 3 && parts[2] == "ro"
+		if mType == "bind" {
+			source = h.translateSiblingBindSource(source)
+		}
 		cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{
 			Source:      source,
 			Destination: parts[1],
@@ -276,6 +279,9 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 			} else {
 				continue
 			}
+		}
+		if mType == "bind" {
+			source = h.translateSiblingBindSource(source)
 		}
 		storeMounts = append(storeMounts, store.MountSpec{
 			Name:        m.Source,
@@ -2394,4 +2400,46 @@ func mergeEnv(imageEnv, requestEnv []string) []string {
 		result = append(result, m[key])
 	}
 	return result
+}
+
+// translateSiblingBindSource maps a bind-mount source that points into
+// another managed container's mount namespace back to the real host path.
+//
+// A container can launch sibling containers through the runtime's Docker
+// socket (Games-on-Whales Wolf does this for every app/compositor it
+// streams). When it cannot introspect its own container it passes one of
+// its OWN in-container paths (e.g. /etc/wolf/<session>/<app>) as the bind
+// source. The runtime would otherwise take that literally as a host path,
+// which does not exist, and lxc-start aborts the sibling container. We only
+// rewrite when the literal source is missing on the host AND it falls under
+// some managed container's mount destination whose translated host path does
+// exist, so valid host binds are never touched.
+func (h *Handler) translateSiblingBindSource(source string) string {
+	if !strings.HasPrefix(source, "/") {
+		return source
+	}
+	if _, err := os.Stat(source); err == nil {
+		return source
+	}
+	var bestDst, bestSrc string
+	for _, rec := range h.store.ListContainers() {
+		for _, m := range rec.Mounts {
+			if m.Source == "" || m.Destination == "" {
+				continue
+			}
+			if source == m.Destination || strings.HasPrefix(source, m.Destination+"/") {
+				if len(m.Destination) > len(bestDst) {
+					bestDst, bestSrc = m.Destination, m.Source
+				}
+			}
+		}
+	}
+	if bestDst == "" {
+		return source
+	}
+	translated := bestSrc + source[len(bestDst):]
+	if _, err := os.Stat(translated); err != nil {
+		return source
+	}
+	return translated
 }
