@@ -344,7 +344,14 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	// host's instance. We only set this when at least one namespace should
 	// be shared (Docker's NetworkMode/IpcMode/UTSMode/PidMode "host").
 	if cfg.NetworkMode == "host" || cfg.IpcMode == "host" || cfg.UTSMode == "host" || cfg.PidMode == "host" {
-		ns := []string{"mnt"}
+		// Always give the container its own cgroup namespace. On cgroup v2,
+		// mounting the unified hierarchy rw (lxc.mount.auto = ...cgroup:rw, set
+		// by rewriteConfig) needs a private cgroup namespace; without one LXC
+		// tries to force-mount it, which "is currently not supported", and the
+		// container ABORTs. This bit Wolf's app/compositor sibling containers,
+		// which share a host namespace (so this explicit clone list is emitted)
+		// but were left sharing the host cgroup namespace.
+		ns := []string{"mnt", "cgroup"}
 		if cfg.NetworkMode != "host" {
 			ns = append(ns, "net")
 		}
