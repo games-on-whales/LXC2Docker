@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1502,27 +1503,38 @@ func (m *Manager) KillContainer(id, signal string) error {
 	// For other signals, get the init PID and send the signal directly.
 	// Works for both PVE and raw LXC containers since the init PID is
 	// visible on the host either way.
-	var pidOut []byte
-	var err error
-	if rec != nil && rec.VMID > 0 {
-		// For PVE containers, lxc-info works with the VMID as name
-		// using the default lxcpath (/var/lib/lxc).
-		pidOut, err = exec.Command("lxc-info", "-n", fmt.Sprintf("%d", rec.VMID), "-pH").Output()
-	} else {
-		pidOut, err = exec.Command("lxc-info", "-n", id, "--lxcpath", m.lxcPath, "-pH").Output()
-	}
-	if err != nil {
-		return fmt.Errorf("manager: kill %s: cannot get init pid: %w", id, err)
-	}
-	pidStr := strings.TrimSpace(string(pidOut))
-	if pidStr == "" || pidStr == "-1" {
+	pid := m.InitPID(id)
+	if pid <= 0 {
 		return fmt.Errorf("manager: kill %s: container not running (no init pid)", id)
 	}
-	killOut, err := exec.Command("kill", fmt.Sprintf("-%s", signal), pidStr).CombinedOutput()
+	killOut, err := exec.Command("kill", fmt.Sprintf("-%s", signal), fmt.Sprintf("%d", pid)).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: kill %s (pid %s, signal %s): %s: %w", id, pidStr, signal, killOut, err)
+		return fmt.Errorf("manager: kill %s (pid %d, signal %s): %s: %w", id, pid, signal, killOut, err)
 	}
 	return nil
+}
+
+// InitPID returns the host PID of a container's init process, or 0 if the
+// container is not running. It is name-scheme aware: Proxmox CTs (VMID > 0)
+// are addressed by VMID on the default lxcpath, while legacy containers use
+// the Docker ID under the daemon's lxcpath.
+func (m *Manager) InitPID(id string) int {
+	rec := m.store.GetContainer(id)
+	var out []byte
+	var err error
+	if rec != nil && rec.VMID > 0 {
+		out, err = exec.Command("lxc-info", "-n", fmt.Sprintf("%d", rec.VMID), "-pH").Output()
+	} else {
+		out, err = exec.Command("lxc-info", "-n", id, "--lxcpath", m.lxcPath, "-pH").Output()
+	}
+	if err != nil {
+		return 0
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(out)))
+	if pid <= 0 {
+		return 0
+	}
+	return pid
 }
 
 // RemoveContainer destroys a container and removes it from the store.

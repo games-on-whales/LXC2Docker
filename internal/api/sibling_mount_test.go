@@ -59,3 +59,44 @@ func TestTranslateSiblingBindSource(t *testing.T) {
 		t.Errorf("unrelated path rewritten: %q", got)
 	}
 }
+
+// TestTranslateSiblingBindSourceResolvesRuntimeDir covers Wolf's PulseAudio
+// sibling: Wolf passes its own XDG_RUNTIME_DIR (/run/user/wolf) as the bind
+// source, which has no host bind backing it but lives inside Wolf's rootfs.
+// It must be rewritten to the host-side rootfs path so the sibling can mount it.
+func TestTranslateSiblingBindSourceResolvesRuntimeDir(t *testing.T) {
+	lxcPath := t.TempDir()
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	h := &Handler{store: st}
+
+	// Stub the rootfs lookup so the test doesn't need a privileged LXC manager.
+	// Mirrors RootfsPath's legacy layout: <lxcPath>/<id>/rootfs.
+	orig := rootfsPathFor
+	rootfsPathFor = func(_ *Handler, id string) string {
+		return filepath.Join(lxcPath, id, "rootfs")
+	}
+	t.Cleanup(func() { rootfsPathFor = orig })
+
+	if err := st.AddContainer(&store.ContainerRecord{ID: "wolf", Name: "wolf"}); err != nil {
+		t.Fatalf("add container: %v", err)
+	}
+
+	// Wolf created its XDG_RUNTIME_DIR inside its rootfs at runtime.
+	runtimeDir := filepath.Join(lxcPath, "wolf", "rootfs", "run", "user", "wolf")
+	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
+		t.Fatalf("mkdir runtime dir: %v", err)
+	}
+
+	if got := h.translateSiblingBindSource("/run/user/wolf"); got != runtimeDir {
+		t.Errorf("runtime dir source: got %q, want %q", got, runtimeDir)
+	}
+
+	// A path that exists in no container's rootfs is left untouched.
+	const missing = "/run/user/nobody"
+	if got := h.translateSiblingBindSource(missing); got != missing {
+		t.Errorf("unknown runtime dir rewritten: %q", got)
+	}
+}
