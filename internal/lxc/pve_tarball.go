@@ -354,11 +354,9 @@ func (m *Manager) createPVEFromTarball(id string, imgRec *store.ImageRecord, cfg
 		}
 	}
 
-	if cfg.LAN && m.lan.Bridge != "" {
-		cfg.LANBridge = m.lan.Bridge
-		cfg.LANIP = resolveLANIP(&cfg, m.lan, vmid)
-		cfg.LANGateway = m.lan.Gateway
-	}
+	// Fill in LAN config (and convert --network=host to a LAN NIC) before the
+	// IP allocation below keys off cfg.NetworkMode.
+	applyLANNetworking(&cfg, m.lan, vmid)
 
 	hostname := id[:12]
 	if storeRec := m.store.GetContainer(id); storeRec != nil {

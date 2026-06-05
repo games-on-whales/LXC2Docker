@@ -71,7 +71,10 @@ bridge; port publishes (`-p`) become nftables DNAT rules to the container
 IP. Optional dual-NIC mode attaches a second interface to a physical LAN
 bridge with a deterministic IP (`<prefix>.<vmid>`), making mDNS and
 Moonlight discovery work on the LAN — the LAN NIC is `net.0` so it's the
-default route.
+default route. A Proxmox CT can't share the host's network namespace, so
+`--network=host` can't be honored literally; when a LAN bridge is configured
+(`--bridge`), host-mode containers (e.g. Wolf) are given this dual-NIC LAN
+setup instead of an empty, unreachable namespace (issue #53).
 
 ### Disk sizing & fast cloning (PVE)
 

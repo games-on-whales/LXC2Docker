@@ -974,12 +974,10 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	}
 
 	// Fill in LAN config from daemon settings before any networking setup.
-	if cfg.LAN && m.lan.Bridge != "" {
-		cfg.LANBridge = m.lan.Bridge
-		cfg.LANIP = resolveLANIP(&cfg, m.lan, vmid)
-		cfg.LANGateway = m.lan.Gateway
-		log.Printf("CreateContainer[PVE]: LAN NIC on %s with IP %s", cfg.LANBridge, cfg.LANIP)
-	}
+	// This may also convert a --network=host container into LAN mode (a CT
+	// can't share the host netns), so it must run before the IP allocation
+	// below keys off cfg.NetworkMode.
+	applyLANNetworking(&cfg, m.lan, vmid)
 
 	log.Printf("CreateContainer[PVE]: pct clone %d → VMID %d for %s", imgRec.TemplateVMID, vmid, id[:12])
 	out, err := exec.Command("pct", "clone",

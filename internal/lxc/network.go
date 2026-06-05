@@ -184,6 +184,34 @@ func resolveLANIP(cfg *ContainerConfig, lan LANConfig, vmid int) string {
 	return fmt.Sprintf("%s.%d/%d", lan.Prefix, vmid, lan.Subnet)
 }
 
+// applyLANNetworking gives a container a routable NIC on the physical LAN
+// bridge when one is configured. It fires in two cases:
+//
+//   - an explicit gow.lan=true label (cfg.LAN), and
+//   - any container that requested Docker --network=host.
+//
+// Host networking can't be honored on a Proxmox CT: a CT can't share the
+// host's network namespace, so a host-mode container would otherwise come up
+// with an empty, unreachable netns — no addresses, no default route, and mDNS
+// failing with "Failed to open any client sockets" (see issue #53, Wolf). The
+// LAN bridge is the Proxmox-appropriate way to put a container on the host's
+// network, where inbound traffic and mDNS/Moonlight discovery work, so we
+// convert host mode into the dual-NIC LAN setup. Returns true if it applied.
+func applyLANNetworking(cfg *ContainerConfig, lan LANConfig, vmid int) bool {
+	if lan.Bridge == "" || (!cfg.LAN && cfg.NetworkMode != "host") {
+		return false
+	}
+	// A real LAN NIC replaces host-netns sharing; clearing the mode also stops
+	// buildItems/buildPVEItems from emitting an lxc.namespace.clone that would
+	// (futilely) try to inherit the host network namespace.
+	cfg.NetworkMode = ""
+	cfg.LANBridge = lan.Bridge
+	cfg.LANIP = resolveLANIP(cfg, lan, vmid)
+	cfg.LANGateway = lan.Gateway
+	log.Printf("CreateContainer[PVE]: LAN NIC on %s with IP %s", cfg.LANBridge, cfg.LANIP)
+	return true
+}
+
 // NetworkConfig returns the lxc.conf lines needed to attach a container to
 // the managed bridge with the given static IP. Includes a default gateway via the bridge.
 func NetworkConfig(ip string) []configItem {
