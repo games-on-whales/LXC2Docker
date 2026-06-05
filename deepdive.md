@@ -73,6 +73,29 @@ bridge with a deterministic IP (`<prefix>.<vmid>`), making mDNS and
 Moonlight discovery work on the LAN — the LAN NIC is `net.0` so it's the
 default route.
 
+### Disk sizing & fast cloning (PVE)
+
+A container's rootfs size defaults to an image-derived estimate
+(`tarballRootfsGB`: compressed-tarball-GB × 3 + 4, floored at 4G). That can be
+too tight for apps that write a lot into the rootfs (e.g. Steam game/shader
+data), so the size is configurable two ways, label winning over storage-opt:
+
+- `docker run --storage-opt size=64G …`  (`HostConfig.StorageOpt["size"]`)
+- the `dld.disksize` label (e.g. `dld.disksize=64G`, or bare `64` = GB)
+
+`ParseDiskSizeGB` accepts a bare number (GB) or a K/M/G/T[i][B] suffix. The
+request is floored at the image minimum so the unpacked rootfs always fits.
+
+On **ZFS** storage, ephemeral containers (everything that isn't a UI-visible
+`gow.pve` CT) skip per-launch tarball extraction entirely: the image tarball is
+unpacked once into a cached template dataset (`<pool>/dld-tmpl-<image>` with an
+`@base` snapshot) and each container is a copy-on-write `zfs clone` of it —
+near-instant, which removes the bulk of Wolf's app-launch latency. The clone
+inherits the pool's free space (thin) unless `DiskSizeGB` is set, in which case
+it becomes a `refquota` cap. Any failure on this path falls back to the
+storage-agnostic `pct create`, so non-ZFS storage and error cases still work.
+`RemoveImage` drops the template dataset once no clones depend on it.
+
 ### Store (`internal/store`)
 
 JSON under `--statepath` (default `/var/lib/docker-lxc-daemon`). Holds
