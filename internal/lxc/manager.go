@@ -47,6 +47,12 @@ type Manager struct {
 	// cacheDir holds bulky regenerable data (tarballs, OCI, volumes); empty
 	// means use the state dir. Set via SetCacheDir. See CacheDir.
 	cacheDir string
+
+	// DefaultMemoryBytes is the RAM (in bytes) given to PVE CTs that don't
+	// request an explicit --memory or dld.memory label. 0 means "use the
+	// host's total RAM" (no artificial cap). Set from the --default-memory
+	// flag after construction.
+	DefaultMemoryBytes int64
 }
 
 // UsePVE returns true when Proxmox CT mode is active.
@@ -1024,7 +1030,7 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	rootfsPath := m.pveRootfsPath(vmid)
 
 	// Write the Proxmox CT config.
-	if err := writePVEConfig(vmid, hostname, rootfsSpec, rootfsPath, &cfg, ip); err != nil {
+	if err := writePVEConfig(vmid, hostname, rootfsSpec, rootfsPath, &cfg, ip, m.DefaultMemoryBytes); err != nil {
 		exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run()
 		return fmt.Errorf("manager: write PVE config: %w", err)
 	}

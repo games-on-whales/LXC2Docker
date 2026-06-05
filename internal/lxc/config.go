@@ -1009,7 +1009,7 @@ func deviceNumbers(path string) (int, int) {
 // writePVEConfig writes a Proxmox CT config to /etc/pve/lxc/<vmid>.conf.
 // It uses Proxmox-native syntax for core options and raw lxc.* pass-through
 // for everything else. The rootfsSpec should be like "large:subvol-260-disk-0,size=4G".
-func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg *ContainerConfig, ip string) error {
+func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg *ContainerConfig, ip string, defaultMemBytes int64) error {
 	path := fmt.Sprintf("/etc/pve/lxc/%d.conf", vmid)
 
 	var lines []string
@@ -1017,11 +1017,19 @@ func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg *Cont
 	if hostname != "" {
 		lines = append(lines, fmt.Sprintf("hostname: %s", hostname))
 	}
-	if cfg.MemoryBytes > 0 {
-		lines = append(lines, fmt.Sprintf("memory: %d", cfg.MemoryBytes/(1024*1024)))
-	} else {
-		lines = append(lines, "memory: 4096")
+	// Memory: an explicit --memory wins; else the daemon's --default-memory;
+	// else the host's total RAM (no artificial cap, matching Docker's
+	// Memory=0 semantics). Proxmox requires a concrete number, so we always
+	// resolve one rather than leaving a low placeholder that silently
+	// OOM-kills memory-hungry workloads.
+	memBytes := cfg.MemoryBytes
+	if memBytes <= 0 {
+		memBytes = defaultMemBytes
 	}
+	if memBytes <= 0 {
+		memBytes = hostMemoryBytes()
+	}
+	lines = append(lines, fmt.Sprintf("memory: %d", memBytes/(1024*1024)))
 	lines = append(lines, "ostype: unmanaged")
 	lines = append(lines, fmt.Sprintf("rootfs: %s", rootfsSpec))
 	lines = append(lines, "unprivileged: 0")
