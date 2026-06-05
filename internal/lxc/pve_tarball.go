@@ -142,7 +142,7 @@ func (m *Manager) reapOrphanTarballs() {
 	if !m.UsePVE() {
 		return
 	}
-	dir := filepath.Join(m.store.RootDir(), "pve-templates")
+	dir := filepath.Join(m.CacheDir(), "pve-templates")
 	entries, err := filepath.Glob(filepath.Join(dir, "*.tar.gz"))
 	if err != nil {
 		return
@@ -188,7 +188,7 @@ func (m *Manager) tarballReferenced(path string) bool {
 // kept under the daemon state dir (not Proxmox storage, so it never shows in the
 // Proxmox UI).
 func (m *Manager) pveTemplateTarballPath(ref string) string {
-	return filepath.Join(m.store.RootDir(), "pve-templates", oci.SafeDirName(ref)+".tar.gz")
+	return filepath.Join(m.CacheDir(), "pve-templates", oci.SafeDirName(ref)+".tar.gz")
 }
 
 // detectPVEStorageType returns the backend type of a PVE storage (e.g.

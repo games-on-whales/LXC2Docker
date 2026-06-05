@@ -78,7 +78,7 @@ func (h *Handler) solveLLB(ctx context.Context, ctxDir string, def *llb.Definiti
 	}
 	cleanup = func() { os.RemoveAll(scratch) }
 
-	cacheDir := filepath.Join(h.store.RootDir(), buildCacheSubdir)
+	cacheDir := filepath.Join(h.cacheDir(), buildCacheSubdir)
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		cacheDir = "" // disable caching rather than fail the build
 	}

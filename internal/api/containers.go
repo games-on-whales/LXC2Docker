@@ -2341,8 +2341,18 @@ func (h *Handler) ensureVolumeOwned(name, owner string, anonymous bool) (string,
 	return mountpoint, nil
 }
 
+// cacheDir is where the API stores bulky regenerable data (named volumes,
+// build cache). It mirrors the manager's cache location, falling back to the
+// state dir when no manager is wired (e.g. in unit tests).
+func (h *Handler) cacheDir() string {
+	if h.mgr != nil {
+		return h.mgr.CacheDir()
+	}
+	return h.store.RootDir()
+}
+
 func (h *Handler) volumeRoot() string {
-	return filepath.Join(h.store.RootDir(), "volumes")
+	return filepath.Join(h.cacheDir(), "volumes")
 }
 
 // mountJSONFrom converts a store mount record to the Docker wire format.

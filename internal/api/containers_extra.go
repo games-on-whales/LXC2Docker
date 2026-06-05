@@ -377,7 +377,7 @@ func (h *Handler) ensureVolume(name string) (*store.VolumeRecord, error) {
 		}
 		return existing, nil
 	}
-	mp := filepath.Join(h.store.RootDir(), "volumes", name)
+	mp := filepath.Join(h.volumeRoot(), name)
 	if err := os.MkdirAll(mp, 0o755); err != nil {
 		return nil, err
 	}
