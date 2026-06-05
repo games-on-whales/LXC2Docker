@@ -176,6 +176,14 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		LAN:               req.Labels["gow.lan"] == "true",
 		LANIPRequest:      strings.TrimSpace(req.Labels["gow.lan.ip"]),
 	}
+	// Rootfs disk size: the "dld.disksize" label takes precedence over
+	// Docker's --storage-opt size (HostConfig.StorageOpt["size"]). Either way
+	// 0/unset leaves the daemon to size the rootfs from the image.
+	if gb := lxc.ParseDiskSizeGB(req.Labels["dld.disksize"]); gb > 0 {
+		cfg.DiskSizeGB = gb
+	} else if gb := lxc.ParseDiskSizeGB(req.HostConfig.StorageOpt["size"]); gb > 0 {
+		cfg.DiskSizeGB = gb
+	}
 	// LAN bridge replaces host networking: the container gets its own network
 	// namespace with dual NICs (internal + LAN) instead of sharing the host's.
 	if cfg.LAN && cfg.NetworkMode == "host" {

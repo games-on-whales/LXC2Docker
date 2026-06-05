@@ -9,6 +9,62 @@ import (
 	"github.com/games-on-whales/LXC2Docker/internal/store"
 )
 
+func TestResolveRootfsGB(t *testing.T) {
+	// A small tarball file (<1G) yields the 4G image minimum.
+	tarball := filepath.Join(t.TempDir(), "rootfs.tar.gz")
+	if err := os.WriteFile(tarball, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if min := tarballRootfsGB(tarball); min != 4 {
+		t.Fatalf("precondition: tarballRootfsGB = %d, want 4", min)
+	}
+
+	cases := []struct {
+		name   string
+		diskGB int
+		want   int
+	}{
+		{"unset uses image minimum", 0, 4},
+		{"below minimum is bumped", 2, 4},
+		{"at minimum honored", 4, 4},
+		{"above minimum honored", 64, 64},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveRootfsGB(ContainerConfig{DiskSizeGB: tc.diskGB}, tarball)
+			if got != tc.want {
+				t.Fatalf("resolveRootfsGB(DiskSizeGB=%d) = %d, want %d", tc.diskGB, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSanitizeDatasetToken(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"ubuntu_22.04", "ubuntu_22.04"},
+		{"ghcr.io/games-on-whales/steam:edge", "ghcr.io-games-on-whales-steam-edge"},
+		{"sha256:abcDEF123", "sha256-abcDEF123"},
+		{"--leading-and-trailing--", "leading-and-trailing"},
+		{"", "img"},
+		{"!!!", "img"},
+	}
+	for _, tc := range cases {
+		if got := sanitizeDatasetToken(tc.in); got != tc.want {
+			t.Errorf("sanitizeDatasetToken(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestImageTemplateDataset(t *testing.T) {
+	m := &Manager{pveStorage: "tank"}
+	got := m.imageTemplateDataset(&store.ImageRecord{ID: "ubuntu_22.04"})
+	if want := "tank/dld-tmpl-ubuntu_22.04"; got != want {
+		t.Fatalf("imageTemplateDataset = %q, want %q", got, want)
+	}
+}
+
 func TestReapOrphanTarballs(t *testing.T) {
 	st, err := store.NewAt(t.TempDir())
 	if err != nil {

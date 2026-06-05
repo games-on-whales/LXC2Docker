@@ -6,6 +6,37 @@ import (
 	"testing"
 )
 
+func TestParseDiskSizeGB(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"", 0},
+		{"   ", 0},
+		{"garbage", 0},
+		{"0", 0},
+		{"-5G", 0},
+		{"32", 32},      // bare number => GB
+		{"32G", 32},
+		{"32g", 32},
+		{"32GB", 32},
+		{"32GiB", 32},
+		{" 64 G ", 64},
+		{"1T", 1024},
+		{"500M", 1},     // rounds up to whole GB
+		{"1536M", 2},    // 1.5G rounds up
+		{"1.5G", 2},     // fractional GB rounds up
+		{"1073741824B", 1},
+	}
+	for _, tc := range cases {
+		if got := ParseDiskSizeGB(tc.in); got != tc.want {
+			t.Errorf("ParseDiskSizeGB(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestCapabilityItemsPrivileged(t *testing.T) {
 	t.Parallel()
 

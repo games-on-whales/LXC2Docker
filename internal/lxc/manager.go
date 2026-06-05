@@ -38,6 +38,9 @@ type Manager struct {
 	pveStgType string // backend type of pveStorage: "zfspool", "lvmthin", "dir", …
 	lan        LANConfig
 	store      *store.Store
+	// tmplMu serializes ZFS image-template materialization so two concurrent
+	// launches of the same image don't race to create the template dataset.
+	tmplMu sync.Mutex
 }
 
 // UsePVE returns true when Proxmox CT mode is active.
@@ -887,6 +890,15 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 	// New images store a rootfs tarball and are created storage-agnostically
 	// via `pct create` (no Proxmox template CT — templates stay out of the UI).
 	if m.UsePVE() && rec.TemplateTarball != "" {
+		// Fast path: on ZFS storage, ephemeral containers are provisioned by
+		// copy-on-write cloning a once-materialized template dataset instead of
+		// re-extracting the tarball on every launch — near-instant, the bulk of
+		// the Wolf-app launch latency. Requires ZFS (clones are pool-local) and
+		// is skipped for UI-visible Proxmox CTs (gow.pve), which must be real
+		// CTs. Any failure falls back to the storage-agnostic pct-create path.
+		if m.pveStorageIsZFS() && !cfg.ProxmoxCT {
+			return m.createZFSCloneFromTarball(id, rec, cfg)
+		}
 		return m.createPVEFromTarball(id, rec, cfg)
 	}
 	// Backward compatibility: images pulled before the tarball change still use
@@ -950,8 +962,14 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	}
 	hostname = sanitizeHostname(hostname)
 
-	// Build rootfs spec for Proxmox config.
-	rootfsSpec := fmt.Sprintf("%s:subvol-%d-disk-0,size=4G", m.pveStorage, vmid)
+	// Build rootfs spec for Proxmox config. The clone inherits the template's
+	// volume size; an explicit DiskSizeGB is recorded in the spec so a later
+	// `pct resize` / config read reflects the requested size.
+	sizeGB := 4
+	if cfg.DiskSizeGB > 0 {
+		sizeGB = cfg.DiskSizeGB
+	}
+	rootfsSpec := fmt.Sprintf("%s:subvol-%d-disk-0,size=%dG", m.pveStorage, vmid, sizeGB)
 	rootfsPath := m.pveRootfsPath(vmid)
 
 	// Write the Proxmox CT config.
@@ -992,6 +1010,17 @@ func (m *Manager) createEphemeralPVE(id string, imgRec *store.ImageRecord, cfg C
 		return fmt.Errorf("manager: zfs clone %s → %s: %s: %w", snapDataset, cloneDataset, out, err)
 	}
 
+	return m.finalizeRawZFSClone(id, cloneDataset, cloneMountpoint, cfg)
+}
+
+// finalizeRawZFSClone turns a freshly-created ZFS clone (already mounted at
+// cloneMountpoint) into a started-able raw-LXC container: it writes the LXC
+// config, allocates an IP, rewrites the config with daemon-managed settings,
+// and prepares the rootfs. The container stays invisible to the Proxmox UI
+// (VMID 0); RemoveContainer cleans up the `<pool>/lxc-<id>` dataset. Shared by
+// createEphemeralPVE (clone from a PVE template CT) and
+// createZFSCloneFromTarball (clone from a tarball-materialized template).
+func (m *Manager) finalizeRawZFSClone(id, cloneDataset, cloneMountpoint string, cfg ContainerConfig) error {
 	// Create the LXC config directory.
 	containerDir := filepath.Join(m.lxcPath, id)
 	if err := os.MkdirAll(containerDir, 0o755); err != nil {
@@ -1014,6 +1043,7 @@ lxc.uts.name = %s
 	// Allocate IP for bridge networking.
 	var ip string
 	if cfg.NetworkMode != "host" {
+		var err error
 		ip, err = m.store.AllocateIP()
 		if err != nil {
 			exec.Command("zfs", "destroy", cloneDataset).Run()
@@ -1609,6 +1639,15 @@ func (m *Manager) RemoveImage(ref string) error {
 		// it once the store record is gone.
 		if err := os.Remove(rec.TemplateTarball); err != nil && !os.IsNotExist(err) {
 			log.Printf("RemoveImage: remove tarball %s: %v", rec.TemplateTarball, err)
+		}
+		// Drop the ZFS template dataset (CoW clone origin), if one was
+		// materialized. Best-effort and non-recursive: `zfs destroy` fails
+		// while clones (running containers) still depend on the @base
+		// snapshot, leaving the cache in place until they're gone.
+		if rec.TemplateDataset != "" {
+			if out, err := exec.Command("zfs", "destroy", "-r", rec.TemplateDataset).CombinedOutput(); err != nil {
+				log.Printf("RemoveImage: zfs destroy %s: %s: %v (continuing)", rec.TemplateDataset, strings.TrimSpace(string(out)), err)
+			}
 		}
 		return m.store.RemoveImage(ref)
 	}

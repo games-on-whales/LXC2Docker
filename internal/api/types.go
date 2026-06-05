@@ -67,6 +67,10 @@ type HostConfig struct {
 	VolumesFrom    []string          `json:"VolumesFrom"`
 	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
 	ShmSize        int64             `json:"ShmSize"`
+	// StorageOpt holds Docker's --storage-opt key=value pairs. The "size"
+	// key (e.g. "32G") sets the container rootfs size on PVE storage; see
+	// lxc.ParseDiskSizeGB. Unknown keys are ignored.
+	StorageOpt map[string]string `json:"StorageOpt"`
 	// Devices & capabilities
 	Devices           []DeviceMapping   `json:"Devices"`
 	DeviceCgroupRules []string          `json:"DeviceCgroupRules"`

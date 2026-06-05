@@ -3,11 +3,55 @@ package lxc
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 )
+
+// ParseDiskSizeGB parses a human disk-size string into whole gigabytes,
+// rounding up. It accepts a bare number (interpreted as GB, e.g. "32") or a
+// value with a K/M/G/T[i][B] unit suffix (e.g. "32G", "32GB", "500M"). Returns
+// 0 for an empty or unparseable string, which callers treat as "use the
+// image-derived default". A bare number is read as GB (not bytes) so the
+// "dld.disksize" label stays terse; Docker's --storage-opt size always carries
+// a unit, so this is unambiguous in practice.
+func ParseDiskSizeGB(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	i := 0
+	for i < len(s) && ((s[i] >= '0' && s[i] <= '9') || s[i] == '.') {
+		i++
+	}
+	val, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil || val <= 0 {
+		return 0
+	}
+	var unitBytes float64
+	switch strings.ToUpper(strings.TrimSpace(s[i:])) {
+	case "", "G", "GB", "GIB":
+		unitBytes = 1 << 30
+	case "M", "MB", "MIB":
+		unitBytes = 1 << 20
+	case "K", "KB", "KIB":
+		unitBytes = 1 << 10
+	case "T", "TB", "TIB":
+		unitBytes = 1 << 40
+	case "B":
+		unitBytes = 1
+	default:
+		return 0
+	}
+	gb := int(math.Ceil(val * unitBytes / (1 << 30)))
+	if gb < 1 {
+		gb = 1
+	}
+	return gb
+}
 
 // configItem is a key/value pair written to an LXC config file.
 type configItem struct {
@@ -107,6 +151,13 @@ type ContainerConfig struct {
 	// template's storage because ZFS clones are pool-local). Empty means
 	// the daemon default. Set from "dld.storage" label.
 	Storage string
+	// DiskSizeGB sets the container rootfs size in whole gigabytes. 0 means
+	// the daemon sizes the rootfs from the image (see tarballRootfsGB). Set
+	// from Docker's --storage-opt size=<N>G (HostConfig.StorageOpt["size"])
+	// or the "dld.disksize" label; the label wins when both are present.
+	// On non-ZFS PVE storage it becomes `pct create --rootfs storage:<N>`;
+	// on ZFS clones it becomes a `refquota` cap.
+	DiskSizeGB int
 	// ISOs are read-only ISO files bind-mounted into the container.
 	// The daemon resolves each Storage:VolumeID via `pvesm path` and binds
 	// the resulting file to Destination. Set from "dld.iso" label

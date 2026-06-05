@@ -313,6 +313,23 @@ func tarballRootfsGB(tarball string) int {
 	return gb
 }
 
+// resolveRootfsGB picks the rootfs size for a `pct create` from a tarball,
+// honoring an explicit cfg.DiskSizeGB (from --storage-opt size / dld.disksize)
+// when set. The explicit size is floored at the image-derived minimum so the
+// unpacked rootfs always fits — a too-small request is bumped (and logged)
+// rather than failing the create.
+func resolveRootfsGB(cfg ContainerConfig, tarball string) int {
+	min := tarballRootfsGB(tarball)
+	if cfg.DiskSizeGB <= 0 {
+		return min
+	}
+	if cfg.DiskSizeGB < min {
+		log.Printf("resolveRootfsGB: requested %dG < image minimum %dG; using %dG", cfg.DiskSizeGB, min, min)
+		return min
+	}
+	return cfg.DiskSizeGB
+}
+
 // createPVEFromTarball creates a Proxmox CT directly from the image's rootfs
 // tarball via `pct create` — storage-agnostic (LVM/ZFS/dir) and needing no
 // Proxmox template CT, so templates never appear in the Proxmox UI. The
@@ -349,7 +366,7 @@ func (m *Manager) createPVEFromTarball(id string, imgRec *store.ImageRecord, cfg
 	}
 	hostname = sanitizeHostname(hostname)
 
-	sizeGB := tarballRootfsGB(imgRec.TemplateTarball)
+	sizeGB := resolveRootfsGB(cfg, imgRec.TemplateTarball)
 	log.Printf("CreateContainer[PVE]: pct create %d from tarball for %s (rootfs %dG)", vmid, id[:12], sizeGB)
 	if out, err := exec.Command("pct", "create", fmt.Sprintf("%d", vmid), imgRec.TemplateTarball,
 		"--storage", m.pveStorage,
@@ -404,4 +421,101 @@ func (m *Manager) createPVEFromTarball(id string, imgRec *store.ImageRecord, cfg
 		return m.store.AddContainer(storeRec)
 	}
 	return nil
+}
+
+// sanitizeDatasetToken reduces an arbitrary string to characters valid in a ZFS
+// dataset component ([A-Za-z0-9_.-]), so an image ID like "ubuntu_22.04" or an
+// OCI ref with slashes/colons yields a stable, legal dataset name.
+func sanitizeDatasetToken(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '.', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		out = "img"
+	}
+	return out
+}
+
+// imageTemplateDataset is the ZFS dataset (under the PVE pool) that caches an
+// image's unpacked rootfs for copy-on-write cloning. One dataset per image; its
+// @base snapshot is the clone origin for every container of that image.
+func (m *Manager) imageTemplateDataset(imgRec *store.ImageRecord) string {
+	return fmt.Sprintf("%s/dld-tmpl-%s", m.pveStorage, sanitizeDatasetToken(imgRec.ID))
+}
+
+// ensureImageTemplateDataset materializes an image's rootfs tarball into its
+// template dataset exactly once and returns the @base snapshot to clone from.
+// Subsequent calls (and launches after a daemon restart) detect the existing
+// snapshot and return immediately. Serialized by tmplMu so concurrent launches
+// of the same image can't race the create/unpack/snapshot sequence.
+func (m *Manager) ensureImageTemplateDataset(imgRec *store.ImageRecord) (string, error) {
+	m.tmplMu.Lock()
+	defer m.tmplMu.Unlock()
+
+	ds := m.imageTemplateDataset(imgRec)
+	snap := ds + "@base"
+	if exec.Command("zfs", "list", "-t", "snapshot", "-H", "-o", "name", snap).Run() == nil {
+		return snap, nil // already materialized
+	}
+
+	mountpoint := "/" + ds
+	if out, err := exec.Command("zfs", "create", "-o", "mountpoint="+mountpoint, ds).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("zfs create %s: %s: %w", ds, strings.TrimSpace(string(out)), err)
+	}
+	if out, err := exec.Command("tar", "xzf", imgRec.TemplateTarball, "-C", mountpoint).CombinedOutput(); err != nil {
+		exec.Command("zfs", "destroy", "-r", ds).Run()
+		return "", fmt.Errorf("unpack %s → %s: %s: %w", imgRec.TemplateTarball, ds, strings.TrimSpace(string(out)), err)
+	}
+	if out, err := exec.Command("zfs", "snapshot", snap).CombinedOutput(); err != nil {
+		exec.Command("zfs", "destroy", "-r", ds).Run()
+		return "", fmt.Errorf("zfs snapshot %s: %s: %w", snap, strings.TrimSpace(string(out)), err)
+	}
+
+	// Record the dataset on the image so RemoveImage can clean it up.
+	if rec := m.store.GetImage(imgRec.Ref); rec != nil {
+		rec.TemplateDataset = ds
+		if err := m.store.AddImage(rec); err != nil {
+			log.Printf("ensureImageTemplateDataset: persist dataset on %s: %v (continuing)", imgRec.Ref, err)
+		}
+	}
+	log.Printf("ensureImageTemplateDataset: materialized %s for %s", snap, imgRec.Ref)
+	return snap, nil
+}
+
+// createZFSCloneFromTarball provisions an ephemeral container by copy-on-write
+// cloning the image's template dataset — near-instant versus re-extracting the
+// tarball with `pct create`. On any preparation failure it falls back to the
+// storage-agnostic pct-create path so a launch never hard-fails on the fast
+// path. An explicit DiskSizeGB becomes a `refquota` cap on the clone; without
+// one the container can grow into the whole pool (thin), which is what gives a
+// Steam container real room.
+func (m *Manager) createZFSCloneFromTarball(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
+	snap, err := m.ensureImageTemplateDataset(imgRec)
+	if err != nil {
+		log.Printf("createZFSCloneFromTarball: template prep failed (%v); falling back to pct create", err)
+		return m.createPVEFromTarball(id, imgRec, cfg)
+	}
+
+	cloneDataset := fmt.Sprintf("%s/lxc-%s", m.pveStorage, id)
+	cloneMountpoint := fmt.Sprintf("/%s/lxc-%s", m.pveStorage, id)
+	log.Printf("CreateContainer[zfs-clone]: %s → %s for %s", snap, cloneDataset, id[:12])
+	if out, err := exec.Command("zfs", "clone", "-o", "mountpoint="+cloneMountpoint, snap, cloneDataset).CombinedOutput(); err != nil {
+		log.Printf("createZFSCloneFromTarball: zfs clone failed (%s: %v); falling back to pct create", strings.TrimSpace(string(out)), err)
+		return m.createPVEFromTarball(id, imgRec, cfg)
+	}
+
+	if cfg.DiskSizeGB > 0 {
+		if out, err := exec.Command("zfs", "set", fmt.Sprintf("refquota=%dG", cfg.DiskSizeGB), cloneDataset).CombinedOutput(); err != nil {
+			log.Printf("createZFSCloneFromTarball: set refquota on %s: %s: %v (continuing)", cloneDataset, strings.TrimSpace(string(out)), err)
+		}
+	}
+
+	return m.finalizeRawZFSClone(id, cloneDataset, cloneMountpoint, cfg)
 }
