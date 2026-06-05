@@ -9,6 +9,41 @@ import (
 	"github.com/games-on-whales/LXC2Docker/internal/store"
 )
 
+func TestEnsureRuntimeDir_ParentsTraversableLeaf0700(t *testing.T) {
+	rootfs := t.TempDir()
+	// Simulate a restrictive intermediate dir baked into an image/template;
+	// os.MkdirAll would leave it untouched, so the chmod pass must repair it.
+	if err := os.MkdirAll(filepath.Join(rootfs, "var", "lib", "smoothnas"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	ensureRuntimeDir(rootfs, "/var/lib/smoothnas/plugins/wolf/runtime")
+
+	// Every parent component must be traversable by "other" (o+x) so a
+	// non-root run-user can reach into the runtime dir.
+	for _, rel := range []string{
+		"var", "var/lib", "var/lib/smoothnas",
+		"var/lib/smoothnas/plugins", "var/lib/smoothnas/plugins/wolf",
+	} {
+		fi, err := os.Stat(filepath.Join(rootfs, rel))
+		if err != nil {
+			t.Fatalf("stat %s: %v", rel, err)
+		}
+		if fi.Mode().Perm()&0o001 == 0 {
+			t.Errorf("%s mode %#o is not world-traversable", rel, fi.Mode().Perm())
+		}
+	}
+
+	// The leaf itself keeps the spec-mandated 0700.
+	leaf, err := os.Stat(filepath.Join(rootfs, "var/lib/smoothnas/plugins/wolf/runtime"))
+	if err != nil {
+		t.Fatalf("stat leaf: %v", err)
+	}
+	if leaf.Mode().Perm() != 0o700 {
+		t.Errorf("leaf mode = %#o, want 0700", leaf.Mode().Perm())
+	}
+}
+
 func TestImageReadyRequiresExistingTemplateSource(t *testing.T) {
 	t.Parallel()
 

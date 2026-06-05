@@ -1228,10 +1228,7 @@ func (m *Manager) prepareRootfs(rootfs string, cfg ContainerConfig) {
 		if strings.HasPrefix(e, "XDG_RUNTIME_DIR=") {
 			dir := strings.TrimPrefix(e, "XDG_RUNTIME_DIR=")
 			if dir != "" {
-				runtimeDir := filepath.Join(rootfs, dir)
-				if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
-					log.Printf("prepareRootfs: warning: mkdir XDG_RUNTIME_DIR %s: %v", runtimeDir, err)
-				}
+				ensureRuntimeDir(rootfs, dir)
 			}
 		}
 	}
@@ -1296,6 +1293,41 @@ func (m *Manager) prepareRootfs(rootfs string, cfg ContainerConfig) {
 		if err := os.Symlink(target, linkPath); err != nil {
 			log.Printf("prepareRootfs: warning: symlink %s → %s: %v", linkPath, target, err)
 		}
+	}
+}
+
+// ensureRuntimeDir creates the container's XDG_RUNTIME_DIR and makes its parent
+// chain traversable by non-root users.
+//
+// The XDG spec mandates the runtime dir itself be 0700, but its *parents* must
+// stay traversable. A plain os.MkdirAll(dir, 0o700) applied 0700 to every
+// intermediate it created, so a deep XDG_RUNTIME_DIR (e.g. a host path mirrored
+// into the container, such as Wolf's /var/lib/smoothnas/plugins/wolf/runtime)
+// left intermediate dirs as 0700 root. A non-root run-user (e.g. gow's "retro",
+// uid 1000) then could not traverse them to reach the bind-mounted wayland
+// socket, so the nested compositor died with "Could not connect to remote
+// display: Permission denied".
+//
+// We add the execute bit (traversal only, never read/write) to each parent
+// component under the rootfs — this also repairs components that already exist
+// at a restrictive mode (which MkdirAll leaves untouched) — and create the leaf
+// at the spec-mandated 0700.
+func ensureRuntimeDir(rootfs, dir string) {
+	leaf := filepath.Join(rootfs, dir)
+	parent := filepath.Dir(leaf)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		log.Printf("prepareRootfs: warning: mkdir XDG_RUNTIME_DIR parent %s: %v", parent, err)
+	}
+	rootfs = filepath.Clean(rootfs)
+	for p := parent; len(p) > len(rootfs) && strings.HasPrefix(p, rootfs); p = filepath.Dir(p) {
+		if fi, err := os.Stat(p); err == nil {
+			if err := os.Chmod(p, fi.Mode().Perm()|0o011); err != nil {
+				log.Printf("prepareRootfs: warning: chmod XDG_RUNTIME_DIR parent %s: %v", p, err)
+			}
+		}
+	}
+	if err := os.Mkdir(leaf, 0o700); err != nil && !os.IsExist(err) {
+		log.Printf("prepareRootfs: warning: mkdir XDG_RUNTIME_DIR %s: %v", leaf, err)
 	}
 }
 

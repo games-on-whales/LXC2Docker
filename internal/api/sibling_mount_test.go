@@ -146,6 +146,17 @@ func TestEnsureRuntimeDirMount(t *testing.T) {
 		t.Error("user-supplied mount over XDG_RUNTIME_DIR must not be overridden")
 	}
 
+	// A sibling already populates the runtime dir with explicit child mounts
+	// (Wolf binds its wayland/pulse sockets at $XDG_RUNTIME_DIR/<socket>).
+	// Host-backing would mount a fresh empty dir over the top and shadow them,
+	// so it must be suppressed.
+	childMounts := []store.MountSpec{
+		{Type: "bind", Source: "/host/wolf/runtime/wayland-1", Destination: "/run/user/wolf/wayland-1"},
+	}
+	if _, ok := h.ensureRuntimeDirMount("wolf5", env, childMounts); ok {
+		t.Error("a child mount populating XDG_RUNTIME_DIR must suppress host-backing")
+	}
+
 	// No XDG_RUNTIME_DIR, or a relative one, produces nothing.
 	if _, ok := h.ensureRuntimeDirMount("wolf3", []string{"FOO=bar"}, nil); ok {
 		t.Error("missing XDG_RUNTIME_DIR should produce no mount")

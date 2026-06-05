@@ -2471,6 +2471,15 @@ func (h *Handler) ensureRuntimeDirMount(id string, env []string, existing []stor
 		if m.Destination == dst || strings.HasPrefix(dst, m.Destination+"/") {
 			return store.MountSpec{}, false // already backed by a user mount
 		}
+		// A sibling already populates the runtime dir with explicit child
+		// mounts (e.g. Wolf binds its wayland/pulse sockets at
+		// $XDG_RUNTIME_DIR/<socket>). Host-backing it here would mount a fresh
+		// empty directory over the top and shadow those sockets — the app then
+		// can't reach the display ("Could not connect to remote display"). The
+		// child binds already give it the shared content, so leave it alone.
+		if strings.HasPrefix(m.Destination, dst+"/") {
+			return store.MountSpec{}, false
+		}
 	}
 	hostDir := filepath.Join(h.store.RootDir(), "runtime", id)
 	if err := os.MkdirAll(hostDir, 0o777); err != nil {
