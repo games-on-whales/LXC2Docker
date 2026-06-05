@@ -511,7 +511,7 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 			// directory and add cgroup allow rules for each device node inside.
 			items = append(items, configItem{
 				"lxc.mount.entry",
-				fmt.Sprintf("%s %s none bind,create=dir 0 0", hostPath, destRel),
+				fmt.Sprintf("%s %s none %s 0 0", hostPath, destRel, bindMountOpts("bind,create=dir")),
 			})
 			// Scan directory for device nodes and allow each one.
 			if entries, err := os.ReadDir(hostPath); err == nil {
@@ -536,7 +536,7 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 			}
 			items = append(items, configItem{
 				"lxc.mount.entry",
-				fmt.Sprintf("%s %s none bind,create=file 0 0", hostPath, destRel),
+				fmt.Sprintf("%s %s none %s 0 0", hostPath, destRel, bindMountOpts("bind,create=file")),
 			})
 		}
 	}
@@ -733,6 +733,13 @@ func sysctlItems(cfg *ContainerConfig) []configItem {
 	return items
 }
 
+// defaultMountPropagation is Docker's default bind-mount propagation. Emitting
+// it on every bind keeps mounts a container creates underneath a bind from
+// leaking back through the host's (shared) peer group — the bug that let a
+// container bind-mounting /dev replace the host's /dev/pts and /dev/ptmx and
+// break PTY allocation for the Proxmox console and SSH.
+const defaultMountPropagation = "rprivate"
+
 // validPropagation is the set of mount propagation modes LXC accepts as an
 // lxc.mount.entry option. Anything outside this set (including the empty
 // string) falls back to the Docker default, rprivate.
@@ -751,7 +758,17 @@ func mountPropagationOpt(p string) string {
 	if _, ok := validPropagation[p]; ok {
 		return p
 	}
-	return "rprivate"
+	return defaultMountPropagation
+}
+
+// bindMountOpts builds the option field for a daemon-emitted bind mount (device
+// nodes, device directories, socket dirs). These are not user-configurable, so
+// they always get the default rprivate propagation — without it they inherit
+// the host's shared propagation and a container that mounts over, say,
+// /dev/input or a socket dir could leak that mount back to the host. base is the
+// leading option set, e.g. "bind,create=dir".
+func bindMountOpts(base string) string {
+	return base + "," + defaultMountPropagation
 }
 
 func shmMountEntry(size int64) string {
@@ -904,7 +921,7 @@ func appendSocketMount(items []configItem, cfg *ContainerConfig, source string, 
 	}
 	if !alreadyMounted {
 		escapedParent := strings.ReplaceAll(parentDir, " ", `\040`)
-		entry := fmt.Sprintf("%s %s none bind,create=dir 0 0", escapedParent, escapedDest)
+		entry := fmt.Sprintf("%s %s none %s 0 0", escapedParent, escapedDest, bindMountOpts("bind,create=dir"))
 		items = append(items, configItem{"lxc.mount.entry", entry})
 	}
 
@@ -930,6 +947,7 @@ func appendSocketDirMount(items []configItem, sourceDir, destDir string, readOnl
 	if readOnly {
 		opts += ",ro"
 	}
+	opts = bindMountOpts(opts)
 	escapedSource := strings.ReplaceAll(sourceDir, " ", `\040`)
 	entry := fmt.Sprintf("%s %s none %s 0 0", escapedSource, escapedDest, opts)
 	return append(items, configItem{"lxc.mount.entry", entry})
@@ -968,7 +986,7 @@ func autoMountDeviceDirs(rules []string) []configItem {
 		destRel := strings.TrimPrefix(dir, "/")
 		items = append(items, configItem{
 			"lxc.mount.entry",
-			fmt.Sprintf("%s %s none bind,create=dir 0 0", dir, destRel),
+			fmt.Sprintf("%s %s none %s 0 0", dir, destRel, bindMountOpts("bind,create=dir")),
 		})
 		// Add per-device cgroup rules for each node in the directory.
 		if entries, err := os.ReadDir(dir); err == nil {
@@ -1153,7 +1171,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 		if isDir {
 			items = append(items, configItem{
 				"lxc.mount.entry",
-				fmt.Sprintf("%s %s none bind,create=dir 0 0", hostPath, destRel),
+				fmt.Sprintf("%s %s none %s 0 0", hostPath, destRel, bindMountOpts("bind,create=dir")),
 			})
 			if entries, err := os.ReadDir(hostPath); err == nil {
 				for _, entry := range entries {
@@ -1171,7 +1189,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 			}
 			items = append(items, configItem{
 				"lxc.mount.entry",
-				fmt.Sprintf("%s %s none bind,create=file 0 0", hostPath, destRel),
+				fmt.Sprintf("%s %s none %s 0 0", hostPath, destRel, bindMountOpts("bind,create=file")),
 			})
 		}
 	}
