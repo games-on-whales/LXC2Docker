@@ -31,6 +31,22 @@ func fsKey(path string) (uint64, error) {
 	return uint64(st.Dev), nil
 }
 
+// isTmpfs reports whether path lives on a tmpfs (or ramfs) mount. Free space on
+// such a mount reflects available RAM, not the host filesystem the guardrail
+// protects: a container filling a tmpfs hits ENOSPC on the tmpfs itself, it
+// does not eat the host disk. Runtime/socket dirs (XDG_RUNTIME_DIR, /dev/shm)
+// are typically small tmpfs mounts, so without this check the create pre-flight
+// would refuse a launch whenever such a bind source reports little free space.
+// That is exactly the false positive seen sharing Wolf's runtime dir with
+// PulseAudio.
+func isTmpfs(path string) bool {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		return false
+	}
+	return int64(st.Type) == unix.TMPFS_MAGIC || int64(st.Type) == unix.RAMFS_MAGIC
+}
+
 // DiskPressureEmitter publishes a disk-pressure notification (wired to the
 // Docker event stream by the API layer). inPressure is true when free space
 // has dropped below the threshold and false on the recovery edge.
@@ -49,7 +65,7 @@ func (m *Manager) watchedPaths() []string {
 	seen := map[uint64]bool{}
 	var out []string
 	add := func(p string) {
-		if p == "" {
+		if p == "" || isTmpfs(p) {
 			return
 		}
 		key, err := fsKey(p)
@@ -140,6 +156,9 @@ func (m *Manager) checkCreateDiskPressure(cfg ContainerConfig) error {
 	for _, mnt := range cfg.Mounts {
 		if mnt.ReadOnly {
 			continue
+		}
+		if isTmpfs(mnt.Source) {
+			continue // tmpfs free space is RAM, not the host disk we guard
 		}
 		free, err := FreeBytes(mnt.Source)
 		if err != nil {
