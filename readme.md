@@ -66,6 +66,7 @@ Useful flags:
 | `--socket` | Unix socket path (default `/run/docker-lxc-daemon/docker.sock`) |
 | `--lxcpath` | LXC container storage (default `/var/lib/lxc`) |
 | `--pve-storage` | Proxmox storage name — enables Proxmox CT mode |
+| `--min-free-disk-gb` | Low-space guardrail (default 2): refuse creates onto, and warn when, a watched filesystem drops below this. `0` disables |
 | `--lan-bridge` / `--lan-prefix` / `--lan-gateway` / `--lan-subnet` | Dual-NIC LAN settings |
 
 ## Use

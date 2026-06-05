@@ -113,6 +113,41 @@ func (h *Handler) RestartEmitter() func(id, action string) {
 	}
 }
 
+// DiskPressureEmitter returns a function suitable for
+// lxc.Manager.StartDiskPressureWatcher. It publishes a daemon-scoped event
+// when a watched filesystem crosses below (or back above) the free-space
+// threshold, so `docker events` and Portainer surface the condition.
+func (h *Handler) DiskPressureEmitter() func(path string, free, threshold uint64, inPressure bool) {
+	return func(path string, free, threshold uint64, inPressure bool) {
+		if h == nil || h.events == nil {
+			return
+		}
+		action := "disk_pressure"
+		if !inPressure {
+			action = "disk_pressure_recovered"
+		}
+		now := time.Now()
+		h.events.publish(Event{
+			Type:   "daemon",
+			Action: action,
+			Actor: EventActor{
+				ID: path,
+				Attributes: map[string]string{
+					"daemon":    localEventDaemon,
+					"path":      path,
+					"free":      strconv.FormatUint(free, 10),
+					"threshold": strconv.FormatUint(threshold, 10),
+				},
+			},
+			Scope:    "local",
+			Time:     now.Unix(),
+			TimeNano: now.UnixNano(),
+			ID:       path,
+			Status:   action,
+		})
+	}
+}
+
 // HealthEmitter returns a function suitable for lxc.Manager.StartHealthWatcher.
 // Each call publishes a Docker-shaped "health_status" event (matching what
 // `docker events` emits) so Portainer refreshes the container's health
