@@ -31,6 +31,7 @@ func main() {
 	lxcPath := flag.String("lxcpath", "/var/lib/lxc", "LXC container storage path (legacy direct-LXC mode)")
 	pveStorage := flag.String("pve-storage", "", "Default Proxmox storage name for CT rootfs (e.g. 'large'); enables Proxmox CT mode. Per-container override via 'dld.storage' label.")
 	statePath := flag.String("statepath", "/var/lib/docker-lxc-daemon", "Daemon state directory")
+	minFreeDiskGB := flag.Int("min-free-disk-gb", 2, "Low-space threshold in GiB: refuse container creates onto, and warn when, a watched filesystem (state dir, LXC path, bind sources) drops below this. 0 disables.")
 
 	// Multi-bridge configuration. Repeatable; first value is the default
 	// bridge used when a container requests LAN networking without naming
@@ -65,7 +66,11 @@ func main() {
 		log.Fatalf("manager: %v", err)
 	}
 
-	handler, healthEmit, restartEmit := api.NewHandlerWithHooks(mgr, st)
+	if *minFreeDiskGB > 0 {
+		mgr.SetMinFreeBytes(uint64(*minFreeDiskGB) << 30)
+	}
+
+	handler, healthEmit, restartEmit, diskEmit := api.NewHandlerWithHooks(mgr, st)
 
 	// Ensure socket directory exists.
 	socketDir := filepath.Dir(*socketPath)
@@ -110,6 +115,9 @@ func main() {
 	mgr.StartRestartWatcherWithEmitter(ctx, restartEmit)
 	// Start the HEALTHCHECK runner so Portainer's health badge updates.
 	mgr.StartHealthWatcher(ctx, healthEmit)
+	// Warn (log + event) when a watched filesystem is running out of space,
+	// so a runaway write can't silently fill the host.
+	mgr.StartDiskPressureWatcher(ctx, diskEmit)
 
 	shutdownDone := make(chan struct{})
 	go func() {

@@ -41,6 +41,9 @@ type Manager struct {
 	// tmplMu serializes ZFS image-template materialization so two concurrent
 	// launches of the same image don't race to create the template dataset.
 	tmplMu sync.Mutex
+	// minFreeBytes is the low-space threshold for the create pre-flight and the
+	// disk-pressure watcher. Zero disables both. Set via SetMinFreeBytes.
+	minFreeBytes uint64
 }
 
 // UsePVE returns true when Proxmox CT mode is active.
@@ -880,6 +883,9 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 	rec := m.store.GetImage(imageRef)
 	if rec == nil {
 		return fmt.Errorf("manager: image %q not found; run pull first", imageRef)
+	}
+	if err := m.checkCreateDiskPressure(cfg); err != nil {
+		return err
 	}
 	if cfg.NetworkMode != "host" {
 		if err := EnsureBridge(); err != nil {
