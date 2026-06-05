@@ -33,6 +33,7 @@ func main() {
 	statePath := flag.String("statepath", "/var/lib/docker-lxc-daemon", "Daemon state directory")
 	minFreeDiskGB := flag.Int("min-free-disk-gb", 2, "Low-space threshold in GiB: refuse container creates onto, and warn when, a watched filesystem (state dir, LXC path, bind sources) drops below this. 0 disables.")
 	cachePath := flag.String("cache-path", "", "Directory for bulky regenerable data (image tarballs, OCI unpacks, named volumes, build cache). Empty auto-defaults onto a ZFS --pve-storage pool, else the state dir. Set this to a large filesystem to keep bulk off the host root.")
+	defaultMemory := flag.String("default-memory", "", "Default RAM for PVE containers that don't set --memory (e.g. \"16G\", \"32G\", a byte count, or empty/\"0\" = host RAM / no cap). Per-container override via the 'dld.memory' label.")
 
 	// Multi-bridge configuration. Repeatable; first value is the default
 	// bridge used when a container requests LAN networking without naming
@@ -66,6 +67,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("manager: %v", err)
 	}
+	defMem, err := lxc.ParseMemorySize(*defaultMemory)
+	if err != nil {
+		log.Fatalf("default-memory: %v", err)
+	}
+	mgr.DefaultMemoryBytes = defMem
 
 	// Resolve where bulky regenerable data lives (off the host root when
 	// possible) before any pull/volume create touches the filesystem.

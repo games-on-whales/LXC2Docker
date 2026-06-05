@@ -68,6 +68,7 @@ Useful flags:
 | `--pve-storage` | Proxmox storage name — enables Proxmox CT mode |
 | `--min-free-disk-gb` | Low-space guardrail (default 2): refuse creates onto, and warn when, a watched filesystem drops below this. `0` disables |
 | `--cache-path` | Directory for bulky regenerable data (image tarballs, OCI unpacks, named volumes, build cache). Empty auto-defaults onto a ZFS `--pve-storage` pool, else the state dir — set it to keep bulk off the host root |
+| `--default-memory` | RAM for PVE CTs without `--memory` (e.g. `16G`, `32G`; empty = host RAM / no cap). Per-container override via the `dld.memory` label |
 | `--lan-bridge` / `--lan-prefix` / `--lan-gateway` / `--lan-subnet` | Dual-NIC LAN settings |
 
 ## Use

@@ -184,6 +184,16 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	} else if gb := lxc.ParseDiskSizeGB(req.HostConfig.StorageOpt["size"]); gb > 0 {
 		cfg.DiskSizeGB = gb
 	}
+	// Per-container memory via the 'dld.memory' label (e.g. "32G"), for
+	// callers like Wolf that create containers without Docker's --memory.
+	// An explicit --memory (HostConfig.Memory) always takes precedence.
+	if cfg.MemoryBytes == 0 {
+		if v := strings.TrimSpace(req.Labels["dld.memory"]); v != "" {
+			if b, err := lxc.ParseMemorySize(v); err == nil {
+				cfg.MemoryBytes = b
+			}
+		}
+	}
 	// LAN bridge replaces host networking: the container gets its own network
 	// namespace with dual NICs (internal + LAN) instead of sharing the host's.
 	if cfg.LAN && cfg.NetworkMode == "host" {

@@ -405,7 +405,7 @@ func (m *Manager) createPVEFromTarball(id string, imgRec *store.ImageRecord, cfg
 		return fmt.Errorf("manager: mount rootfs: %w", err)
 	}
 
-	if err := writePVEConfig(vmid, hostname, rootfsSpec, rootfsPath, &cfg, ip); err != nil {
+	if err := writePVEConfig(vmid, hostname, rootfsSpec, rootfsPath, &cfg, ip, m.DefaultMemoryBytes); err != nil {
 		unmount()
 		cleanup()
 		return fmt.Errorf("manager: write PVE config: %w", err)
