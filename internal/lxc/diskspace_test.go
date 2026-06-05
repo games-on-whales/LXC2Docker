@@ -4,6 +4,28 @@ import (
 	"testing"
 )
 
+// TestCheckCreateDiskPressureSkipsTmpfs covers the guardrail false positive that
+// refused Wolf's PulseAudio sibling: its shared runtime dir is a small tmpfs, so
+// FreeBytes reports little space, but a tmpfs cannot fill the host disk. /dev/shm
+// is a tmpfs on a normal Linux host; skip the test where it is not.
+func TestCheckCreateDiskPressureSkipsTmpfs(t *testing.T) {
+	t.Parallel()
+
+	const shm = "/dev/shm"
+	if !isTmpfs(shm) {
+		t.Skipf("%s is not tmpfs on this host", shm)
+	}
+
+	// Threshold far above any tmpfs free space; a non-tmpfs source would be
+	// refused, but the tmpfs source must be skipped so create is allowed.
+	m := &Manager{minFreeBytes: 1 << 50} // 1 PiB
+	if err := m.checkCreateDiskPressure(ContainerConfig{
+		Mounts: []MountSpec{{Source: shm}},
+	}); err != nil {
+		t.Fatalf("tmpfs bind source should not trip the guardrail: %v", err)
+	}
+}
+
 func TestFreeBytes(t *testing.T) {
 	t.Parallel()
 

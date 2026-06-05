@@ -100,3 +100,57 @@ func TestTranslateSiblingBindSourceResolvesRuntimeDir(t *testing.T) {
 		t.Errorf("unknown runtime dir rewritten: %q", got)
 	}
 }
+
+// TestEnsureRuntimeDirMount covers host-backing XDG_RUNTIME_DIR so that a
+// shared runtime/socket dir (Wolf's /run/user/wolf, passed to its PulseAudio
+// sibling) becomes a stable host bind instead of resolving through the owner's
+// live mount namespace — which the kernel refuses to bind-mount (EINVAL).
+func TestEnsureRuntimeDirMount(t *testing.T) {
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	h := &Handler{store: st}
+
+	// XDG_RUNTIME_DIR set and uncovered → a host-backed bind is produced and
+	// the backing directory is created.
+	env := []string{"FOO=bar", "XDG_RUNTIME_DIR=/run/user/wolf"}
+	m, ok := h.ensureRuntimeDirMount("wolf", env, nil)
+	if !ok {
+		t.Fatal("expected a runtime-dir mount to be produced")
+	}
+	if m.Destination != "/run/user/wolf" {
+		t.Errorf("destination: got %q, want /run/user/wolf", m.Destination)
+	}
+	wantSrc := filepath.Join(st.RootDir(), "runtime", "wolf")
+	if m.Source != wantSrc {
+		t.Errorf("source: got %q, want %q", m.Source, wantSrc)
+	}
+	if fi, err := os.Stat(m.Source); err != nil || !fi.IsDir() {
+		t.Errorf("backing dir not created at %q: err=%v", m.Source, err)
+	}
+
+	// A sibling resolving the owner's runtime dir now lands on the host path.
+	if err := st.AddContainer(&store.ContainerRecord{
+		ID: "wolf", Name: "wolf", Mounts: []store.MountSpec{m},
+	}); err != nil {
+		t.Fatalf("add container: %v", err)
+	}
+	if got := h.translateSiblingBindSource("/run/user/wolf"); got != wantSrc {
+		t.Errorf("sibling source: got %q, want %q", got, wantSrc)
+	}
+
+	// An explicit user mount covering the path is never overridden.
+	existing := []store.MountSpec{{Type: "bind", Source: "/host/rt", Destination: "/run/user/wolf"}}
+	if _, ok := h.ensureRuntimeDirMount("wolf2", env, existing); ok {
+		t.Error("user-supplied mount over XDG_RUNTIME_DIR must not be overridden")
+	}
+
+	// No XDG_RUNTIME_DIR, or a relative one, produces nothing.
+	if _, ok := h.ensureRuntimeDirMount("wolf3", []string{"FOO=bar"}, nil); ok {
+		t.Error("missing XDG_RUNTIME_DIR should produce no mount")
+	}
+	if _, ok := h.ensureRuntimeDirMount("wolf4", []string{"XDG_RUNTIME_DIR=relative/dir"}, nil); ok {
+		t.Error("relative XDG_RUNTIME_DIR should produce no mount")
+	}
+}

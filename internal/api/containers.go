@@ -316,6 +316,15 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// Host-back the container's XDG_RUNTIME_DIR so a runtime/socket directory
+	// it shares with sibling containers (Wolf passes /run/user/wolf to its
+	// PulseAudio sibling) resolves to a stable host path instead of the owner's
+	// live mount namespace. See ensureRuntimeDirMount.
+	if rm, ok := h.ensureRuntimeDirMount(id, env, storeMounts); ok {
+		cfg.Mounts = append(cfg.Mounts, lxc.MountSpec{Source: rm.Source, Destination: rm.Destination})
+		storeMounts = append(storeMounts, rm)
+	}
+
 	// Preserve the full HostConfig as JSON so inspect can echo exactly what
 	// the client posted, including fields the LXC runtime doesn't honor.
 	rawHC, _ := json.Marshal(req.HostConfig)
@@ -2419,6 +2428,62 @@ func mergeEnv(imageEnv, requestEnv []string) []string {
 		result = append(result, m[key])
 	}
 	return result
+}
+
+// envValue returns the value of key in a KEY=VALUE environment slice, or ""
+// when the key is absent. The last occurrence wins, matching shell semantics.
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	val := ""
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			val = e[len(prefix):]
+		}
+	}
+	return val
+}
+
+// ensureRuntimeDirMount host-backs a container's XDG_RUNTIME_DIR so that a
+// runtime/socket directory it shares with sibling containers resolves to a
+// stable host path.
+//
+// Wolf passes its own XDG_RUNTIME_DIR (/run/user/wolf) as a bind source to its
+// PulseAudio/app siblings so they can reach its audio socket. Wolf creates that
+// directory at runtime inside its own mount namespace, so nothing on the host
+// backs it. A sibling's bind of that path can then only be resolved through the
+// owner's live namespace (/proc/<pid>/root/...), and bind-mounting a path that
+// lives in another container's mount namespace fails with EINVAL. Backing the
+// runtime dir with a real host directory turns it into an ordinary host bind:
+// the sibling's source resolves via translateViaBindDest (case 1, the stable
+// host-path case) and both containers bind the same directory, exactly as
+// sharing through a Docker volume would.
+//
+// It only fires when XDG_RUNTIME_DIR is an absolute path that no user-supplied
+// mount already covers, so explicit binds are never overridden. The directory
+// is world-accessible because it is shared between the owner (often root) and
+// sibling processes that run as the application uid.
+func (h *Handler) ensureRuntimeDirMount(id string, env []string, existing []store.MountSpec) (store.MountSpec, bool) {
+	dst := envValue(env, "XDG_RUNTIME_DIR")
+	if !strings.HasPrefix(dst, "/") {
+		return store.MountSpec{}, false
+	}
+	for _, m := range existing {
+		if m.Destination == dst || strings.HasPrefix(dst, m.Destination+"/") {
+			return store.MountSpec{}, false // already backed by a user mount
+		}
+	}
+	hostDir := filepath.Join(h.store.RootDir(), "runtime", id)
+	if err := os.MkdirAll(hostDir, 0o777); err != nil {
+		log.Printf("runtime-dir: cannot host-back %s for %s: %v", dst, id, err)
+		return store.MountSpec{}, false
+	}
+	// MkdirAll honors umask, so set the mode explicitly: the dir is shared
+	// across uids (the owner is often root, the audio/app siblings run as the
+	// app uid) and every party must be able to create its socket here.
+	if err := os.Chmod(hostDir, 0o777); err != nil {
+		log.Printf("runtime-dir: cannot chmod %s: %v", hostDir, err)
+	}
+	return store.MountSpec{Type: "bind", Source: hostDir, Destination: dst}, true
 }
 
 // translateSiblingBindSource maps a bind-mount source that points into
