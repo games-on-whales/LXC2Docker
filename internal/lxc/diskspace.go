@@ -60,6 +60,7 @@ func (m *Manager) watchedPaths() []string {
 		out = append(out, p)
 	}
 	add(m.store.RootDir())
+	add(m.CacheDir())
 	add(m.lxcPath)
 	if m.UsePVE() && m.pveStorageIsZFS() {
 		add("/" + m.pveStorage)

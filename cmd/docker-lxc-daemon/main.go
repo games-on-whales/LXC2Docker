@@ -32,6 +32,7 @@ func main() {
 	pveStorage := flag.String("pve-storage", "", "Default Proxmox storage name for CT rootfs (e.g. 'large'); enables Proxmox CT mode. Per-container override via 'dld.storage' label.")
 	statePath := flag.String("statepath", "/var/lib/docker-lxc-daemon", "Daemon state directory")
 	minFreeDiskGB := flag.Int("min-free-disk-gb", 2, "Low-space threshold in GiB: refuse container creates onto, and warn when, a watched filesystem (state dir, LXC path, bind sources) drops below this. 0 disables.")
+	cachePath := flag.String("cache-path", "", "Directory for bulky regenerable data (image tarballs, OCI unpacks, named volumes, build cache). Empty auto-defaults onto a ZFS --pve-storage pool, else the state dir. Set this to a large filesystem to keep bulk off the host root.")
 
 	// Multi-bridge configuration. Repeatable; first value is the default
 	// bridge used when a container requests LAN networking without naming
@@ -66,6 +67,9 @@ func main() {
 		log.Fatalf("manager: %v", err)
 	}
 
+	// Resolve where bulky regenerable data lives (off the host root when
+	// possible) before any pull/volume create touches the filesystem.
+	mgr.SetCacheDir(*cachePath)
 	if *minFreeDiskGB > 0 {
 		mgr.SetMinFreeBytes(uint64(*minFreeDiskGB) << 30)
 	}

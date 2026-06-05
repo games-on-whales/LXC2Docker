@@ -44,6 +44,9 @@ type Manager struct {
 	// minFreeBytes is the low-space threshold for the create pre-flight and the
 	// disk-pressure watcher. Zero disables both. Set via SetMinFreeBytes.
 	minFreeBytes uint64
+	// cacheDir holds bulky regenerable data (tarballs, OCI, volumes); empty
+	// means use the state dir. Set via SetCacheDir. See CacheDir.
+	cacheDir string
 }
 
 // UsePVE returns true when Proxmox CT mode is active.
@@ -53,6 +56,50 @@ func (m *Manager) UsePVE() bool { return m.pveStorage != "" }
 // daemon isn't in PVE mode. Used by the API layer's size-of-image logic to
 // build the ZFS dataset name for `zfs get used`.
 func (m *Manager) PVEStorage() string { return m.pveStorage }
+
+// CacheDir is where the daemon keeps bulky, regenerable data — image rootfs
+// tarballs, OCI unpacks, and named-volume backing — as opposed to the small
+// JSON metadata under the state dir. Defaults to the state dir; relocate it
+// off the (often small) host root with --cache-path or the PVE auto-default.
+func (m *Manager) CacheDir() string {
+	if m.cacheDir == "" {
+		return m.store.RootDir()
+	}
+	return m.cacheDir
+}
+
+// SetCacheDir resolves and applies the bulky-cache location from the operator's
+// --cache-path value (empty = auto). On a directory-capable PVE storage (a ZFS
+// pool, mounted at /<pool>) an empty value defaults the cache onto that pool so
+// it never fills the host root; block storages (lvmthin/lvm) have no POSIX
+// mountpoint, so it stays on the state dir and we log a recommendation.
+func (m *Manager) SetCacheDir(explicit string) {
+	m.cacheDir = resolveCacheDir(explicit, m.store.RootDir(), m.pveStorage, m.pveStgType)
+	if m.cacheDir == m.store.RootDir() {
+		if m.UsePVE() && explicit == "" && !m.pveStorageIsZFS() {
+			log.Printf("cache: bulky image/volume data stays under %s (host root); "+
+				"set --cache-path to a large filesystem to keep it off root", m.store.RootDir())
+		}
+		return
+	}
+	if err := os.MkdirAll(m.cacheDir, 0o755); err != nil {
+		log.Printf("cache: mkdir %s: %v; falling back to %s", m.cacheDir, err, m.store.RootDir())
+		m.cacheDir = ""
+		return
+	}
+	log.Printf("cache: bulky image/volume data stored under %s", m.cacheDir)
+}
+
+// resolveCacheDir is the pure path-selection rule behind SetCacheDir.
+func resolveCacheDir(explicit, statePath, pveStorage, pveStgType string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if pveStgType == "zfspool" && pveStorage != "" {
+		return filepath.Join("/"+pveStorage, "docker-lxc-daemon-cache")
+	}
+	return statePath
+}
 
 // NewManager creates a Manager that stores containers under lxcPath.
 // If pveStorage is non-empty, containers are created as Proxmox CTs on
@@ -768,7 +815,7 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 // to a rootfs, and creates a template from it. In PVE mode the template is a
 // Proxmox CT on the configured storage; otherwise a direct LXC template.
 func (m *Manager) pullOCI(r *image.ResolvedImage, opts PullOpts) error {
-	ociStoreDir := filepath.Join(filepath.Dir(m.lxcPath), "docker-lxc-daemon", "oci")
+	ociStoreDir := filepath.Join(m.CacheDir(), "oci")
 
 	progress := opts.OnStatus
 	if progress == nil {

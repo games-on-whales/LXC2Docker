@@ -21,6 +21,6 @@ func (s *controlServer) DiskUsage(ctx context.Context, req *controlapi.DiskUsage
 // so `docker builder prune` reclaims build-cache disk. It streams no usage
 // records — the daemon doesn't track per-entry sizes.
 func (s *controlServer) Prune(req *controlapi.PruneRequest, stream grpc.ServerStreamingServer[controlapi.UsageRecord]) error {
-	_ = os.RemoveAll(filepath.Join(s.h.store.RootDir(), buildCacheSubdir))
+	_ = os.RemoveAll(filepath.Join(s.h.cacheDir(), buildCacheSubdir))
 	return nil
 }
