@@ -1848,8 +1848,7 @@ func (m *Manager) ExecAs(id string, cmd, env []string, user string) *exec.Cmd {
 	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
 		args := []string{"exec", fmt.Sprintf("%d", rec.VMID), "--"}
 		if user != "" {
-			joined := shellJoin(cmd)
-			args = append(args, "su", "-s", "/bin/sh", "-c", joined, userName(user))
+			args = append(args, suWrap(cmd, user)...)
 		} else {
 			args = append(args, cmd...)
 		}
@@ -1858,25 +1857,64 @@ func (m *Manager) ExecAs(id string, cmd, env []string, user string) *exec.Cmd {
 		return c
 	}
 	args := []string{"-n", id, "--lxcpath", m.lxcPath}
+	runArgv := cmd
 	if user != "" {
-		uid, gid := parseUserSpec(user)
-		if uid != "" {
-			args = append(args, "-u", uid)
-		}
-		if gid != "" {
-			args = append(args, "-g", gid)
+		// lxc-attach -u/-g accept only NUMERIC ids. For a numeric spec, pass
+		// them directly; for a user NAME, run the command through `su` inside
+		// the container so the name resolves against the container's own passwd
+		// database (same approach as the pct-exec branch above and buildRunArgv).
+		// Handing a name to `lxc-attach -u` makes it abort with
+		// "could not parse command line".
+		if uid, gid, ok := numericUserSpec(user); ok {
+			if uid != "" {
+				args = append(args, "-u", uid)
+			}
+			if gid != "" {
+				args = append(args, "-g", gid)
+			}
+		} else {
+			runArgv = suWrap(cmd, user)
 		}
 	}
 	args = append(args, "--")
-	args = append(args, cmd...)
+	args = append(args, runArgv...)
 	c := exec.Command("lxc-attach", args...)
 	c.Env = env
 	return c
 }
 
-func parseUserSpec(s string) (uid, gid string) {
-	u, g, _ := strings.Cut(s, ":")
-	return u, g
+// suWrap returns an argv that runs cmd as the given user via `su` inside the
+// container. su resolves a user NAME against the container's own passwd
+// database — unlike `lxc-attach -u`, which accepts only numeric ids. Shared by
+// the pct-exec and lxc-attach exec paths so their user handling can't drift.
+func suWrap(cmd []string, user string) []string {
+	return []string{"su", "-s", "/bin/sh", "-c", shellJoin(cmd), userName(user)}
+}
+
+// numericUserSpec reports whether a "uid[:gid]" spec is purely numeric and, if
+// so, returns its parts. Only numeric specs are valid for `lxc-attach -u/-g`;
+// a user NAME must instead be resolved inside the container (see suWrap).
+func numericUserSpec(s string) (uid, gid string, ok bool) {
+	uid, gid, _ = strings.Cut(s, ":")
+	if !isAllDigits(uid) {
+		return "", "", false
+	}
+	if gid != "" && !isAllDigits(gid) {
+		return "", "", false
+	}
+	return uid, gid, true
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func userName(s string) string {
