@@ -324,3 +324,59 @@ func hasMountEntry(items []configItem, want string) bool {
 	}
 	return false
 }
+
+func TestInitUserConfigItems(t *testing.T) {
+	rootfs := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rootfs, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(rootfs, "etc", "passwd"),
+		[]byte("root:x:0:0:root:/root:/bin/bash\npostgres:x:999:1001:PostgreSQL:/var/lib/postgresql:/bin/bash\nadmin:x:1000:1000::/home/admin:/bin/sh\n"), 0o644)
+	os.WriteFile(filepath.Join(rootfs, "etc", "group"),
+		[]byte("root:x:0:\npostgres:x:1001:\nstaff:x:50:\n"), 0o644)
+
+	asMap := func(items []configItem) map[string]string {
+		m := map[string]string{}
+		for _, it := range items {
+			m[it.key] = it.value
+		}
+		return m
+	}
+
+	tests := []struct {
+		name, spec  string
+		wantUID     string // "" => expect no items at all
+		wantGID     string // "" => expect lxc.init.gid absent
+	}{
+		{"empty", "", "", ""},
+		{"numeric uid:gid", "1000:1000", "1000", "1000"},
+		{"numeric uid in passwd -> primary gid", "1000", "1000", "1000"},
+		{"numeric uid not in passwd -> no gid", "4242", "4242", ""},
+		{"name resolves uid+primary gid", "postgres", "999", "1001"},
+		{"name uid + name group", "postgres:staff", "999", "50"},
+		{"name uid + numeric group override", "admin:0", "1000", "0"},
+		{"unknown name -> nil", "nope", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			items := initUserConfigItems(tt.spec, rootfs)
+			m := asMap(items)
+			if tt.wantUID == "" {
+				if len(items) != 0 {
+					t.Fatalf("expected no items, got %v", items)
+				}
+				return
+			}
+			if m["lxc.init.uid"] != tt.wantUID {
+				t.Fatalf("lxc.init.uid = %q, want %q (items=%v)", m["lxc.init.uid"], tt.wantUID, items)
+			}
+			if tt.wantGID == "" {
+				if _, ok := m["lxc.init.gid"]; ok {
+					t.Fatalf("expected no lxc.init.gid, got %q", m["lxc.init.gid"])
+				}
+			} else if m["lxc.init.gid"] != tt.wantGID {
+				t.Fatalf("lxc.init.gid = %q, want %q (items=%v)", m["lxc.init.gid"], tt.wantGID, items)
+			}
+		})
+	}
+}

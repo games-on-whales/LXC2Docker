@@ -95,6 +95,11 @@ type ContainerConfig struct {
 	ShmSize           int64        // /dev/shm tmpfs size in bytes (0 = kernel default)
 	BlkioWeight       uint16       // Block I/O weight (10-1000, mapped to io.weight)
 	WorkingDir        string       // container cwd; maps to lxc.init.cwd
+	// User is the Docker-style spec the container's PID 1 runs as: "uid",
+	// "uid:gid", "user", or "user:group". Maps to lxc.init.uid / lxc.init.gid
+	// (names resolved against the rootfs /etc/passwd + /etc/group). Empty runs
+	// as root, preserving the daemon's historical default.
+	User string
 	// Security. Privileged grants full capabilities + unrestricted device
 	// access; equivalent to Docker's --privileged. CapAdd/CapDrop extend
 	// or restrict the default set when not privileged.
@@ -303,6 +308,10 @@ func rewriteConfig(path string, cfg *ContainerConfig, ip, containerName string, 
 		}
 	}
 
+	// Run PID 1 as the requested user. Done here (not in buildItems) because
+	// resolving a user/group name needs the rootfs, parsed just above.
+	items = append(items, initUserConfigItems(cfg.User, rootfs)...)
+
 	out, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("write config: %w", err)
@@ -321,6 +330,120 @@ func rewriteConfig(path string, cfg *ContainerConfig, ip, containerName string, 
 		fmt.Fprintf(w, "%s = %s\n", item.key, item.value)
 	}
 	return w.Flush()
+}
+
+// initUserConfigItems translates a Docker-style user spec ("uid", "uid:gid",
+// "user", or "user:group") into lxc.init.uid / lxc.init.gid config items. LXC's
+// init id keys are numeric, so non-numeric names are resolved against the
+// container rootfs's /etc/passwd and /etc/group — matching how Docker resolves
+// an image's USER. Returns nil when the spec is empty or the user part can't be
+// resolved, in which case PID 1 runs as root (the daemon's historical default).
+//
+// When only a user is given (no ":group"), the group defaults to that user's
+// primary GID from /etc/passwd if known; otherwise lxc.init.gid is omitted and
+// LXC falls back to GID 0, matching Docker's behavior for an unresolvable user.
+func initUserConfigItems(spec, rootfs string) []configItem {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil
+	}
+	userPart, groupPart, hasGroup := strings.Cut(spec, ":")
+	uid, primaryGID, ok := resolveUID(strings.TrimSpace(userPart), rootfs)
+	if !ok {
+		return nil
+	}
+	items := []configItem{{"lxc.init.uid", uid}}
+	gid := ""
+	if hasGroup && strings.TrimSpace(groupPart) != "" {
+		if g, ok := resolveGID(strings.TrimSpace(groupPart), rootfs); ok {
+			gid = g
+		}
+	} else {
+		gid = primaryGID
+	}
+	if gid != "" {
+		items = append(items, configItem{"lxc.init.gid", gid})
+	}
+	return items
+}
+
+// resolveUID resolves the user part of a spec to a numeric UID. A numeric input
+// is returned as-is (primary GID looked up from passwd only if an entry exists);
+// a name is looked up in <rootfs>/etc/passwd. The second return is the user's
+// primary GID when known. ok is false when a name can't be resolved.
+func resolveUID(user, rootfs string) (uid, primaryGID string, ok bool) {
+	if user == "" {
+		return "", "", false
+	}
+	if _, err := strconv.Atoi(user); err == nil {
+		// Numeric UID. Try to find a matching passwd entry for its primary GID.
+		if _, gid, found := lookupPasswd(rootfs, "", user); found {
+			return user, gid, true
+		}
+		return user, "", true
+	}
+	if u, gid, found := lookupPasswd(rootfs, user, ""); found {
+		return u, gid, true
+	}
+	return "", "", false
+}
+
+// resolveGID resolves the group part of a spec to a numeric GID. Numeric input
+// is returned as-is; a name is looked up in <rootfs>/etc/group.
+func resolveGID(group, rootfs string) (gid string, ok bool) {
+	if group == "" {
+		return "", false
+	}
+	if _, err := strconv.Atoi(group); err == nil {
+		return group, true
+	}
+	if g, found := lookupGroup(rootfs, group); found {
+		return g, true
+	}
+	return "", false
+}
+
+// lookupPasswd scans <rootfs>/etc/passwd for an entry matching byName (when
+// non-empty) or byUID (when non-empty), returning its uid and primary gid.
+func lookupPasswd(rootfs, byName, byUID string) (uid, gid string, ok bool) {
+	f, err := os.Open(filepath.Join(rootfs, "etc", "passwd"))
+	if err != nil {
+		return "", "", false
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		// name:passwd:uid:gid:gecos:home:shell
+		fields := strings.Split(scanner.Text(), ":")
+		if len(fields) < 4 {
+			continue
+		}
+		if (byName != "" && fields[0] == byName) || (byUID != "" && fields[2] == byUID) {
+			return fields[2], fields[3], true
+		}
+	}
+	return "", "", false
+}
+
+// lookupGroup scans <rootfs>/etc/group for a group name, returning its gid.
+func lookupGroup(rootfs, name string) (gid string, ok bool) {
+	f, err := os.Open(filepath.Join(rootfs, "etc", "group"))
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		// name:passwd:gid:members
+		fields := strings.Split(scanner.Text(), ":")
+		if len(fields) < 3 {
+			continue
+		}
+		if fields[0] == name {
+			return fields[2], true
+		}
+	}
+	return "", false
 }
 
 // resolveMountDest rewrites the destination field of an lxc.mount.entry so
@@ -1071,6 +1194,10 @@ func writePVEConfig(vmid int, hostname, rootfsSpec, rootfsPath string, cfg *Cont
 			items[i].value = resolveMountDest(rootfsPath, item.value)
 		}
 	}
+
+	// Run PID 1 as the requested user (lxc.init.uid/gid), resolving any
+	// name against the CT rootfs.
+	items = append(items, initUserConfigItems(cfg.User, rootfsPath)...)
 
 	for _, item := range items {
 		lines = append(lines, fmt.Sprintf("%s: %s", item.key, item.value))

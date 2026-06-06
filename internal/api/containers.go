@@ -146,6 +146,13 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		Cmd:               cmd,
 		Env:               env,
 		WorkingDir:        workingDir,
+		// Run PID 1 as the explicitly requested user. We deliberately do NOT
+		// fall back to the image's USER here: the daemon has always run
+		// containers as root, and silently honoring image USER would change
+		// the runtime identity of every existing image (breaking those whose
+		// volumes were provisioned for root). Callers that want the image USER
+		// can read it from inspect and pass it explicitly.
+		User:              req.User,
 		DeviceCgroupRules: req.HostConfig.DeviceCgroupRules,
 		NetworkMode:       canonicalNetworkName(req.HostConfig.NetworkMode),
 		IpcMode:           req.HostConfig.IpcMode,
