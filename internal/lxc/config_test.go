@@ -1,6 +1,7 @@
 package lxc
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -107,7 +108,7 @@ func TestAppendSocketMountMountsRuntimeSocketDirAtRealDestination(t *testing.T) 
 		Destination: "/run/user/wolf/wayland-1",
 	})
 
-	want := strings.ReplaceAll(runtimeDir, " ", `\040`) + " run/user/wolf none bind,create=dir 0 0"
+	want := strings.ReplaceAll(runtimeDir, " ", `\040`) + " run/user/wolf none bind,create=dir,rprivate 0 0"
 	if !hasMountEntry(items, want) {
 		t.Fatalf("expected direct runtime dir mount %q, got %#v", want, items)
 	}
@@ -128,7 +129,7 @@ func TestAppendSocketMountKeepsHiddenSocketMountForTranslatedDestinations(t *tes
 		Destination: "/var/run/wolf/wolf.sock",
 	})
 
-	want := strings.ReplaceAll(runtimeDir, " ", `\040`) + " .socket-dirs/wolf none bind,create=dir 0 0"
+	want := strings.ReplaceAll(runtimeDir, " ", `\040`) + " .socket-dirs/wolf none bind,create=dir,rprivate 0 0"
 	if !hasMountEntry(items, want) {
 		t.Fatalf("expected hidden socket dir mount %q, got %#v", want, items)
 	}
@@ -174,7 +175,7 @@ func TestBuildItemsRewritesRawSocketMounts(t *testing.T) {
 	}
 	items := buildItems(cfg, "10.0.0.2")
 
-	wantMount := strings.ReplaceAll(dir, " ", `\040`) + " .socket-dirs/" + filepath.Base(dir) + " none bind,create=dir 0 0"
+	wantMount := strings.ReplaceAll(dir, " ", `\040`) + " .socket-dirs/" + filepath.Base(dir) + " none bind,create=dir,rprivate 0 0"
 	if !hasMountEntry(items, wantMount) {
 		t.Fatalf("expected rewritten socket dir mount %q, got %#v", wantMount, items)
 	}
@@ -239,6 +240,62 @@ func TestBuildPVEItemsBindMountDefaultsToPrivatePropagation(t *testing.T) {
 	want := strings.ReplaceAll(src, " ", `\040`) + " dev none bind,create=dir,rprivate 0 0"
 	if !hasMountEntry(items, want) {
 		t.Fatalf("expected rprivate bind mount %q, got %#v", want, items)
+	}
+}
+
+// Device bind mounts (e.g. Wolf's /dev/dri, /dev/input, /dev/uinput) live under
+// /dev just like a whole-/dev bind, so they must also be rprivate — otherwise a
+// container that mounts over one of them could leak the mount back to the host
+// and break it, the same failure mode the user-bind propagation fix closed.
+func TestBuildItemsDeviceMountsArePrivate(t *testing.T) {
+	t.Parallel()
+
+	devDir := t.TempDir()             // bound as a device directory (create=dir)
+	devNode := filepath.Join(devDir, "node")
+	if err := os.WriteFile(devNode, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	items := buildItems(&ContainerConfig{
+		Devices: []DeviceSpec{
+			{PathOnHost: devDir, PathInContainer: "/dev/dri"},
+			{PathOnHost: devNode, PathInContainer: "/dev/uinput"},
+		},
+	}, "10.0.0.2")
+
+	wantDir := strings.ReplaceAll(devDir, " ", `\040`) + " dev/dri none bind,create=dir,rprivate 0 0"
+	if !hasMountEntry(items, wantDir) {
+		t.Fatalf("expected rprivate device dir mount %q, got %#v", wantDir, items)
+	}
+	wantNode := strings.ReplaceAll(devNode, " ", `\040`) + " dev/uinput none bind,create=file,rprivate 0 0"
+	if !hasMountEntry(items, wantNode) {
+		t.Fatalf("expected rprivate device node mount %q, got %#v", wantNode, items)
+	}
+}
+
+func TestBuildPVEItemsDeviceMountsArePrivate(t *testing.T) {
+	t.Parallel()
+
+	devDir := t.TempDir()
+	devNode := filepath.Join(devDir, "node")
+	if err := os.WriteFile(devNode, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	items := buildPVEItems(&ContainerConfig{
+		Devices: []DeviceSpec{
+			{PathOnHost: devDir, PathInContainer: "/dev/dri"},
+			{PathOnHost: devNode, PathInContainer: "/dev/uinput"},
+		},
+	}, "10.0.0.2")
+
+	wantDir := strings.ReplaceAll(devDir, " ", `\040`) + " dev/dri none bind,create=dir,rprivate 0 0"
+	if !hasMountEntry(items, wantDir) {
+		t.Fatalf("expected rprivate device dir mount %q, got %#v", wantDir, items)
+	}
+	wantNode := strings.ReplaceAll(devNode, " ", `\040`) + " dev/uinput none bind,create=file,rprivate 0 0"
+	if !hasMountEntry(items, wantNode) {
+		t.Fatalf("expected rprivate device node mount %q, got %#v", wantNode, items)
 	}
 }
 
