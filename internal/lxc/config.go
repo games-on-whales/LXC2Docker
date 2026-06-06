@@ -1044,7 +1044,11 @@ func appendSocketMount(items []configItem, cfg *ContainerConfig, source string, 
 	}
 	if !alreadyMounted {
 		escapedParent := strings.ReplaceAll(parentDir, " ", `\040`)
-		entry := fmt.Sprintf("%s %s none %s 0 0", escapedParent, escapedDest, bindMountOpts("bind,create=dir"))
+		// Socket/runtime dirs keep the shared propagation they inherit (NOT
+		// rprivate): sibling containers must observe the PulseAudio/Wayland
+		// sockets created under XDG_RUNTIME_DIR after the mount. Forcing
+		// rprivate here breaks Wolf audio (sockets never reach sessions).
+		entry := fmt.Sprintf("%s %s none %s 0 0", escapedParent, escapedDest, "bind,create=dir")
 		items = append(items, configItem{"lxc.mount.entry", entry})
 	}
 
@@ -1070,7 +1074,7 @@ func appendSocketDirMount(items []configItem, sourceDir, destDir string, readOnl
 	if readOnly {
 		opts += ",ro"
 	}
-	opts = bindMountOpts(opts)
+	// Shared propagation (see appendSocketMount); do not force rprivate here.
 	escapedSource := strings.ReplaceAll(sourceDir, " ", `\040`)
 	entry := fmt.Sprintf("%s %s none %s 0 0", escapedSource, escapedDest, opts)
 	return append(items, configItem{"lxc.mount.entry", entry})

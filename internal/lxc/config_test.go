@@ -108,7 +108,7 @@ func TestAppendSocketMountMountsRuntimeSocketDirAtRealDestination(t *testing.T) 
 		Destination: "/run/user/wolf/wayland-1",
 	})
 
-	want := strings.ReplaceAll(runtimeDir, " ", `\040`) + " run/user/wolf none bind,create=dir,rprivate 0 0"
+	want := strings.ReplaceAll(runtimeDir, " ", `\040`) + " run/user/wolf none bind,create=dir 0 0"
 	if !hasMountEntry(items, want) {
 		t.Fatalf("expected direct runtime dir mount %q, got %#v", want, items)
 	}
@@ -129,7 +129,7 @@ func TestAppendSocketMountKeepsHiddenSocketMountForTranslatedDestinations(t *tes
 		Destination: "/var/run/wolf/wolf.sock",
 	})
 
-	want := strings.ReplaceAll(runtimeDir, " ", `\040`) + " .socket-dirs/wolf none bind,create=dir,rprivate 0 0"
+	want := strings.ReplaceAll(runtimeDir, " ", `\040`) + " .socket-dirs/wolf none bind,create=dir 0 0"
 	if !hasMountEntry(items, want) {
 		t.Fatalf("expected hidden socket dir mount %q, got %#v", want, items)
 	}
@@ -175,7 +175,7 @@ func TestBuildItemsRewritesRawSocketMounts(t *testing.T) {
 	}
 	items := buildItems(cfg, "10.0.0.2")
 
-	wantMount := strings.ReplaceAll(dir, " ", `\040`) + " .socket-dirs/" + filepath.Base(dir) + " none bind,create=dir,rprivate 0 0"
+	wantMount := strings.ReplaceAll(dir, " ", `\040`) + " .socket-dirs/" + filepath.Base(dir) + " none bind,create=dir 0 0"
 	if !hasMountEntry(items, wantMount) {
 		t.Fatalf("expected rewritten socket dir mount %q, got %#v", wantMount, items)
 	}
