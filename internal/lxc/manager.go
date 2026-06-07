@@ -1578,14 +1578,26 @@ func (m *Manager) StopContainerWithSignal(id string, timeout time.Duration, sign
 
 	rec := m.store.GetContainer(id)
 	if rec != nil && rec.VMID > 0 {
-		out, err := exec.Command("pct", "shutdown",
-			fmt.Sprintf("%d", rec.VMID),
-			"--timeout", fmt.Sprintf("%d", int(timeout.Seconds())),
+		vmid := fmt.Sprintf("%d", rec.VMID)
+		secs := int(timeout.Seconds())
+		if secs <= 0 {
+			secs = 10
+		}
+		// Mirror `docker stop`: a grace period, then a hard stop. --forceStop
+		// makes PVE escalate to a kill once the timeout elapses. Without it PVE
+		// runs `lxc-stop --nokill`, which leaves a container whose init ignores
+		// the shutdown signal (e.g. Wolf) running while still reporting the task
+		// as OK — so the caller believes the stop succeeded but it didn't.
+		out, err := exec.Command("pct", "shutdown", vmid,
+			"--timeout", fmt.Sprintf("%d", secs), "--forceStop", "1",
 		).CombinedOutput()
-		if err != nil {
-			out2, err2 := exec.Command("pct", "stop", fmt.Sprintf("%d", rec.VMID)).CombinedOutput()
+		// Trust the live state, not the exit code: pct's shutdown task can
+		// report success while the container is still up. Force-stop whatever
+		// is left running.
+		if st, _ := m.State(id); st == "running" {
+			out2, err2 := exec.Command("pct", "stop", vmid).CombinedOutput()
 			if err2 != nil {
-				return fmt.Errorf("manager: pct stop %d: %s (shutdown: %s): %w", rec.VMID, out2, out, err2)
+				return fmt.Errorf("manager: pct stop %d: %s (shutdown: %s/%v): %w", rec.VMID, out2, out, err, err2)
 			}
 		}
 		return nil
