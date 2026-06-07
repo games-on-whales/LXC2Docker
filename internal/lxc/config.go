@@ -124,6 +124,13 @@ type ContainerConfig struct {
 	// LogFile is where the container console output is written.
 	// Set automatically by the manager.
 	LogFile string
+	// IDHostnameSource, when set, is bind-mounted at /etc/hostname. The daemon
+	// points it at <statepath>/containers/<id>/hostname so the 64-hex container
+	// ID appears in /proc/self/mountinfo — matching Docker, which is how an app
+	// identifies its own container (e.g. Wolf's get_current_container scans
+	// mountinfo for the ID). Without it such apps can't self-identify. Set by
+	// the manager at create time.
+	IDHostnameSource string
 	// RawConfig contains vetted lxc.* directives to append to the generated
 	// config. SmoothNAS plugin profiles use this for runtime-specific binds
 	// that have no Docker API equivalent.
@@ -506,6 +513,20 @@ func resolveInRootfs(rootfs, containerPath string) (string, error) {
 	return current, nil
 }
 
+// containerIDHostnameMount emits the Docker-style /etc/hostname bind whose
+// source path embeds the container ID. Docker bind-mounts /etc/hostname from
+// /var/lib/docker/containers/<id>/hostname; apps identify their own container by
+// scanning /proc/self/mountinfo for that 64-hex ID (e.g. Wolf, to enable
+// host<->container mount matching). The source file is written at create time by
+// the manager; an empty IDHostnameSource disables the bind.
+func containerIDHostnameMount(cfg *ContainerConfig) []configItem {
+	if cfg.IDHostnameSource == "" {
+		return nil
+	}
+	src := strings.ReplaceAll(cfg.IDHostnameSource, " ", `\040`)
+	return []configItem{{"lxc.mount.entry", src + " etc/hostname none bind,create=file 0 0"}}
+}
+
 func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	var items []configItem
 
@@ -735,6 +756,9 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	items = append(items, tmpfsItems(cfg)...)
 	items = append(items, ulimitItems(cfg)...)
 	items = append(items, rawConfigItems(cfg, cfg.RawConfig)...)
+
+	// Docker-compat: /etc/hostname bind embedding the container ID (self-id).
+	items = append(items, containerIDHostnameMount(cfg)...)
 
 	// Console log so we can serve it via the logs API
 	if cfg.LogFile != "" {
@@ -1381,6 +1405,9 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	items = append(items, tmpfsItems(cfg)...)
 	items = append(items, ulimitItems(cfg)...)
 	items = append(items, rawConfigItems(cfg, cfg.RawConfig)...)
+
+	// Docker-compat: /etc/hostname bind embedding the container ID (self-id).
+	items = append(items, containerIDHostnameMount(cfg)...)
 
 	// Console log.
 	if cfg.LogFile != "" {
