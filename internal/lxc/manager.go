@@ -949,14 +949,18 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 	// New images store a rootfs tarball and are created storage-agnostically
 	// via `pct create` (no Proxmox template CT — templates stay out of the UI).
 	if m.UsePVE() && rec.TemplateTarball != "" {
-		// Fast path: on ZFS storage, ephemeral containers are provisioned by
-		// copy-on-write cloning a once-materialized template dataset instead of
-		// re-extracting the tarball on every launch — near-instant, the bulk of
-		// the Wolf-app launch latency. Requires ZFS (clones are pool-local) and
-		// is skipped for UI-visible Proxmox CTs (gow.pve), which must be real
-		// CTs. Any failure falls back to the storage-agnostic pct-create path.
+		// Fast path: provision by copy-on-write cloning a once-materialized
+		// template instead of re-extracting the tarball on every launch —
+		// near-instant, the bulk of the Wolf-app launch latency.
+		//   - ZFS: raw `zfs clone` of a hidden template dataset (also yields a
+		//     raw-LXC container), skipped for UI-visible Proxmox CTs (gow.pve).
+		//   - lvmthin: linked `pct clone` of a template CT, a normal Proxmox CT.
+		// Any failure falls back to the storage-agnostic pct-create path.
 		if m.pveStorageIsZFS() && !cfg.ProxmoxCT {
 			return m.createZFSCloneFromTarball(id, rec, cfg)
+		}
+		if m.pveStorageSupportsLinkedClone() {
+			return m.createPVELinkedCloneFromTarball(id, rec, cfg)
 		}
 		return m.createPVEFromTarball(id, rec, cfg)
 	}
@@ -1775,6 +1779,14 @@ func (m *Manager) RemoveImage(ref string) error {
 		if rec.TemplateDataset != "" {
 			if out, err := exec.Command("zfs", "destroy", "-r", rec.TemplateDataset).CombinedOutput(); err != nil {
 				log.Printf("RemoveImage: zfs destroy %s: %s: %v (continuing)", rec.TemplateDataset, strings.TrimSpace(string(out)), err)
+			}
+		}
+		// Drop the linked-clone template CT (lvmthin fast path), if one was
+		// materialized. Best-effort: on lvmthin the base volume can be removed
+		// while linked clones still reference its blocks.
+		if rec.TemplateVMID > 0 {
+			if out, err := exec.Command("pct", "destroy", fmt.Sprintf("%d", rec.TemplateVMID), "--force").CombinedOutput(); err != nil {
+				log.Printf("RemoveImage: pct destroy template %d: %s: %v (continuing)", rec.TemplateVMID, strings.TrimSpace(string(out)), err)
 			}
 		}
 		return m.store.RemoveImage(ref)

@@ -57,6 +57,40 @@ func TestSanitizeDatasetToken(t *testing.T) {
 	}
 }
 
+func TestPVEStorageSupportsLinkedClone(t *testing.T) {
+	cases := []struct {
+		stgType string
+		want    bool
+	}{
+		{"lvmthin", true},
+		{"zfspool", false}, // ZFS uses its own raw-clone fast path
+		{"dir", false},
+		{"lvm", false},
+		{"nfs", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		m := &Manager{pveStgType: tc.stgType}
+		if got := m.pveStorageSupportsLinkedClone(); got != tc.want {
+			t.Errorf("pveStorageSupportsLinkedClone(%q) = %v, want %v", tc.stgType, got, tc.want)
+		}
+	}
+}
+
+func TestImageTemplateCTHostname(t *testing.T) {
+	cases := []struct {
+		id, want string
+	}{
+		{"ubuntu_22.04", "dld-tmpl-ubuntu-22-04"},
+		{"ghcr.io/games-on-whales/steam:edge", "dld-tmpl-ghcr-io-games-on-whales-steam-edge"},
+	}
+	for _, tc := range cases {
+		if got := imageTemplateCTHostname(&store.ImageRecord{ID: tc.id}); got != tc.want {
+			t.Errorf("imageTemplateCTHostname(%q) = %q, want %q", tc.id, got, tc.want)
+		}
+	}
+}
+
 func TestImageTemplateDataset(t *testing.T) {
 	m := &Manager{pveStorage: "tank"}
 	got := m.imageTemplateDataset(&store.ImageRecord{ID: "ubuntu_22.04"})
