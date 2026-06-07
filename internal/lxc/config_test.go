@@ -380,3 +380,27 @@ func TestInitUserConfigItems(t *testing.T) {
 		})
 	}
 }
+
+func TestContainerIDHostnameBind(t *testing.T) {
+	t.Parallel()
+
+	src := "/var/lib/docker-lxc-daemon/containers/" + strings.Repeat("a", 64) + "/hostname"
+	want := src + " etc/hostname none bind,create=file 0 0"
+	cfg := &ContainerConfig{IDHostnameSource: src}
+
+	// Both build paths must emit the id-embedded /etc/hostname bind so apps can
+	// self-identify from /proc/self/mountinfo (Docker parity).
+	if !hasMountEntry(buildPVEItems(cfg, "10.0.0.2"), want) {
+		t.Fatalf("buildPVEItems missing id-hostname bind %q", want)
+	}
+	if !hasMountEntry(buildItems(cfg, "10.0.0.2"), want) {
+		t.Fatalf("buildItems missing id-hostname bind %q", want)
+	}
+
+	// With no source, no /etc/hostname bind is emitted.
+	for _, it := range buildPVEItems(&ContainerConfig{}, "10.0.0.2") {
+		if it.key == "lxc.mount.entry" && strings.Contains(it.value, " etc/hostname none bind") {
+			t.Fatalf("unexpected /etc/hostname bind when IDHostnameSource empty: %q", it.value)
+		}
+	}
+}

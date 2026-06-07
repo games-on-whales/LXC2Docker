@@ -973,6 +973,22 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 
 // createPVEContainer creates a full Proxmox CT via pct clone. The container
 // is visible in the Proxmox web UI and managed via pct commands.
+// writeContainerIDHostname writes hostname to <statepath>/containers/<id>/hostname
+// and returns that path, to be bind-mounted at /etc/hostname. The path embeds the
+// container ID so apps can identify their own container from /proc/self/mountinfo
+// (matching Docker's …/containers/<id>/hostname bind).
+func (m *Manager) writeContainerIDHostname(id, hostname string) (string, error) {
+	dir := filepath.Join(m.store.RootDir(), "containers", id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	p := filepath.Join(dir, "hostname")
+	if err := os.WriteFile(p, []byte(hostname+"\n"), 0o644); err != nil {
+		return "", err
+	}
+	return p, nil
+}
+
 func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
 	vmid, err := allocateVMID()
 	if err != nil {
@@ -1018,6 +1034,14 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 		hostname = storeRec.Name
 	}
 	hostname = sanitizeHostname(hostname)
+
+	// Docker-compat: bind /etc/hostname from a path embedding the container ID
+	// so apps can identify their own container via /proc/self/mountinfo.
+	if src, err := m.writeContainerIDHostname(id, hostname); err != nil {
+		log.Printf("createPVEContainer: container hostname for %s: %v", id[:12], err)
+	} else {
+		cfg.IDHostnameSource = src
+	}
 
 	// Build rootfs spec for Proxmox config. The clone inherits the template's
 	// volume size; an explicit DiskSizeGB is recorded in the spec so a later
@@ -1673,6 +1697,9 @@ func (m *Manager) RemoveContainer(id string) error {
 	if state == "running" {
 		return fmt.Errorf("manager: cannot remove running container %s; stop it first", id)
 	}
+
+	// Drop the per-container state dir (the id-embedded /etc/hostname source).
+	os.RemoveAll(filepath.Join(m.store.RootDir(), "containers", id))
 
 	if rec != nil && rec.VMID > 0 {
 		// Proxmox CT — destroy via pct.
