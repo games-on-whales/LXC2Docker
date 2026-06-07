@@ -215,6 +215,12 @@ func detectPVEStorageType(storage string) string {
 // `pct mount` for offline preparation.
 func (m *Manager) pveStorageIsZFS() bool { return m.pveStgType == "zfspool" }
 
+// pveStorageSupportsLinkedClone reports whether the configured PVE storage can
+// back instant copy-on-write linked CT clones via `pct clone` (no --full). Only
+// lvmthin is enabled: ZFS uses its own raw-clone fast path, while dir/lvm/nfs
+// have no CT snapshot primitive and `pct clone` falls back to a full copy there.
+func (m *Manager) pveStorageSupportsLinkedClone() bool { return m.pveStgType == "lvmthin" }
+
 // readPVERootfsSpec extracts the `rootfs:` volume spec from a CT's config — e.g.
 // "storage:vm-123-disk-0,size=4G". This is the volume `pct create` chose for the
 // backing storage (subvol-<vmid> on zfs/dir, vm-<vmid> on lvmthin), preserved
@@ -376,10 +382,19 @@ func (m *Manager) createPVEFromTarball(id string, imgRec *store.ImageRecord, cfg
 	).CombinedOutput(); err != nil {
 		return fmt.Errorf("manager: pct create %d from tarball: %s: %w", vmid, out, err)
 	}
+	return m.finalizePVECT(id, vmid, hostname, cfg)
+}
+
+// finalizePVECT configures an already-created Proxmox CT (vmid) — networking, IP,
+// config, rootfs prep — and persists its store record. Shared by the pct-create
+// and linked-clone tarball paths, which differ only in how the CT's rootfs is
+// provisioned. On any error it destroys the CT.
+func (m *Manager) finalizePVECT(id string, vmid int, hostname string, cfg ContainerConfig) error {
 	cleanup := func() { exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run() }
 
 	var ip string
 	if cfg.NetworkMode != "host" {
+		var err error
 		ip, err = m.store.AllocateIP()
 		if err != nil {
 			cleanup()
@@ -393,7 +408,7 @@ func (m *Manager) createPVEFromTarball(id string, imgRec *store.ImageRecord, cfg
 		return fmt.Errorf("manager: mkdir log dir: %w", err)
 	}
 
-	// Preserve the rootfs volume pct create chose (storage-specific naming).
+	// Preserve the rootfs volume pct chose (storage-specific naming).
 	rootfsSpec, err := readPVERootfsSpec(vmid)
 	if err != nil {
 		cleanup()
@@ -516,4 +531,135 @@ func (m *Manager) createZFSCloneFromTarball(id string, imgRec *store.ImageRecord
 	}
 
 	return m.finalizeRawZFSClone(id, cloneDataset, cloneMountpoint, cfg)
+}
+
+// imageTemplateCTHostname is the (cosmetic) hostname for an image's template CT,
+// so it's identifiable in the Proxmox UI.
+func imageTemplateCTHostname(imgRec *store.ImageRecord) string {
+	return sanitizeHostname("dld-tmpl-" + sanitizeDatasetToken(imgRec.ID))
+}
+
+// ensureImageTemplateCT materializes an image's rootfs tarball into a Proxmox
+// template CT exactly once and returns its VMID. The template's base volume is
+// the copy-on-write origin that every container of that image is linked-cloned
+// from. Subsequent calls (and launches after a daemon restart) detect the
+// existing template and return immediately. Serialized by tmplMu so concurrent
+// launches of the same image can't race the create/template sequence.
+//
+// Unlike the ZFS scheme (a hidden dataset), a CT template is visible in the
+// Proxmox UI — the cost of staying on the supported `pct clone` path for
+// block-device storages that expose no raw clone primitive the daemon can drive.
+func (m *Manager) ensureImageTemplateCT(imgRec *store.ImageRecord) (int, error) {
+	m.tmplMu.Lock()
+	defer m.tmplMu.Unlock()
+
+	// Already materialized? (record carries the VMID and its config still exists)
+	if rec := m.store.GetImage(imgRec.Ref); rec != nil && rec.TemplateVMID > 0 {
+		if _, err := os.Stat(pveConfigPath(rec.TemplateVMID)); err == nil {
+			return rec.TemplateVMID, nil
+		}
+	}
+
+	vmid, err := allocateVMID()
+	if err != nil {
+		return 0, fmt.Errorf("manager: %w", err)
+	}
+
+	sizeGB := tarballRootfsGB(imgRec.TemplateTarball)
+	log.Printf("ensureImageTemplateCT: pct create template %d from tarball for %s (rootfs %dG)", vmid, imgRec.Ref, sizeGB)
+	if out, err := exec.Command("pct", "create", fmt.Sprintf("%d", vmid), imgRec.TemplateTarball,
+		"--storage", m.pveStorage,
+		"--ostype", "unmanaged",
+		"--arch", "amd64",
+		"--hostname", imageTemplateCTHostname(imgRec),
+		"--unprivileged", "0",
+		"--rootfs", fmt.Sprintf("%s:%d", m.pveStorage, sizeGB),
+	).CombinedOutput(); err != nil {
+		return 0, fmt.Errorf("manager: pct create template %d: %s: %w", vmid, strings.TrimSpace(string(out)), err)
+	}
+	destroy := func() { exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run() }
+
+	// Tag the template so reapOrphanCTs recognizes it as ours and can clean it
+	// up if the image record is lost before TemplateVMID is persisted below.
+	if out, err := exec.Command("pct", "set", fmt.Sprintf("%d", vmid), "--tags", ManagedTag).CombinedOutput(); err != nil {
+		log.Printf("ensureImageTemplateCT: tag template %d: %s: %v (continuing)", vmid, strings.TrimSpace(string(out)), err)
+	}
+
+	// Convert to a template so `pct clone` can make instant linked (CoW) clones.
+	if out, err := exec.Command("pct", "template", fmt.Sprintf("%d", vmid)).CombinedOutput(); err != nil {
+		destroy()
+		return 0, fmt.Errorf("manager: pct template %d: %s: %w", vmid, strings.TrimSpace(string(out)), err)
+	}
+
+	// Record the template VMID so it's reused, and so RemoveImage and the reaper
+	// can find it (a referenced VMID is never reaped).
+	if rec := m.store.GetImage(imgRec.Ref); rec != nil {
+		rec.TemplateVMID = vmid
+		if err := m.store.AddImage(rec); err != nil {
+			destroy()
+			return 0, fmt.Errorf("manager: persist template vmid: %w", err)
+		}
+	}
+	log.Printf("ensureImageTemplateCT: materialized template CT %d for %s", vmid, imgRec.Ref)
+	return vmid, nil
+}
+
+// createPVELinkedCloneFromTarball provisions a Proxmox CT by linked-cloning the
+// image's template CT — an instant copy-on-write clone instead of re-extracting
+// the rootfs tarball with `pct create` on every launch. Used on snapshot-capable
+// block storages (lvmthin) where the ZFS raw-clone fast path doesn't apply. The
+// container is a normal CT, visible and managed via pct exactly like the
+// pct-create path. Any failure falls back to that path so a launch never
+// hard-fails on the fast path.
+func (m *Manager) createPVELinkedCloneFromTarball(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
+	tmplVMID, err := m.ensureImageTemplateCT(imgRec)
+	if err != nil {
+		log.Printf("createPVELinkedCloneFromTarball: template prep failed (%v); falling back to pct create", err)
+		return m.createPVEFromTarball(id, imgRec, cfg)
+	}
+
+	vmid, err := allocateVMID()
+	if err != nil {
+		return fmt.Errorf("manager: %w", err)
+	}
+	// Record the VMID up front so gc() doesn't reap the half-built record
+	// mid-clone (same rationale as createPVEFromTarball).
+	if storeRec := m.store.GetContainer(id); storeRec != nil {
+		storeRec.VMID = vmid
+		if err := m.store.AddContainer(storeRec); err != nil {
+			return fmt.Errorf("manager: persist vmid: %w", err)
+		}
+	}
+
+	// Fill in LAN config before the IP allocation in finalizePVECT keys off
+	// cfg.NetworkMode (may convert --network=host to a LAN NIC).
+	applyLANNetworking(&cfg, m.lan, vmid)
+
+	hostname := id[:12]
+	if storeRec := m.store.GetContainer(id); storeRec != nil {
+		hostname = storeRec.Name
+	}
+	hostname = sanitizeHostname(hostname)
+
+	// Linked clone: no --full (copy-on-write) and no --storage (a linked clone
+	// must stay on the template's storage; passing --storage is rejected by pct).
+	log.Printf("CreateContainer[linked-clone]: pct clone %d → %d for %s", tmplVMID, vmid, id[:12])
+	if out, err := exec.Command("pct", "clone", fmt.Sprintf("%d", tmplVMID), fmt.Sprintf("%d", vmid),
+		"--hostname", hostname,
+	).CombinedOutput(); err != nil {
+		log.Printf("createPVELinkedCloneFromTarball: pct clone failed (%s: %v); falling back to pct create", strings.TrimSpace(string(out)), err)
+		exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run()
+		return m.createPVEFromTarball(id, imgRec, cfg)
+	}
+
+	// The clone inherits the template's image-minimum rootfs; grow it if a larger
+	// size was requested (--storage-opt size). Best-effort: a failed grow leaves
+	// the image-minimum rootfs rather than failing the launch.
+	if want := resolveRootfsGB(cfg, imgRec.TemplateTarball); want > tarballRootfsGB(imgRec.TemplateTarball) {
+		if out, err := exec.Command("pct", "resize", fmt.Sprintf("%d", vmid), "rootfs", fmt.Sprintf("%dG", want)).CombinedOutput(); err != nil {
+			log.Printf("createPVELinkedCloneFromTarball: resize %d rootfs to %dG: %s: %v (continuing)", vmid, want, strings.TrimSpace(string(out)), err)
+		}
+	}
+
+	return m.finalizePVECT(id, vmid, hostname, cfg)
 }
