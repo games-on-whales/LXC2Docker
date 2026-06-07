@@ -281,10 +281,14 @@ func rewriteConfig(path string, cfg *ContainerConfig, ip, containerName string, 
 
 	items := append([]configItem{
 		{"lxc.apparmor.profile", "unconfined"},
-		// Override common.conf's cgroup:mixed which fails on Proxmox cgroup v2.
-		// An empty value clears the inherited list; then we set what we need.
+		// Clear common.conf's inherited cgroup auto-mount, then set our own.
+		// Use cgroup:mixed, not cgroup:rw: rw mounts the whole hierarchy and on
+		// the PVE path makes a freshly-created uinput device stat() as 0:0, so
+		// controllers go undetected; mixed gives nested runtimes a writable
+		// own-cgroup without that side effect. It needs the private cgroup
+		// namespace we emit below, or LXC aborts the cgroup mount on cgroup v2.
 		{"lxc.mount.auto", ""},
-		{"lxc.mount.auto", "proc:mixed sys:mixed cgroup:rw"},
+		{"lxc.mount.auto", "proc:mixed sys:mixed cgroup:mixed"},
 	}, buildItems(cfg, ip)...)
 	// Note: buildItems may populate cfg.SocketLinks (for socket bind mounts).
 
@@ -549,12 +553,12 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	// be shared (Docker's NetworkMode/IpcMode/UTSMode/PidMode "host").
 	if cfg.NetworkMode == "host" || cfg.IpcMode == "host" || cfg.UTSMode == "host" || cfg.PidMode == "host" {
 		// Always give the container its own cgroup namespace. On cgroup v2,
-		// mounting the unified hierarchy rw (lxc.mount.auto = ...cgroup:rw, set
-		// by rewriteConfig) needs a private cgroup namespace; without one LXC
-		// tries to force-mount it, which "is currently not supported", and the
-		// container ABORTs. This bit Wolf's app/compositor sibling containers,
-		// which share a host namespace (so this explicit clone list is emitted)
-		// but were left sharing the host cgroup namespace.
+		// mounting the cgroup hierarchy (lxc.mount.auto = ...cgroup:mixed) needs
+		// a private cgroup namespace; without one LXC tries to force-mount it,
+		// which "is currently not supported", and the container ABORTs. This bit
+		// Wolf's app/compositor sibling containers, which share a host namespace
+		// (so this explicit clone list is emitted) but were left sharing the
+		// host cgroup namespace.
 		ns := []string{"mnt", "cgroup"}
 		if cfg.NetworkMode != "host" {
 			ns = append(ns, "net")
@@ -1243,7 +1247,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 
 	items = append(items, configItem{"lxc.apparmor.profile", "unconfined"})
 	items = append(items, configItem{"lxc.mount.auto", ""})
-	items = append(items, configItem{"lxc.mount.auto", "proc:mixed sys:mixed cgroup:rw"})
+	items = append(items, configItem{"lxc.mount.auto", "proc:mixed sys:mixed cgroup:mixed"})
 
 	// /dev/shm
 	items = append(items, configItem{"lxc.mount.entry", shmMountEntry(cfg.ShmSize)})
