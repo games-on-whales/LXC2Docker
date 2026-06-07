@@ -1583,52 +1583,59 @@ func (m *Manager) StopContainerWithSignal(id string, timeout time.Duration, sign
 	rec := m.store.GetContainer(id)
 	if rec != nil && rec.VMID > 0 {
 		vmid := fmt.Sprintf("%d", rec.VMID)
-		secs := int(timeout.Seconds())
-		if secs <= 0 {
-			secs = 10
+		// Docker semantics: deliver the container's stop signal (default
+		// SIGTERM) to its init PID, wait up to the timeout, then hard-stop.
+		// `pct shutdown` / lxc-stop send SIGPWR (the LXC halt signal), which
+		// only systemd-style inits treat as a shutdown request; application
+		// inits (supervisord, Wolf, ...) don't handle SIGPWR and PID 1 ignores
+		// unhandled signals, so graceful shutdown never runs and we always fall
+		// through to a hard kill. Sending the real signal to init ourselves
+		// matches Docker and lets in-container handlers run.
+		sig := signal
+		if sig == "" {
+			sig = "SIGTERM"
 		}
-		// Mirror `docker stop`: a grace period, then a hard stop. --forceStop
-		// makes PVE escalate to a kill once the timeout elapses. Without it PVE
-		// runs `lxc-stop --nokill`, which leaves a container whose init ignores
-		// the shutdown signal (e.g. Wolf) running while still reporting the task
-		// as OK — so the caller believes the stop succeeded but it didn't.
-		out, err := exec.Command("pct", "shutdown", vmid,
-			"--timeout", fmt.Sprintf("%d", secs), "--forceStop", "1",
-		).CombinedOutput()
-		// Trust the live state, not the exit code: pct's shutdown task can
-		// report success while the container is still up. Force-stop whatever
-		// is left running.
-		if st, _ := m.State(id); st == "running" {
-			out2, err2 := exec.Command("pct", "stop", vmid).CombinedOutput()
-			if err2 != nil {
-				return fmt.Errorf("manager: pct stop %d: %s (shutdown: %s/%v): %w", rec.VMID, out2, out, err, err2)
-			}
-		}
-		return nil
-	}
-
-	if signal != "" && signal != "SIGTERM" && signal != "TERM" && signal != "15" {
-		if err := m.KillContainer(id, signal); err != nil {
-			return err
+		if err := m.KillContainer(id, sig); err != nil {
+			log.Printf("manager: stop %s: signal %s to init failed: %v (forcing)", id, sig, err)
 		}
 		deadline := time.Now().Add(timeout)
 		for time.Now().Before(deadline) {
-			if s, _ := m.State(id); s != "running" {
+			if st, _ := m.State(id); st != "running" {
 				return nil
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
-		out, err := exec.Command("lxc-stop", "--kill", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
+		// Grace period elapsed: hard stop.
+		out, err := exec.Command("pct", "stop", vmid).CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("manager: force stop %s: %s: %w", id, out, err)
+			return fmt.Errorf("manager: pct stop %d: %s: %w", rec.VMID, out, err)
 		}
 		return nil
 	}
 
-	out, err := exec.Command("lxc-stop", "-n", id, "--lxcpath", m.lxcPath,
-		"-t", fmt.Sprintf("%d", int(timeout.Seconds()))).CombinedOutput()
+	// Raw LXC (non-PVE) container: same Docker semantics as the PVE branch.
+	// Deliver the stop signal (default SIGTERM) to init, wait up to the
+	// timeout, then force-kill. Plain `lxc-stop` sends SIGPWR (the LXC halt
+	// signal), which application inits ignore, so it never stops them
+	// gracefully. KillContainer already routes SIGKILL to `lxc-stop --kill`
+	// and other signals to `kill -<sig> <initPID>`.
+	sig := signal
+	if sig == "" {
+		sig = "SIGTERM"
+	}
+	if err := m.KillContainer(id, sig); err != nil {
+		log.Printf("manager: stop %s: signal %s to init failed: %v (forcing)", id, sig, err)
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if s, _ := m.State(id); s != "running" {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	out, err := exec.Command("lxc-stop", "--kill", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: stop %s: %s: %w", id, out, err)
+		return fmt.Errorf("manager: force stop %s: %s: %w", id, out, err)
 	}
 	return nil
 }
