@@ -4,9 +4,17 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
+
+// lanDHCPHookPath is the lxc.hook.start-host script that DHCPs the LAN NIC from
+// inside the container's network namespace (see writeLANDHCPHook). Lives under
+// the daemon state dir so it persists across reboots. A var (not const) so tests
+// can redirect it to a temp dir.
+var lanDHCPHookPath = "/var/lib/docker-lxc-daemon/lan-dhcp-hook.sh"
 
 const (
 	DefaultNetworkName = "veth0"
@@ -176,6 +184,11 @@ func RemovePortForwards(containerIP string) error {
 // historical "<prefix>.<vmid>/<subnet>" derivation.
 func resolveLANIP(cfg *ContainerConfig, lan LANConfig, vmid int) string {
 	if req := strings.TrimSpace(cfg.LANIPRequest); req != "" {
+		// "dhcp" (gow.lan.ip=dhcp) requests a DHCP lease on the LAN instead of a
+		// daemon-assigned static address; DualNICConfig wires the client hook.
+		if strings.EqualFold(req, "dhcp") {
+			return "dhcp"
+		}
 		if strings.Contains(req, "/") {
 			return req
 		}
@@ -233,10 +246,22 @@ func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem
 		{"lxc.net.0.type", "veth"},
 		{"lxc.net.0.link", lanBridge},
 		{"lxc.net.0.flags", "up"},
-		{"lxc.net.0.ipv4.address", lanIP},
 	}
-	if lanGateway != "" {
-		items = append(items, configItem{"lxc.net.0.ipv4.gateway", lanGateway})
+	if lanIP == "dhcp" {
+		// DHCP: bring the NIC up with a known name but no static address, and
+		// attach a start-host hook that runs a DHCP client inside the container's
+		// netns (the unmanaged gow images ship no DHCP client of their own).
+		items = append(items, configItem{"lxc.net.0.name", "eth0"})
+		if err := writeLANDHCPHook(); err != nil {
+			log.Printf("DualNICConfig: LAN DHCP hook write failed: %v (LAN NIC will come up without an address)", err)
+		} else {
+			items = append(items, configItem{"lxc.hook.start-host", lanDHCPHookPath})
+		}
+	} else {
+		items = append(items, configItem{"lxc.net.0.ipv4.address", lanIP})
+		if lanGateway != "" {
+			items = append(items, configItem{"lxc.net.0.ipv4.gateway", lanGateway})
+		}
 	}
 	// net.1 = internal managed bridge (no gateway — connected route only).
 	items = append(items,
@@ -246,4 +271,23 @@ func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem
 		configItem{"lxc.net.1.ipv4.address", internalIP + "/24"},
 	)
 	return items
+}
+
+// lanDHCPHookScript runs as an lxc.hook.start-host hook: it DHCPs the LAN NIC
+// (eth0) from inside the container's network namespace using the host's dhcpcd
+// (the unmanaged gow images have no DHCP client). --nohook resolv.conf keeps it
+// from rewriting the host's DNS config; dhcpcd daemonizes to renew the lease.
+const lanDHCPHookScript = `#!/bin/sh
+[ -n "$LXC_PID" ] || exit 0
+command -v dhcpcd >/dev/null 2>&1 || exit 0
+nsenter -t "$LXC_PID" -n dhcpcd --nohook resolv.conf -q eth0 >/dev/null 2>&1 &
+exit 0
+`
+
+// writeLANDHCPHook writes the DHCP start-host hook script idempotently.
+func writeLANDHCPHook() error {
+	if err := os.MkdirAll(filepath.Dir(lanDHCPHookPath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(lanDHCPHookPath, []byte(lanDHCPHookScript), 0o755)
 }
