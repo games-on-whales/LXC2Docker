@@ -280,12 +280,14 @@ func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem
 const lanDHCPHookScript = `#!/bin/sh
 [ -n "$LXC_PID" ] || exit 0
 command -v dhcpcd >/dev/null 2>&1 || exit 0
-# One-shot lease (-1): dhcpcd exits right after configuring the address, so it
-# leaves no lingering host-wide master to collide with the next container start
-# (dhcpcd keys its control state on the interface name, which repeats as "eth0"
-# across netns). The lease lands within ~1-2s — before Wolf's much later mDNS
-# bind — so the LAN address is advertised. Background so we don't delay startup.
-nsenter -t "$LXC_PID" -n dhcpcd -1 -q --nohook resolv.conf eth0 >/dev/null 2>&1 &
+# One-shot lease (-1): dhcpcd configures the address then exits, leaving no
+# lingering host-wide master to collide with the next container start (dhcpcd
+# keys its control state on the interface name, which repeats as "eth0" across
+# netns). Run it SYNCHRONOUSLY (no &): -1 does not self-daemonize, so
+# backgrounding would let LXC kill it before the lease completes. -t 10 bounds
+# the wait; exit 0 so a DHCP failure never aborts container start. The lease
+# lands (~2-5s) before Wolf's later mDNS bind, so the LAN address is advertised.
+nsenter -t "$LXC_PID" -n dhcpcd -1 -t 10 -q --nohook resolv.conf eth0 >/dev/null 2>&1
 exit 0
 `
 
