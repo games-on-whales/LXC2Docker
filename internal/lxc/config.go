@@ -1109,12 +1109,14 @@ func appendSocketDirMount(items []configItem, sourceDir, destDir string, readOnl
 }
 
 // autoMountDeviceDirs inspects wildcard cgroup rules (like "c 13:* rwm") and
-// bind-mounts the corresponding host device directories so device nodes are
-// visible inside the container. In Docker, cgroup rules + MKNOD cap suffice
-// because Docker populates /dev from the host; LXC containers have their own
-// /dev from the rootfs, so the files must be explicitly mounted.
+// gives the container a private tmpfs at the corresponding device directory so
+// the workload can create device nodes there. In Docker, cgroup rules + MKNOD
+// cap suffice because each container gets its own private /dev; LXC containers
+// share the host /dev tree, so we mount a private tmpfs to reproduce that
+// isolation (a bind of the host dir would be the shared global devtmpfs).
 func autoMountDeviceDirs(rules []string) []configItem {
-	// Map well-known device major numbers to host directories.
+	// Map well-known device major numbers to the in-container directory that
+	// holds nodes of that major.
 	majorDirMap := map[string]string{
 		"13": "/dev/input", // evdev input devices (keyboard, mouse, gamepad)
 	}
@@ -1134,26 +1136,24 @@ func autoMountDeviceDirs(rules []string) []configItem {
 		if !ok || mounted[dir] {
 			continue
 		}
-		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
-			continue
-		}
 		mounted[dir] = true
 		destRel := strings.TrimPrefix(dir, "/")
+		// Mount a PRIVATE tmpfs here rather than bind-mounting the host's real
+		// device directory. /dev/input on the host is the single global devtmpfs;
+		// gow/Wolf manages its virtual input nodes per container by exec'ing
+		// `mknod`/`rm` inside it (one container's controller plug/unplug), exactly
+		// as it would against Docker's private per-container /dev. Bind-mounting
+		// the shared devtmpfs makes those node operations leak across every
+		// container and the host, so one session's unplug deletes the node out
+		// from under another still-running session — controllers and keyboard die
+		// "off and on". A private tmpfs isolates them. It must allow device nodes,
+		// so no `nodev`. The matching `c <major>:* rwm` wildcard (emitted from
+		// DeviceCgroupRules) already authorises any minor Wolf creates here, so no
+		// per-node cgroup rule is needed.
 		items = append(items, configItem{
 			"lxc.mount.entry",
-			fmt.Sprintf("%s %s none %s 0 0", dir, destRel, bindMountOpts("bind,create=dir")),
+			fmt.Sprintf("tmpfs %s tmpfs rw,nosuid,relatime,mode=0755,create=dir 0 0", destRel),
 		})
-		// Add per-device cgroup rules for each node in the directory.
-		if entries, err := os.ReadDir(dir); err == nil {
-			for _, entry := range entries {
-				if entry.IsDir() {
-					continue
-				}
-				if rule := deviceCgroupEntry(filepath.Join(dir, entry.Name())); rule != "" {
-					items = append(items, configItem{"lxc.cgroup2.devices.allow", rule})
-				}
-			}
-		}
 	}
 	return items
 }

@@ -299,6 +299,41 @@ func TestBuildPVEItemsDeviceMountsArePrivate(t *testing.T) {
 	}
 }
 
+func TestAutoMountDeviceDirsUsesPrivateTmpfs(t *testing.T) {
+	t.Parallel()
+
+	items := autoMountDeviceDirs([]string{"c 13:* rwm"})
+
+	// /dev/input must be a private tmpfs, NOT a bind of the host's shared
+	// devtmpfs. A bind makes Wolf's per-container mknod/rm of virtual input
+	// nodes leak across every container and the host, so one session's
+	// controller unplug deletes the node out from under another session.
+	want := "tmpfs dev/input tmpfs rw,nosuid,relatime,mode=0755,create=dir 0 0"
+	if !hasMountEntry(items, want) {
+		t.Fatalf("expected private tmpfs mount %q, got %#v", want, items)
+	}
+
+	for _, item := range items {
+		if item.key == "lxc.mount.entry" && strings.Contains(item.value, "/dev/input ") {
+			t.Fatalf("did not expect a host /dev/input bind mount, got %q", item.value)
+		}
+		// The `c 13:* rwm` wildcard (emitted from DeviceCgroupRules) already
+		// covers any minor; no per-node cgroup allow should be enumerated here.
+		if item.key == "lxc.cgroup2.devices.allow" {
+			t.Fatalf("did not expect per-node cgroup rule from autoMountDeviceDirs, got %q", item.value)
+		}
+	}
+}
+
+func TestAutoMountDeviceDirsIgnoresNonWildcardAndUnknownMajors(t *testing.T) {
+	t.Parallel()
+
+	// A specific minor (not "*") and an unmapped major must not produce a mount.
+	if items := autoMountDeviceDirs([]string{"c 13:64 rwm", "c 99:* rwm"}); len(items) != 0 {
+		t.Fatalf("expected no mounts, got %#v", items)
+	}
+}
+
 func TestMountPropagationOpt(t *testing.T) {
 	t.Parallel()
 
