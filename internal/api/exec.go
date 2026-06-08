@@ -188,7 +188,7 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		})
 		h.execs.update(rec.ID, func(r *execRecord) { r.Pty = nil })
 	} else {
-		runExecMux(cmd, conn, func() {
+		runExecMux(cmd, conn, rec.AttachStdin, func() {
 			h.execs.update(rec.ID, func(r *execRecord) {
 				if cmd.Process != nil {
 					r.Pid = cmd.Process.Pid
@@ -326,12 +326,21 @@ func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter, onReady func(*os.File)) {
 }
 
 // runExecMux runs cmd with pipes and multiplexes stdout/stderr into the
-// Docker raw-stream format. Used when Tty=false.
-func runExecMux(cmd *exec.Cmd, conn io.ReadWriter, onStart func()) {
+// Docker raw-stream format. Used when Tty=false. When attachStdin is set the
+// hijacked connection is forwarded to the command's stdin (raw, not framed —
+// matching how Docker streams exec stdin), so `docker exec -i` works.
+func runExecMux(cmd *exec.Cmd, conn io.ReadWriter, attachStdin bool, onStart func()) {
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
+
+	var stdinW *io.PipeWriter
+	if attachStdin {
+		var stdinR *io.PipeReader
+		stdinR, stdinW = io.Pipe()
+		cmd.Stdin = stdinR
+	}
 
 	if err := cmd.Start(); err != nil {
 		writeLogFrame(conn, 2, []byte("error: "+err.Error()+"\n"))
@@ -339,6 +348,16 @@ func runExecMux(cmd *exec.Cmd, conn io.ReadWriter, onStart func()) {
 	}
 	if onStart != nil {
 		onStart()
+	}
+
+	// Forward the client's stdin to the command. The copy ends when the client
+	// half-closes (EOF) or the connection drops; closing stdinW then gives the
+	// command EOF on stdin.
+	if stdinW != nil {
+		go func() {
+			io.Copy(stdinW, conn)
+			stdinW.Close()
+		}()
 	}
 
 	var wg sync.WaitGroup
