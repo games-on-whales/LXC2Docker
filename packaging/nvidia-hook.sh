@@ -21,7 +21,11 @@
 # libraries + device nodes, runs ldconfig to create the SONAME symlinks, and
 # installs the GLVND/EGL vendor configs — all matched to the running host driver,
 # so it keeps working across driver upgrades with no daemon change.
-set -eu
+#
+# This hook is deliberately fault-tolerant: a GPU-injection problem must never
+# stop the container from starting (it would just come up without the GPU), so
+# we do not use `set -e` and we swallow the toolkit's expected ldcache failure.
+set -u
 
 rootfs="${LXC_ROOTFS_MOUNT:-}"
 if [ -z "$rootfs" ]; then
@@ -74,12 +78,30 @@ else
 	IFS=$OLDIFS
 fi
 
+# Inject the driver libraries, device nodes, and base symlinks into the rootfs.
+#
 # --no-cgroups: the container's device cgroup is managed by LXC (privileged
-# containers already allow all devices), so let the toolkit only handle the
-# rootfs (libraries, device nodes, ldconfig) and not touch cgroups.
-exec nvidia-container-cli --load-kmods configure \
+# containers already allow all devices), so the toolkit only touches the rootfs.
+#
+# We intentionally do NOT let this command's exit status abort the hook. Its
+# final "ldcache" step runs ldconfig through a privileged mount-based chroot that
+# fails with EPERM inside an lxc.hook.mount ("mount operation failed: /:
+# permission denied") — but only AFTER the libraries and device nodes are already
+# in place. So it returns non-zero while having done the part we need; aborting
+# here (set -e / exec) would brick the container in a start loop.
+nvidia-container-cli --load-kmods configure \
 	--ldconfig=@/sbin/ldconfig \
 	--no-cgroups \
 	--device="$devices" \
 	"$@" \
-	"$rootfs"
+	"$rootfs" || echo "nvidia-hook: nvidia-container-cli returned non-zero (ldcache step expected to fail in a mount hook); continuing" >&2
+
+# Build the SONAME symlinks (e.g. libcuda.so.1 -> libcuda.so.NNN) and ld.so.cache
+# ourselves. `ldconfig -r` chroots into the rootfs with a plain chroot(2) — it
+# does NOT need the privileged mount the toolkit's own ldcache step uses, so it
+# succeeds here where that step could not. Without these symlinks dlopen of the
+# SONAMEs (libcuda.so.1, libnvidia-encode.so.1, ...) fails and CUDA/NVENC/EGL go
+# unused.
+ldconfig -r "$rootfs" || echo "nvidia-hook: ldconfig -r failed" >&2
+
+exit 0
