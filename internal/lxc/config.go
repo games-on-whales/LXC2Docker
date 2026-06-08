@@ -583,6 +583,10 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 		items = append(items, configItem{"lxc.environment", e})
 	}
 
+	// NVIDIA GPU: inject the host driver userspace when the container opted in
+	// (NVIDIA_VISIBLE_DEVICES). Emitted after env so the hook can read it back.
+	items = append(items, nvidiaGPUItems(cfg)...)
+
 	// Entrypoint + cmd: combined into lxc.init.cmd.
 	// LXC runs this as the container's PID 1.
 	if combined := combinedCmd(cfg.Entrypoint, cfg.Cmd); combined != "" {
@@ -920,6 +924,51 @@ func mountPropagationOpt(p string) string {
 // leading option set, e.g. "bind,create=dir".
 func bindMountOpts(base string) string {
 	return base + "," + defaultMountPropagation
+}
+
+// nvidiaHookPath is the host path to the LXC mount hook that injects the NVIDIA
+// userspace driver into a GPU container. Shipped by the Makefile / .deb at the
+// same absolute path the daemon references here.
+const nvidiaHookPath = "/usr/libexec/docker-lxc-daemon/nvidia-hook.sh"
+
+// nvidiaGPUItems returns the LXC config that grants a container access to the
+// host's NVIDIA GPU. A container opts in the games-on-whales / NVIDIA
+// container-toolkit way — by setting NVIDIA_VISIBLE_DEVICES, which `--gpus` and
+// compose's `deploy.devices[driver:nvidia]` set alongside the libnvidia env.
+//
+// Binding /dev/dri (or /dev/nvidia*) alone is not enough: the NVIDIA driver
+// *userspace* (libcuda, libnvidia-encode, EGL/GLX, GLVND configs) must be
+// injected too, or CUDA/EGL init fails and GPU apps such as Wolf's compositor
+// black-screen. Instead of hardcoding a driver-version-specific file list, we
+// defer to nvidia-container-cli via an lxc.hook.mount that runs against the
+// freshly mounted rootfs — the same mechanism Docker's nvidia-container-runtime
+// uses. The hook self-skips when the toolkit is absent or the selection is
+// "void", so emitting it unconditionally for opted-in containers is safe.
+func nvidiaGPUItems(cfg *ContainerConfig) []configItem {
+	if !nvidiaGPURequested(cfg.Env) {
+		return nil
+	}
+	return []configItem{{"lxc.hook.mount", nvidiaHookPath}}
+}
+
+// nvidiaGPURequested reports whether the container opted into NVIDIA GPU access.
+// An empty or "void" NVIDIA_VISIBLE_DEVICES means no GPU (matching the toolkit's
+// own semantics).
+func nvidiaGPURequested(env []string) bool {
+	v := envValue(env, "NVIDIA_VISIBLE_DEVICES")
+	return v != "" && v != "void"
+}
+
+// envValue returns the value of key from a Docker-style ["K=V", ...] env slice,
+// or "" if unset.
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return strings.TrimPrefix(e, prefix)
+		}
+	}
+	return ""
 }
 
 func shmMountEntry(size int64) string {
@@ -1280,6 +1329,10 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 		}
 		items = append(items, configItem{"lxc.environment", e})
 	}
+
+	// NVIDIA GPU: inject the host driver userspace when the container opted in
+	// (NVIDIA_VISIBLE_DEVICES). Emitted after env so the hook can read it back.
+	items = append(items, nvidiaGPUItems(cfg)...)
 
 	// Init command.
 	if combined := combinedCmd(cfg.Entrypoint, cfg.Cmd); combined != "" {
