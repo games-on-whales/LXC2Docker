@@ -4,17 +4,10 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"os/exec"
-	"path/filepath"
+	"strconv"
 	"strings"
 )
-
-// lanDHCPHookPath is the lxc.hook.start-host script that DHCPs the LAN NIC from
-// inside the container's network namespace (see writeLANDHCPHook). Lives under
-// the daemon state dir so it persists across reboots. A var (not const) so tests
-// can redirect it to a temp dir.
-var lanDHCPHookPath = "/var/lib/docker-lxc-daemon/lan-dhcp-hook.sh"
 
 const (
 	DefaultNetworkName = "veth0"
@@ -248,15 +241,11 @@ func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem
 		{"lxc.net.0.flags", "up"},
 	}
 	if lanIP == "dhcp" {
-		// DHCP: bring the NIC up with a known name but no static address, and
-		// attach a start-host hook that runs a DHCP client inside the container's
-		// netns (the unmanaged gow images ship no DHCP client of their own).
+		// DHCP: bring the NIC up with a known name but no static address. The
+		// lease itself is obtained by the daemon after start (see maybeLANDHCP) —
+		// PVE silently rejects custom lxc.hook.* directives, and the unmanaged gow
+		// images ship no DHCP client, so the daemon runs one in the netns.
 		items = append(items, configItem{"lxc.net.0.name", "eth0"})
-		if err := writeLANDHCPHook(); err != nil {
-			log.Printf("DualNICConfig: LAN DHCP hook write failed: %v (LAN NIC will come up without an address)", err)
-		} else {
-			items = append(items, configItem{"lxc.hook.start-host", lanDHCPHookPath})
-		}
 	} else {
 		items = append(items, configItem{"lxc.net.0.ipv4.address", lanIP})
 		if lanGateway != "" {
@@ -273,28 +262,24 @@ func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem
 	return items
 }
 
-// lanDHCPHookScript runs as an lxc.hook.start-host hook: it DHCPs the LAN NIC
-// (eth0) from inside the container's network namespace using the host's dhcpcd
-// (the unmanaged gow images have no DHCP client). --nohook resolv.conf keeps it
-// from rewriting the host's DNS config; dhcpcd daemonizes to renew the lease.
-const lanDHCPHookScript = `#!/bin/sh
-[ -n "$LXC_PID" ] || exit 0
-command -v dhcpcd >/dev/null 2>&1 || exit 0
-# One-shot lease (-1): dhcpcd configures the address then exits, leaving no
-# lingering host-wide master to collide with the next container start (dhcpcd
-# keys its control state on the interface name, which repeats as "eth0" across
-# netns). Run it SYNCHRONOUSLY (no &): -1 does not self-daemonize, so
-# backgrounding would let LXC kill it before the lease completes. -t 10 bounds
-# the wait; exit 0 so a DHCP failure never aborts container start. The lease
-# lands (~2-5s) before Wolf's later mDNS bind, so the LAN address is advertised.
-nsenter -t "$LXC_PID" -n dhcpcd -1 -t 10 -q --nohook resolv.conf eth0 >/dev/null 2>&1
-exit 0
-`
-
-// writeLANDHCPHook writes the DHCP start-host hook script idempotently.
-func writeLANDHCPHook() error {
-	if err := os.MkdirAll(filepath.Dir(lanDHCPHookPath), 0o755); err != nil {
-		return err
+// leaseLANDHCP obtains a DHCP lease for the LAN NIC (eth0) from inside the
+// container's network namespace, using the host's dhcpcd (the unmanaged gow
+// images ship no DHCP client, and PVE silently rejects custom lxc.hook.*
+// directives — so the daemon drives the client itself after start).
+//
+// One-shot (-1): dhcpcd configures the address then exits, leaving no lingering
+// host-wide master to collide with the next start (dhcpcd keys its control state
+// on the interface name, which repeats as "eth0" across netns). Synchronous and
+// bounded (-t), so the lease lands before the workload's later mDNS bind.
+// --nohook resolv.conf keeps it from rewriting the host's DNS config.
+func leaseLANDHCP(initPID int) error {
+	if _, err := exec.LookPath("dhcpcd"); err != nil {
+		return fmt.Errorf("dhcpcd not found on host: %w", err)
 	}
-	return os.WriteFile(lanDHCPHookPath, []byte(lanDHCPHookScript), 0o755)
+	out, err := exec.Command("nsenter", "-t", strconv.Itoa(initPID), "-n",
+		"dhcpcd", "-1", "-t", "12", "-q", "--nohook", "resolv.conf", "eth0").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("dhcpcd: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }

@@ -1,9 +1,6 @@
 package lxc
 
 import (
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -25,11 +22,7 @@ func TestResolveLANIPDHCP(t *testing.T) {
 }
 
 func TestDualNICConfigDHCP(t *testing.T) {
-	// Redirect the hook path to a temp file so the write succeeds in the test env.
-	old := lanDHCPHookPath
-	lanDHCPHookPath = filepath.Join(t.TempDir(), "lan-dhcp-hook.sh")
-	defer func() { lanDHCPHookPath = old }()
-
+	t.Parallel()
 	items := DualNICConfig("vmbr1", "dhcp", "192.168.1.1", "10.100.0.5")
 
 	get := func(key string) []string {
@@ -42,26 +35,20 @@ func TestDualNICConfigDHCP(t *testing.T) {
 		return vals
 	}
 
+	// DHCP LAN NIC: named eth0, no static address (daemon leases it post-start).
 	if v := get("lxc.net.0.ipv4.address"); len(v) != 0 {
 		t.Fatalf("DHCP LAN NIC must not have a static address, got %v", v)
 	}
 	if v := get("lxc.net.0.name"); len(v) != 1 || v[0] != "eth0" {
 		t.Fatalf("expected lxc.net.0.name=eth0, got %v", v)
 	}
-	if v := get("lxc.hook.start-host"); len(v) != 1 || v[0] != lanDHCPHookPath {
-		t.Fatalf("expected start-host hook %q, got %v", lanDHCPHookPath, v)
+	// No lxc.hook.* (PVE rejects them; DHCP is daemon-driven).
+	if v := get("lxc.hook.start-host"); len(v) != 0 {
+		t.Fatalf("expected no start-host hook, got %v", v)
 	}
 	// Internal NIC still static.
 	if v := get("lxc.net.1.ipv4.address"); len(v) != 1 || v[0] != "10.100.0.5/24" {
 		t.Fatalf("expected internal NIC 10.100.0.5/24, got %v", v)
-	}
-	// Hook script written and runs a DHCP client in the netns.
-	data, err := os.ReadFile(lanDHCPHookPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(data), "dhcpcd") || !strings.Contains(string(data), "$LXC_PID") {
-		t.Fatalf("hook script missing dhcpcd/$LXC_PID:\n%s", data)
 	}
 
 	// Static path unchanged: address present, no hook.
