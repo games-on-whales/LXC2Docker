@@ -73,6 +73,7 @@ type HostConfig struct {
 	StorageOpt map[string]string `json:"StorageOpt"`
 	// Devices & capabilities
 	Devices           []DeviceMapping   `json:"Devices"`
+	DeviceRequests    []DeviceRequest   `json:"DeviceRequests"` // --gpus / GPU device requests
 	DeviceCgroupRules []string          `json:"DeviceCgroupRules"`
 	CapAdd            []string          `json:"CapAdd"`
 	CapDrop           []string          `json:"CapDrop"`
@@ -150,6 +151,18 @@ type DeviceMapping struct {
 	PathOnHost        string `json:"PathOnHost"`
 	PathInContainer   string `json:"PathInContainer"`
 	CgroupPermissions string `json:"CgroupPermissions"`
+}
+
+// DeviceRequest mirrors Docker's HostConfig.DeviceRequests entry, populated by
+// `--gpus`. For NVIDIA GPUs the CLI sends Driver "nvidia" (or "") with a
+// Capabilities set containing "gpu", and Count -1 (== "all") or a DeviceIDs
+// list. We treat any such request as "give this container the NVIDIA GPUs".
+type DeviceRequest struct {
+	Driver       string            `json:"Driver"`
+	Count        int               `json:"Count"`
+	DeviceIDs    []string          `json:"DeviceIDs"`
+	Capabilities [][]string        `json:"Capabilities"`
+	Options      map[string]string `json:"Options"`
 }
 
 // PortBinding maps a container port to a host port.

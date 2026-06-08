@@ -3,6 +3,7 @@ package lxc
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -80,6 +81,12 @@ type ContainerConfig struct {
 	Mounts            []MountSpec  // bind mounts
 	Devices           []DeviceSpec // host devices to expose
 	DeviceCgroupRules []string     // e.g. ["c 13:* rwm"]
+	// GPU requests NVIDIA GPU access for this container (Docker's --gpus, or a
+	// NVIDIA_VISIBLE_DEVICES env). When set, the daemon injects the host NVIDIA
+	// driver via the CDI spec (see nvidia.go) — driver libs, device nodes, and
+	// the symlink/ldcache setup — so the container can use the GPU without a
+	// hand-populated driver volume.
+	GPU bool
 	NetworkMode       string       // "host" or "" (bridge)
 	IpcMode           string       // "host" or "" (private)
 	UTSMode           string       // "host" or "" (private)
@@ -698,6 +705,15 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	// share the host's devtmpfs (or Docker creates device nodes). In LXC
 	// the device files must physically exist in the container's /dev.
 	items = append(items, autoMountDeviceDirs(cfg.DeviceCgroupRules)...)
+
+	// NVIDIA GPU via CDI (see buildPVEItems for details).
+	if cfg.GPU {
+		if gpu, err := nvidiaGPUConfigItems(); err != nil {
+			log.Printf("buildItems: NVIDIA GPU setup failed: %v (container will start without GPU)", err)
+		} else {
+			items = append(items, gpu...)
+		}
+	}
 
 	// Memory limit
 	if cfg.MemoryBytes > 0 {
@@ -1366,6 +1382,17 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 		items = append(items, configItem{"lxc.cgroup2.devices.allow", rule})
 	}
 	items = append(items, autoMountDeviceDirs(cfg.DeviceCgroupRules)...)
+
+	// NVIDIA GPU: inject the host driver via the CDI spec (driver libs, device
+	// nodes, symlink/ldcache hook). On failure, log and continue without GPU
+	// rather than failing the whole container build.
+	if cfg.GPU {
+		if gpu, err := nvidiaGPUConfigItems(); err != nil {
+			log.Printf("buildPVEItems: NVIDIA GPU setup failed: %v (container will start without GPU)", err)
+		} else {
+			items = append(items, gpu...)
+		}
+	}
 
 	// CPU (memory handled by Proxmox-native "memory:" line).
 	if cfg.CPUShares > 0 {
