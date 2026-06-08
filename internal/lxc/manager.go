@@ -203,6 +203,10 @@ func (m *Manager) StartNetworkReconciler(ctx context.Context) {
 				if err := EnsureBridge(); err != nil {
 					log.Printf("network reconcile: %v", err)
 				}
+				// Keep every container's managed /etc/hosts block current
+				// so a peer that drifted to a new bridge IP stays
+				// resolvable by name without recreating the dependent.
+				m.syncHosts()
 			}
 		}
 	}()
@@ -1378,11 +1382,26 @@ func (m *Manager) StartContainer(id string) error {
 		if err := EnsureBridge(); err != nil {
 			return fmt.Errorf("manager: bridge: %w", err)
 		}
+		// Seed this container's /etc/hosts before it starts so its first
+		// outbound dial resolves sibling names — LXC2Docker has no
+		// embedded DNS, so without this a name-addressed peer would be
+		// unreachable until the periodic reconcile catches up.
+		if err := m.writeContainerHosts(rec, m.store.ListContainers()); err != nil {
+			log.Printf("container DNS: seed /etc/hosts for %s: %v", shortID(id), err)
+		}
 	}
+
+	var err error
 	if rec != nil && rec.VMID > 0 {
-		return m.startPVEContainer(id, rec.VMID)
+		err = m.startPVEContainer(id, rec.VMID)
+	} else {
+		err = m.startLXCContainer(id)
 	}
-	return m.startLXCContainer(id)
+	if err == nil {
+		// Peers learn this container's (possibly reassigned) IP.
+		m.syncHosts()
+	}
+	return err
 }
 
 func (m *Manager) startPVEContainer(id string, vmid int) error {
