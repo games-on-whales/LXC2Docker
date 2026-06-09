@@ -1369,6 +1369,62 @@ func ensureRuntimeDir(rootfs, dir string) {
 	}
 }
 
+// chownLabelKey lets a container ask the daemon to chown host paths (bind-mount
+// sources) to a fixed owner immediately before it starts — on every start,
+// including restarts. It exists because a shared bind-mounted directory can be
+// re-owned by a sibling container running under a different uid, breaking a
+// process in this container that requires a specific owner. Canonical case:
+// Wolf's pulseaudio runs as root and refuses to start unless its XDG_RUNTIME_DIR
+// is root-owned, but the app containers Wolf launches run as uid 1000 and
+// chown that shared dir — so after any app session a Wolf restart used to die
+// until the dir was re-chowned by hand. Value: comma-separated "path[:uid[:gid]]"
+// entries; owner defaults to 0:0 (root).
+const chownLabelKey = "dld.chown"
+
+// applyChownLabels honors chownLabelKey for the container, before it starts.
+// Best-effort: a missing path or chown failure is logged, never fatal — the
+// container should still start (and may simply work without the fix-up).
+func (m *Manager) applyChownLabels(id string) {
+	rec := m.store.GetContainer(id)
+	if rec == nil {
+		return
+	}
+	spec := strings.TrimSpace(rec.Labels[chownLabelKey])
+	if spec == "" {
+		return
+	}
+	for _, entry := range strings.Split(spec, ",") {
+		if entry = strings.TrimSpace(entry); entry == "" {
+			continue
+		}
+		path, uid, gid := parseChownEntry(entry)
+		if path == "" {
+			continue
+		}
+		if err := os.Chown(path, uid, gid); err != nil {
+			log.Printf("applyChownLabels: chown %s -> %d:%d for %s: %v", path, uid, gid, shortID(id), err)
+		}
+	}
+}
+
+// parseChownEntry parses a "path[:uid[:gid]]" chown spec. Owner defaults to root
+// (0:0); "path:uid" sets gid=uid, matching `chown uid`'s convention.
+func parseChownEntry(entry string) (path string, uid, gid int) {
+	parts := strings.Split(entry, ":")
+	path = strings.TrimSpace(parts[0])
+	if len(parts) >= 2 {
+		if v, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
+			uid, gid = v, v
+		}
+	}
+	if len(parts) >= 3 {
+		if v, err := strconv.Atoi(strings.TrimSpace(parts[2])); err == nil {
+			gid = v
+		}
+	}
+	return path, uid, gid
+}
+
 // StartContainer starts a stopped container.
 // For Proxmox CTs (VMID > 0), uses pct start; otherwise lxc-start.
 func (m *Manager) StartContainer(id string) error {
@@ -1405,6 +1461,7 @@ func (m *Manager) StartContainer(id string) error {
 }
 
 func (m *Manager) startPVEContainer(id string, vmid int) error {
+	m.applyChownLabels(id) // fix shared bind-mount ownership before init runs
 	log.Printf("StartContainer[PVE]: pct start %d (%s)", vmid, id[:12])
 	out, err := exec.Command("pct", "start", fmt.Sprintf("%d", vmid)).CombinedOutput()
 	if err != nil {
@@ -1445,6 +1502,7 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 }
 
 func (m *Manager) startLXCContainer(id string) error {
+	m.applyChownLabels(id) // fix shared bind-mount ownership before init runs
 	log.Printf("StartContainer[LXC]: starting %s", id)
 	// -d (daemonize): modern lxc-start runs in the FOREGROUND by default, which
 	// would block here until the container exits. Daemonize so the call returns
