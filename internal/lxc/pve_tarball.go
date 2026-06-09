@@ -420,6 +420,20 @@ func (m *Manager) finalizePVECT(id string, vmid int, hostname string, cfg Contai
 		return fmt.Errorf("manager: mount rootfs: %w", err)
 	}
 
+	// Docker-compat self-identification: bind /etc/hostname from a path that
+	// embeds the container ID, so an app can find its own container by scanning
+	// /proc/self/mountinfo (e.g. Wolf's get_current_container, which replicates
+	// its own mounts into the app containers it launches). Done here in the
+	// shared finalizer so EVERY PVE path gets it — previously only
+	// createPVEContainer wired this up, so the common lvmthin/tarball
+	// linked-clone path produced CTs that couldn't self-identify ("No valid
+	// container ID found in mountinfo").
+	if src, err := m.writeContainerIDHostname(id, hostname); err != nil {
+		log.Printf("finalizePVECT: container ID hostname for %s: %v", shortID(id), err)
+	} else {
+		cfg.IDHostnameSource = src
+	}
+
 	if err := writePVEConfig(vmid, hostname, rootfsSpec, rootfsPath, &cfg, ip, m.DefaultMemoryBytes); err != nil {
 		unmount()
 		cleanup()

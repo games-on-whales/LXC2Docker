@@ -241,3 +241,36 @@ func TestLXCDestroyMissingOutput(t *testing.T) {
 		t.Fatal("unrelated destroy errors should not be treated as missing containers")
 	}
 }
+
+func TestParseChownEntry(t *testing.T) {
+	cases := []struct {
+		in       string
+		path     string
+		uid, gid int
+	}{
+		{"/run/wolf", "/run/wolf", 0, 0},            // default owner is root
+		{"/run/wolf:1000", "/run/wolf", 1000, 1000}, // uid only => gid=uid
+		{"/run/wolf:1000:2000", "/run/wolf", 1000, 2000},
+		{" /run/wolf : 0 : 0 ", "/run/wolf", 0, 0}, // trims whitespace
+		{"/run/wolf:bad", "/run/wolf", 0, 0},       // non-numeric uid ignored
+	}
+	for _, c := range cases {
+		path, uid, gid := parseChownEntry(c.in)
+		if path != c.path || uid != c.uid || gid != c.gid {
+			t.Errorf("parseChownEntry(%q) = (%q,%d,%d); want (%q,%d,%d)",
+				c.in, path, uid, gid, c.path, c.uid, c.gid)
+		}
+	}
+}
+
+func TestApplyChownLabels_NoLabelNoop(t *testing.T) {
+	// A container without the dld.chown label must not error or touch anything.
+	dir := t.TempDir()
+	st, err := store.NewAt(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	st.AddContainer(&store.ContainerRecord{ID: "abc123", Name: "c", Labels: map[string]string{}})
+	m := &Manager{store: st}
+	m.applyChownLabels("abc123") // must be a no-op, no panic
+}
