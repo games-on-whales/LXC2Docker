@@ -19,16 +19,16 @@ func TestParseDiskSizeGB(t *testing.T) {
 		{"garbage", 0},
 		{"0", 0},
 		{"-5G", 0},
-		{"32", 32},      // bare number => GB
+		{"32", 32}, // bare number => GB
 		{"32G", 32},
 		{"32g", 32},
 		{"32GB", 32},
 		{"32GiB", 32},
 		{" 64 G ", 64},
 		{"1T", 1024},
-		{"500M", 1},     // rounds up to whole GB
-		{"1536M", 2},    // 1.5G rounds up
-		{"1.5G", 2},     // fractional GB rounds up
+		{"500M", 1},  // rounds up to whole GB
+		{"1536M", 2}, // 1.5G rounds up
+		{"1.5G", 2},  // fractional GB rounds up
 		{"1073741824B", 1},
 	}
 	for _, tc := range cases {
@@ -250,7 +250,7 @@ func TestBuildPVEItemsBindMountDefaultsToPrivatePropagation(t *testing.T) {
 func TestBuildItemsDeviceMountsArePrivate(t *testing.T) {
 	t.Parallel()
 
-	devDir := t.TempDir()             // bound as a device directory (create=dir)
+	devDir := t.TempDir() // bound as a device directory (create=dir)
 	devNode := filepath.Join(devDir, "node")
 	if err := os.WriteFile(devNode, nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -296,6 +296,46 @@ func TestBuildPVEItemsDeviceMountsArePrivate(t *testing.T) {
 	wantNode := strings.ReplaceAll(devNode, " ", `\040`) + " dev/uinput none bind,create=file,rprivate 0 0"
 	if !hasMountEntry(items, wantNode) {
 		t.Fatalf("expected rprivate device node mount %q, got %#v", wantNode, items)
+	}
+}
+
+// A container that opts into the NVIDIA GPU (NVIDIA_VISIBLE_DEVICES) gets the
+// lxc.hook.mount that injects the driver userspace via nvidia-container-cli.
+// Binding /dev/dri alone leaves CUDA/EGL unusable and GPU apps (Wolf's Wayland
+// compositor) black-screen, so the hook is the actual fix.
+func TestBuildItemsEmitsNvidiaHookWhenRequested(t *testing.T) {
+	t.Parallel()
+
+	for _, fn := range []struct {
+		name  string
+		build func(*ContainerConfig, string) []configItem
+	}{
+		{"buildItems", buildItems},
+		{"buildPVEItems", buildPVEItems},
+	} {
+		t.Run(fn.name, func(t *testing.T) {
+			items := fn.build(&ContainerConfig{
+				Env: []string{"NVIDIA_VISIBLE_DEVICES=all", "NVIDIA_DRIVER_CAPABILITIES=all"},
+			}, "10.0.0.2")
+			if !hasItem(items, "lxc.hook.mount", nvidiaHookPath) {
+				t.Fatalf("%s: expected nvidia mount hook %q, got %#v", fn.name, nvidiaHookPath, items)
+			}
+		})
+	}
+}
+
+// No NVIDIA_VISIBLE_DEVICES (or "void") means no GPU opt-in, so no hook — we must
+// not run nvidia-container-cli against plain containers.
+func TestBuildItemsNoNvidiaHookWithoutOptIn(t *testing.T) {
+	t.Parallel()
+
+	for _, env := range [][]string{nil, {"FOO=bar"}, {"NVIDIA_VISIBLE_DEVICES="}, {"NVIDIA_VISIBLE_DEVICES=void"}} {
+		items := buildItems(&ContainerConfig{Env: env}, "10.0.0.2")
+		for _, it := range items {
+			if it.key == "lxc.hook.mount" {
+				t.Fatalf("env %v: unexpected GPU hook %q", env, it.value)
+			}
+		}
 	}
 }
 
@@ -352,8 +392,12 @@ func TestMountPropagationOpt(t *testing.T) {
 }
 
 func hasMountEntry(items []configItem, want string) bool {
+	return hasItem(items, "lxc.mount.entry", want)
+}
+
+func hasItem(items []configItem, key, value string) bool {
 	for _, item := range items {
-		if item.key == "lxc.mount.entry" && item.value == want {
+		if item.key == key && item.value == value {
 			return true
 		}
 	}
@@ -379,9 +423,9 @@ func TestInitUserConfigItems(t *testing.T) {
 	}
 
 	tests := []struct {
-		name, spec  string
-		wantUID     string // "" => expect no items at all
-		wantGID     string // "" => expect lxc.init.gid absent
+		name, spec string
+		wantUID    string // "" => expect no items at all
+		wantGID    string // "" => expect lxc.init.gid absent
 	}{
 		{"empty", "", "", ""},
 		{"numeric uid:gid", "1000:1000", "1000", "1000"},
