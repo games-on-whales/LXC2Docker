@@ -151,6 +151,71 @@ func Pull(storeDir, ref string, opts PullOpts) (*ImageConfig, string, error) {
 	return cfg, rootfs, nil
 }
 
+// RemoteDigest returns the manifest digest the registry currently serves for
+// ref, COMPARABLE to the digest Pull records — a metadata-only inspect that
+// does NOT download layers. It lets callers cheaply decide whether a locally
+// cached template for a mutable tag (e.g. ":latest") has gone stale before
+// paying for a full re-pull. creds, when non-empty, is the "user:password"
+// form.
+//
+// Pull resolves a multi-arch ref to one platform (via skopeo copy) and records
+// that CHILD manifest's digest. skopeo's top-level inspect digest, by contrast,
+// is the manifest-LIST digest — which never equals a stored child digest. So
+// for a manifest list we dig out the arch-specific child digest; for a plain
+// single manifest skopeo's reported digest already matches what Pull records.
+func RemoteDigest(ref, arch, creds string) (string, error) {
+	raw, err := skopeoInspect(ref, creds, true /* raw manifest */)
+	if err != nil {
+		return "", err
+	}
+	var idx struct {
+		Manifests []struct {
+			Digest   string `json:"digest"`
+			Platform struct {
+				Architecture string `json:"architecture"`
+				OS           string `json:"os"`
+			} `json:"platform"`
+		} `json:"manifests"`
+	}
+	if json.Unmarshal([]byte(raw), &idx) == nil && len(idx.Manifests) > 0 {
+		for _, m := range idx.Manifests {
+			if m.Platform.Architecture == arch && (m.Platform.OS == "" || m.Platform.OS == "linux") {
+				return m.Digest, nil
+			}
+		}
+		// Arch absent from the list: report an error so callers keep the
+		// working template rather than destroying a cache they can't replace.
+		return "", fmt.Errorf("oci: %s exposes no %s/linux manifest in its image index", ref, arch)
+	}
+	// Not a manifest list — ask skopeo for the single manifest's digest.
+	d, err := skopeoInspect(ref, creds, false /* {{.Digest}} */)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(d), nil
+}
+
+// skopeoInspect runs `skopeo inspect` for ref against the registry. When raw is
+// true it returns the raw manifest JSON (--raw); otherwise the manifest digest
+// (--format {{.Digest}}). creds, when non-empty, is "user:password".
+func skopeoInspect(ref, creds string, raw bool) (string, error) {
+	args := []string{"inspect"}
+	if raw {
+		args = append(args, "--raw")
+	} else {
+		args = append(args, "--format", "{{.Digest}}")
+	}
+	if creds != "" {
+		args = append(args, "--creds", creds)
+	}
+	args = append(args, "docker://"+normalizeDockerRef(ref))
+	out, err := exec.Command("skopeo", args...).Output()
+	if err != nil {
+		return "", fmt.Errorf("oci: skopeo inspect %s: %w", ref, err)
+	}
+	return string(out), nil
+}
+
 // manifestDigest returns the top-level manifest digest recorded in the
 // OCI layout's index.json. Matches what `docker pull` prints and what
 // `docker inspect` exposes as RepoDigests. Empty on any error.

@@ -673,6 +673,14 @@ func (m *Manager) PullImage(ref, arch string, progress func(string)) error {
 	return m.PullImageWith(ref, arch, PullOpts{OnStatus: progress})
 }
 
+// isDigestPinnedRef reports whether ref pins an immutable content digest
+// (e.g. "repo@sha256:…"), as opposed to a mutable tag like ":latest". A
+// digest-pinned ref always resolves to the same bytes, so a cached template
+// for one is never stale.
+func isDigestPinnedRef(ref string) bool {
+	return strings.Contains(ref, "@")
+}
+
 // PullImageWith is the full-fat version of PullImage. OCI pulls honor
 // opts.Credentials (sent to skopeo) and emit layer progress via
 // opts.OnEvent. Distro and app pulls ignore credentials — they're fetched
@@ -688,17 +696,50 @@ func (m *Manager) PullImageWith(ref, arch string, opts PullOpts) error {
 		progress = func(string) {}
 	}
 
-	// If the template container already exists, nothing to do — but restore
-	// the store record if it was lost (e.g. state.json was cleared).
+	// If the template container already exists, decide whether it can be
+	// reused or has gone stale. A digest-pinned ref ("repo@sha256:…") is
+	// immutable, and distro/app templates are keyed by distro+release — for
+	// those, "present" means "up to date". A mutable OCI tag (e.g. ":latest")
+	// can drift, so consult the registry and only reuse the cached template
+	// when the remote manifest digest still matches what we pulled. Without
+	// this check a ":latest" template, once created, is NEVER refreshed.
 	if m.containerExists(resolved.TemplateContainerName) {
-		if m.store.GetImage(resolved.Ref) == nil {
-			rec := m.restoreImageRecord(resolved)
+		rec := m.store.GetImage(resolved.Ref)
+		if rec == nil {
+			// Restore a store record lost out from under us (e.g. state.json
+			// was cleared) so the rest of the daemon can find the template.
+			rec = m.restoreImageRecord(resolved)
 			if err := m.store.AddImage(rec); err != nil {
 				log.Printf("PullImage: warning: could not restore store record for %s: %v", resolved.Ref, err)
 			}
 		}
-		progress("Image already present")
-		return nil
+
+		if resolved.Kind != image.KindOCI || isDigestPinnedRef(resolved.Ref) {
+			progress("Image already present")
+			return nil
+		}
+
+		remoteDigest, derr := oci.RemoteDigest(resolved.Ref, arch, opts.Credentials)
+		switch {
+		case derr != nil:
+			// Registry unreachable (offline / transient error): keep the
+			// working template rather than destroying a cache we can't replace.
+			log.Printf("PullImage: remote digest check for %s failed (%v); reusing local template", resolved.Ref, derr)
+			progress("Image already present (registry unreachable)")
+			return nil
+		case remoteDigest != "" && rec.RepoDigest == remoteDigest:
+			progress(fmt.Sprintf("Status: Image is up to date for %s", resolved.Ref))
+			return nil
+		default:
+			// The mutable tag points at a new digest (or we have no recorded
+			// digest to compare): drop the stale template so the pull below
+			// rebuilds it. Running containers are independent rootfs copies
+			// (cp -a) and are unaffected by destroying the clone source.
+			log.Printf("PullImage: %s is stale (local=%q remote=%q); re-pulling", resolved.Ref, rec.RepoDigest, remoteDigest)
+			if err := m.RemoveImage(resolved.Ref); err != nil {
+				return fmt.Errorf("manager: replace stale template for %s: %w", resolved.Ref, err)
+			}
+		}
 	}
 
 	switch resolved.Kind {
