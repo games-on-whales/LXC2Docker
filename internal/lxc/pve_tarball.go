@@ -450,6 +450,72 @@ func (m *Manager) finalizePVECT(id string, vmid int, hostname string, cfg Contai
 	return nil
 }
 
+// reconfigureReusedPVECT adopts an already-provisioned Proxmox CT (cfg.ReuseVMID,
+// the warm rootfs from a previous session of the same app) for a new session: it
+// rewrites the CT's config and re-preps the rootfs for the new launch WITHOUT
+// cloning — the single biggest re-open latency win, since the expensive clone is
+// skipped and the in-rootfs warm state (app config, shader caches) is preserved.
+// The container keeps its existing IP. Returns an error (→ caller falls back to a
+// fresh clone) if the CT has vanished since it was recorded.
+func (m *Manager) reconfigureReusedPVECT(id string, cfg ContainerConfig) error {
+	vmid := cfg.ReuseVMID
+	if _, err := os.Stat(pveConfigPath(vmid)); err != nil {
+		return fmt.Errorf("reused CT %d config missing: %w", vmid, err)
+	}
+	if st, _ := m.State(id); st == "running" {
+		return fmt.Errorf("reused CT %d is running", vmid)
+	}
+
+	rec := m.store.GetContainer(id)
+	hostname := id[:12]
+	ip := ""
+	if rec != nil {
+		if rec.Name != "" {
+			hostname = rec.Name
+		}
+		ip = rec.IPAddress // keep the address the CT already holds
+	}
+	hostname = sanitizeHostname(hostname)
+
+	// Fill LAN config (may convert --network=host to a LAN NIC) before writing.
+	applyLANNetworking(&cfg, m.lan, vmid, m.lanMACForContainer(id))
+
+	cfg.LogFile = LogFilePath(m.lxcPath, id)
+	if err := os.MkdirAll(filepath.Dir(cfg.LogFile), 0o755); err != nil {
+		return fmt.Errorf("mkdir log dir: %w", err)
+	}
+
+	rootfsSpec, err := readPVERootfsSpec(vmid)
+	if err != nil {
+		return fmt.Errorf("read rootfs spec: %w", err)
+	}
+	rootfsPath, unmount, err := m.mountPVERootfs(vmid)
+	if err != nil {
+		return fmt.Errorf("mount rootfs: %w", err)
+	}
+
+	if src, err := m.writeContainerIDHostname(id, hostname); err != nil {
+		log.Printf("reconfigureReusedPVECT: container ID hostname for %s: %v", shortID(id), err)
+	} else {
+		cfg.IDHostnameSource = src
+	}
+
+	if err := writePVEConfig(vmid, hostname, rootfsSpec, rootfsPath, &cfg, ip, m.DefaultMemoryBytes); err != nil {
+		unmount()
+		return fmt.Errorf("write PVE config: %w", err)
+	}
+	m.prepareRootfs(rootfsPath, cfg)
+	unmount() // a held mount blocks pct start on block-device backends
+
+	log.Printf("CreateContainer[reuse]: adopted warm CT %d for %s (no clone)", vmid, shortID(id))
+	if rec != nil {
+		rec.VMID = vmid
+		rec.IPAddress = ip
+		return m.store.AddContainer(rec)
+	}
+	return nil
+}
+
 // sanitizeDatasetToken reduces an arbitrary string to characters valid in a ZFS
 // dataset component ([A-Za-z0-9_.-]), so an image ID like "ubuntu_22.04" or an
 // OCI ref with slashes/colons yields a stable, legal dataset name.
