@@ -977,7 +977,7 @@ lxc.uts.name = %s
 	}
 
 	progress("Image ready")
-	return m.store.AddImage(&store.ImageRecord{
+	imgRec := &store.ImageRecord{
 		ID:              "oci_" + oci.SafeDirName(r.Ref),
 		Ref:             r.Ref,
 		Arch:            r.Arch,
@@ -992,7 +992,41 @@ lxc.uts.name = %s
 		OCIPorts:        cfg.Ports,
 		OCILabels:       cfg.Labels,
 		RepoDigest:      repoDigest,
-	})
+	}
+	if err := m.store.AddImage(imgRec); err != nil {
+		return err
+	}
+	// Eagerly materialize the copy-on-write template now, off the pull's critical
+	// path, so the one-time ~15s rootfs extraction never lands on a user's first
+	// launch — the first open becomes a ~2s clone like every subsequent one.
+	m.prewarmImageTemplate(imgRec)
+	return nil
+}
+
+// prewarmImageTemplate kicks off (asynchronously, best-effort) the one-time
+// materialization of an image's clone template, so the first container launch
+// pays only the fast clone instead of the tarball extraction. No-op for non-PVE
+// mode and for tarball-less images, and for storages with no clone template
+// (dir/lvm/nfs re-extract per launch — nothing to pre-build). Failures are
+// logged and simply mean the first launch materializes lazily as before.
+func (m *Manager) prewarmImageTemplate(imgRec *store.ImageRecord) {
+	if !m.UsePVE() || imgRec == nil || imgRec.TemplateTarball == "" {
+		return
+	}
+	if !m.pveStorageIsZFS() && !m.pveStorageSupportsLinkedClone() {
+		return
+	}
+	go func() {
+		if m.pveStorageIsZFS() {
+			if _, err := m.ensureImageTemplateDataset(imgRec); err != nil {
+				log.Printf("prewarmImageTemplate: %s: %v (will materialize on first launch)", imgRec.Ref, err)
+			}
+			return
+		}
+		if _, err := m.ensureImageTemplateCT(imgRec); err != nil {
+			log.Printf("prewarmImageTemplate: %s: %v (will materialize on first launch)", imgRec.Ref, err)
+		}
+	}()
 }
 
 // CreateContainer clones the image template, applies the given config, and
@@ -1010,6 +1044,19 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 	if cfg.NetworkMode != "host" {
 		if err := EnsureBridge(); err != nil {
 			return fmt.Errorf("manager: bridge: %w", err)
+		}
+	}
+
+	// Warm reuse: adopt the warm rootfs of a previous session's CT (same
+	// name+image, now stopped) instead of cloning a fresh one. Only the CT config
+	// is rewritten for the new session — no clone, and the in-rootfs warm state
+	// survives. Falls back to a normal create if the CT has gone missing.
+	if cfg.ReuseVMID > 0 {
+		if err := m.reconfigureReusedPVECT(id, cfg); err != nil {
+			log.Printf("CreateContainer[reuse]: adopt VMID %d for %s failed (%v); cloning fresh", cfg.ReuseVMID, shortID(id), err)
+			cfg.ReuseVMID = 0
+		} else {
+			return nil
 		}
 	}
 
@@ -1567,6 +1614,11 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 		return fmt.Errorf("manager: pct start %d: %s: %w", vmid, out, err)
 	}
 	deadline := time.Now().Add(30 * time.Second)
+	// Ramp the poll: a warm reused CT (linked clone / adopted rootfs) is often
+	// RUNNING within tens of ms, so a flat 200ms tick would add up to ~200ms of
+	// dead wait to every fast launch. Start at 20ms and back off to 200ms so a
+	// quick start is detected promptly without busy-spinning on a slow one.
+	interval := 20 * time.Millisecond
 	for time.Now().Before(deadline) {
 		state, _ := m.State(id)
 		if state == "running" {
@@ -1581,7 +1633,10 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 			log.Printf("StartContainer[PVE]: VMID %d (%s) started and exited quickly", vmid, id[:12])
 			return nil
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(interval)
+		if interval < 200*time.Millisecond {
+			interval *= 2
+		}
 	}
 	return fmt.Errorf("manager: VMID %d did not reach RUNNING within 30s", vmid)
 }

@@ -81,10 +81,29 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	// the existing container's record. Portainer relies on this to detect
 	// duplicate-create attempts (e.g. after a partially-failed deploy) and
 	// surface a clear error to the user.
-	if name != "" && h.store.FindContainerByName(name) != nil {
-		errResponse(w, http.StatusConflict,
-			fmt.Sprintf("Conflict. The container name %q is already in use.", "/"+name))
-		return
+	//
+	// Warm reuse (opt-in, DLD_REUSE_CONTAINERS): a caller that re-launches with a
+	// stable container name normally triggers 409 → remove → fresh clone on every
+	// re-create. With reuse on, the existing stopped container's warm rootfs is
+	// adopted and just reconfigured for the new run instead. Only safe to reuse
+	// when the prior container is stopped and built from the same image; anything
+	// else falls through to the normal 409.
+	var reuseVMID int
+	var reuseOldID string
+	var reuseOldIP string
+	if name != "" {
+		if old := h.store.FindContainerByName(name); old != nil {
+			if h.reusableContainer(old, imageRef) {
+				log.Printf("createContainer: reusing warm CT %d for %q (image %s)", old.VMID, name, imageRef)
+				reuseVMID = old.VMID
+				reuseOldID = old.ID
+				reuseOldIP = old.IPAddress
+			} else {
+				errResponse(w, http.StatusConflict,
+					fmt.Sprintf("Conflict. The container name %q is already in use.", "/"+name))
+				return
+			}
+		}
 	}
 
 	// Auto-pull if image not present. Portainer's deploy flow POSTs
@@ -104,6 +123,12 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := generateID()
+	if reuseOldID != "" {
+		// Adopt the previous session's container identity so its warm CT/rootfs,
+		// networks, and per-container state dir carry straight over; only the
+		// config is refreshed below.
+		id = reuseOldID
+	}
 	if name == "" {
 		name = id[:12]
 	}
@@ -142,10 +167,10 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := lxc.ContainerConfig{
-		Entrypoint:        entrypoint,
-		Cmd:               cmd,
-		Env:               env,
-		WorkingDir:        workingDir,
+		Entrypoint: entrypoint,
+		Cmd:        cmd,
+		Env:        env,
+		WorkingDir: workingDir,
 		// Run PID 1 as the explicitly requested user. We deliberately do NOT
 		// fall back to the image's USER here: the daemon has always run
 		// containers as root, and silently honoring image USER would change
@@ -188,6 +213,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	// NVIDIA GPU". When requested, the daemon injects the host driver via CDI
 	// (see lxc/nvidia.go) instead of relying on a hand-populated driver volume.
 	cfg.GPU = wantsNvidiaGPU(req.HostConfig.DeviceRequests, env)
+	cfg.ReuseVMID = reuseVMID
 
 	// Rootfs disk size: the "dld.disksize" label takes precedence over
 	// Docker's --storage-opt size (HostConfig.StorageOpt["size"]). Either way
@@ -428,6 +454,15 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if reuseVMID > 0 {
+		// Carry the warm CT's VMID + IP onto the refreshed record so the manager's
+		// reuse path rewrites config in place (no clone) and the GC doesn't reap a
+		// VMID-less record mid-reconfigure. The record otherwise reflects the new
+		// session's full config, replacing the prior session's at the same id.
+		rec.VMID = reuseVMID
+		rec.IPAddress = reuseOldIP
+	}
+
 	if err := h.store.AddContainer(rec); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -463,6 +498,36 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		ID:       id,
 		Warnings: []string{},
 	})
+}
+
+// reuseContainersEnabled reports whether warm container reuse is turned on
+// (DLD_REUSE_CONTAINERS=1/true/yes). Off by default: it changes Docker's create
+// semantics (a same-name create adopts the stopped container instead of 409ing),
+// so it's opt-in for re-launch workloads that recreate under a stable name.
+func reuseContainersEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DLD_REUSE_CONTAINERS"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// reusableContainer reports whether an existing same-name container can be
+// adopted (its warm rootfs reused) for a new create of imageRef, instead of
+// returning a 409 name conflict. Safe only when reuse is enabled, the prior
+// container is a Proxmox CT (VMID > 0 — the linked-clone path), is built from
+// the same image (so its warm rootfs is still valid), and is not running.
+func (h *Handler) reusableContainer(old *store.ContainerRecord, imageRef string) bool {
+	if !reuseContainersEnabled() || old == nil || old.VMID <= 0 {
+		return false
+	}
+	if old.ImageID != imageRef {
+		return false // image changed — the warm rootfs is stale, clone fresh
+	}
+	if st, _ := h.mgr.State(old.ID); st == "running" {
+		return false // can't reconfigure a live container out from under itself
+	}
+	return true
 }
 
 // GET /containers/json

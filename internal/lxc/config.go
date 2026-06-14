@@ -188,6 +188,14 @@ type ContainerConfig struct {
 	LANIP         string
 	LANGateway    string
 	LANMacAddress string
+	// ReuseVMID, when > 0, asks CreateContainer to adopt an existing Proxmox CT's
+	// rootfs (the warm rootfs left by a previous session of the same app) instead
+	// of cloning a fresh one — it only rewrites the CT config for the new session.
+	// Set by the API layer when warm container reuse is enabled (DLD_REUSE_CONTAINERS)
+	// and a stopped container of the same name+image already exists. The biggest
+	// re-open latency win: no clone, and the in-rootfs warm state (shader caches,
+	// app config) survives. See reconfigureReusedPVECT.
+	ReuseVMID int
 }
 
 // ISOMount describes one read-only ISO bind-mount.

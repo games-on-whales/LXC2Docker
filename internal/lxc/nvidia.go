@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // NVIDIA GPU support via CDI (Container Device Interface).
@@ -62,9 +63,31 @@ type cdiHook struct {
 	Args     []string `json:"args"`
 }
 
+// The CDI spec is static between driver changes but every GPU-container launch
+// re-reads and re-parses it. Cache the parsed spec keyed by the file's mtime+size
+// so re-opens skip the read/parse; a driver update (nvidia-ctk regenerates the
+// file, changing mtime) invalidates it automatically.
+var (
+	cdiCacheMu   sync.Mutex
+	cdiCacheKey  string // "<modtime-unixnano>:<size>"
+	cdiCacheSpec *cdiSpec
+)
+
 // loadNvidiaCDI reads the NVIDIA CDI spec, generating it once via nvidia-ctk if
-// it isn't present yet (e.g. first GPU container after a fresh install).
+// it isn't present yet (e.g. first GPU container after a fresh install). The
+// parsed result is cached by file mtime+size across launches.
 func loadNvidiaCDI() (*cdiSpec, error) {
+	if fi, err := os.Stat(nvidiaCDIPath); err == nil {
+		key := fmt.Sprintf("%d:%d", fi.ModTime().UnixNano(), fi.Size())
+		cdiCacheMu.Lock()
+		if cdiCacheSpec != nil && cdiCacheKey == key {
+			spec := cdiCacheSpec
+			cdiCacheMu.Unlock()
+			return spec, nil
+		}
+		cdiCacheMu.Unlock()
+	}
+
 	data, err := os.ReadFile(nvidiaCDIPath)
 	if os.IsNotExist(err) {
 		if err := os.MkdirAll(filepath.Dir(nvidiaCDIPath), 0o755); err != nil {
@@ -82,6 +105,15 @@ func loadNvidiaCDI() (*cdiSpec, error) {
 	var spec cdiSpec
 	if err := json.Unmarshal(data, &spec); err != nil {
 		return nil, fmt.Errorf("parse nvidia CDI spec %s: %w", nvidiaCDIPath, err)
+	}
+
+	// Cache under the just-read file's current mtime+size (re-stat: the generate
+	// branch above may have just created it).
+	if fi, err := os.Stat(nvidiaCDIPath); err == nil {
+		cdiCacheMu.Lock()
+		cdiCacheKey = fmt.Sprintf("%d:%d", fi.ModTime().UnixNano(), fi.Size())
+		cdiCacheSpec = &spec
+		cdiCacheMu.Unlock()
 	}
 	return &spec, nil
 }
