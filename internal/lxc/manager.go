@@ -691,14 +691,29 @@ func (m *Manager) PullImageWith(ref, arch string, opts PullOpts) error {
 	// If the template container already exists, nothing to do — but restore
 	// the store record if it was lost (e.g. state.json was cleared).
 	if m.containerExists(resolved.TemplateContainerName) {
-		if m.store.GetImage(resolved.Ref) == nil {
-			rec := m.restoreImageRecord(resolved)
-			if err := m.store.AddImage(rec); err != nil {
-				log.Printf("PullImage: warning: could not restore store record for %s: %v", resolved.Ref, err)
+		// An OCI image pulled by a mutable tag (e.g. ":latest") names its
+		// template purely from the ref, so a stale local template would
+		// otherwise shadow a newer registry digest forever — the tag would
+		// be frozen to whatever was first pulled. When the registry digest
+		// has moved, drop the stale template and fall through to a fresh
+		// pull. ociTagMoved is conservative (false for digest-pinned refs,
+		// missing local digests, or an unreachable registry), so a working
+		// template is never discarded on a transient error.
+		if m.ociTagMoved(resolved, opts) {
+			progress("Image tag moved in registry; re-pulling")
+			if err := m.RemoveImage(resolved.Ref); err != nil {
+				log.Printf("PullImage: warning: could not remove stale template for %s: %v", resolved.Ref, err)
 			}
+		} else {
+			if m.store.GetImage(resolved.Ref) == nil {
+				rec := m.restoreImageRecord(resolved)
+				if err := m.store.AddImage(rec); err != nil {
+					log.Printf("PullImage: warning: could not restore store record for %s: %v", resolved.Ref, err)
+				}
+			}
+			progress("Image already present")
+			return nil
 		}
-		progress("Image already present")
-		return nil
 	}
 
 	switch resolved.Kind {
@@ -710,6 +725,44 @@ func (m *Manager) PullImageWith(ref, arch string, opts PullOpts) error {
 		return m.pullOCI(resolved, opts)
 	}
 	return fmt.Errorf("manager: unknown image kind")
+}
+
+// ociRemoteDigest resolves a ref's current manifest digest in its registry.
+// It is a package variable so tests can stub the registry round-trip; in
+// production it points at oci.RemoteDigest (a `skopeo inspect`).
+var ociRemoteDigest = oci.RemoteDigest
+
+// ociTagMoved reports whether resolved is an OCI image pulled by a mutable
+// tag whose manifest digest in the registry now differs from the digest
+// recorded locally at pull time. It exists so PullImageWith can refresh a
+// re-pushed tag (e.g. ":latest") instead of serving a frozen local template.
+//
+// It is deliberately conservative and returns false — meaning "keep the
+// existing template" — in every case where it cannot prove the tag has
+// moved: non-OCI images, digest-pinned (immutable) refs, no recorded local
+// digest, or a registry/skopeo error. That keeps offline and air-gapped
+// deploys working and never discards a good template on a transient failure.
+func (m *Manager) ociTagMoved(resolved *image.ResolvedImage, opts PullOpts) bool {
+	if resolved.Kind != image.KindOCI {
+		return false
+	}
+	if oci.IsDigestPinned(resolved.Ref) {
+		return false
+	}
+	rec := m.store.GetImage(resolved.Ref)
+	if rec == nil || rec.RepoDigest == "" {
+		return false
+	}
+	remote, err := ociRemoteDigest(resolved.Ref, opts.Credentials)
+	if err != nil || remote == "" {
+		log.Printf("PullImage: could not check remote digest for %s: %v (keeping local template)", resolved.Ref, err)
+		return false
+	}
+	if remote != rec.RepoDigest {
+		log.Printf("PullImage: %s tag moved: local %s → remote %s", resolved.Ref, rec.RepoDigest, remote)
+		return true
+	}
+	return false
 }
 
 func (m *Manager) pullDistro(r *image.ResolvedImage, progress func(string)) error {

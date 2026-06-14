@@ -151,6 +151,41 @@ func Pull(storeDir, ref string, opts PullOpts) (*ImageConfig, string, error) {
 	return cfg, rootfs, nil
 }
 
+// IsDigestPinned reports whether ref pins an immutable manifest digest
+// (it carries an "@sha256:..." component). Such a reference can never change
+// in the registry, so a cached local pull is valid forever and never needs a
+// staleness re-check.
+func IsDigestPinned(ref string) bool {
+	return strings.Contains(ref, "@")
+}
+
+// RemoteDigest returns the manifest digest ("sha256:...") that ref currently
+// resolves to in its registry, via `skopeo inspect`. creds, when non-empty,
+// is passed as --creds ("user:password") for private registries. skopeo
+// resolves a manifest list to the host-platform image manifest before
+// reporting .Digest, exactly as `skopeo copy` does at pull time, so the value
+// returned here is directly comparable to the RepoDigest recorded by Pull —
+// letting callers detect a tag that has moved (e.g. a re-pushed ":latest").
+func RemoteDigest(ref, creds string) (string, error) {
+	dockerRef := normalizeDockerRef(ref)
+	args := []string{"inspect"}
+	if creds != "" {
+		args = append(args, "--creds", creds)
+	}
+	args = append(args, "docker://"+dockerRef)
+	out, err := exec.Command("skopeo", args...).Output()
+	if err != nil {
+		return "", fmt.Errorf("oci: skopeo inspect %s: %w", dockerRef, err)
+	}
+	var info struct {
+		Digest string `json:"Digest"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil {
+		return "", fmt.Errorf("oci: parse skopeo inspect output: %w", err)
+	}
+	return info.Digest, nil
+}
+
 // manifestDigest returns the top-level manifest digest recorded in the
 // OCI layout's index.json. Matches what `docker pull` prints and what
 // `docker inspect` exposes as RepoDigests. Empty on any error.
