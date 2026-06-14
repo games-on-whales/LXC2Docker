@@ -1,6 +1,7 @@
 package lxc
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"net"
@@ -190,6 +191,15 @@ func resolveLANIP(cfg *ContainerConfig, lan LANConfig, vmid int) string {
 	return fmt.Sprintf("%s.%d/%d", lan.Prefix, vmid, lan.Subnet)
 }
 
+// stableLANMac derives a locally-administered unicast MAC from stable
+// container identity. LXC otherwise generates a new veth MAC after CT
+// recreation, which breaks LAN clients that bind pairing state to MAC address
+// (Moonlight/Wolf is the common case).
+func stableLANMac(id string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(id)))
+	return fmt.Sprintf("02:%02x:%02x:%02x:%02x:%02x", sum[0], sum[1], sum[2], sum[3], sum[4])
+}
+
 // applyLANNetworking gives a container a routable NIC on the physical LAN
 // bridge when one is configured. It fires in two cases:
 //
@@ -203,7 +213,7 @@ func resolveLANIP(cfg *ContainerConfig, lan LANConfig, vmid int) string {
 // LAN bridge is the Proxmox-appropriate way to put a container on the host's
 // network, where inbound traffic and mDNS/Moonlight discovery work, so we
 // convert host mode into the dual-NIC LAN setup. Returns true if it applied.
-func applyLANNetworking(cfg *ContainerConfig, lan LANConfig, vmid int) bool {
+func applyLANNetworking(cfg *ContainerConfig, lan LANConfig, vmid int, lanMAC string) bool {
 	if lan.Bridge == "" || (!cfg.LAN && cfg.NetworkMode != "host") {
 		return false
 	}
@@ -214,6 +224,7 @@ func applyLANNetworking(cfg *ContainerConfig, lan LANConfig, vmid int) bool {
 	cfg.LANBridge = lan.Bridge
 	cfg.LANIP = resolveLANIP(cfg, lan, vmid)
 	cfg.LANGateway = lan.Gateway
+	cfg.LANMacAddress = strings.TrimSpace(lanMAC)
 	log.Printf("CreateContainer[PVE]: LAN NIC on %s with IP %s", cfg.LANBridge, cfg.LANIP)
 	return true
 }
@@ -233,12 +244,18 @@ func NetworkConfig(ip string) []configItem {
 // DualNICConfig returns lxc.conf lines for a dual-NIC container: the LAN
 // bridge as net.0 (primary — so mDNS and other services advertise the LAN IP)
 // and the internal managed bridge as net.1 (for inter-container traffic).
-func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem {
+func DualNICConfig(lanBridge, lanIP, lanGateway, lanMAC, internalIP string) []configItem {
 	// net.0 = LAN (primary): routable IP on the physical network.
 	items := []configItem{
 		{"lxc.net.0.type", "veth"},
 		{"lxc.net.0.link", lanBridge},
 		{"lxc.net.0.flags", "up"},
+	}
+	// A stable, locally-administered MAC keeps LAN clients that bind state to
+	// the NIC's hardware address (Moonlight/Wolf pairing) working across CT
+	// recreation. Applied for both DHCP and static addressing.
+	if lanMAC = strings.TrimSpace(lanMAC); lanMAC != "" {
+		items = append(items, configItem{"lxc.net.0.hwaddr", lanMAC})
 	}
 	if lanIP == "dhcp" {
 		// DHCP: bring the NIC up with a known name but no static address. The

@@ -23,7 +23,7 @@ func TestResolveLANIPDHCP(t *testing.T) {
 
 func TestDualNICConfigDHCP(t *testing.T) {
 	t.Parallel()
-	items := DualNICConfig("vmbr1", "dhcp", "192.168.1.1", "10.100.0.5")
+	items := DualNICConfig("vmbr1", "dhcp", "192.168.1.1", "02:de:ad:be:ef:01", "10.100.0.5")
 
 	get := func(key string) []string {
 		var vals []string
@@ -42,6 +42,10 @@ func TestDualNICConfigDHCP(t *testing.T) {
 	if v := get("lxc.net.0.name"); len(v) != 1 || v[0] != "eth0" {
 		t.Fatalf("expected lxc.net.0.name=eth0, got %v", v)
 	}
+	// The stable LAN MAC is applied even on the DHCP path.
+	if v := get("lxc.net.0.hwaddr"); len(v) != 1 || v[0] != "02:de:ad:be:ef:01" {
+		t.Fatalf("expected lxc.net.0.hwaddr=02:de:ad:be:ef:01, got %v", v)
+	}
 	// No lxc.hook.* (PVE rejects them; DHCP is daemon-driven).
 	if v := get("lxc.hook.start-host"); len(v) != 0 {
 		t.Fatalf("expected no start-host hook, got %v", v)
@@ -52,7 +56,7 @@ func TestDualNICConfigDHCP(t *testing.T) {
 	}
 
 	// Static path unchanged: address present, no hook.
-	st := DualNICConfig("vmbr1", "192.168.1.50/23", "192.168.1.1", "10.100.0.5")
+	st := DualNICConfig("vmbr1", "192.168.1.50/23", "192.168.1.1", "02:de:ad:be:ef:02", "10.100.0.5")
 	hasAddr, hasHook := false, false
 	for _, it := range st {
 		if it.key == "lxc.net.0.ipv4.address" && it.value == "192.168.1.50/23" {

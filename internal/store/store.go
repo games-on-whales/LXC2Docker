@@ -24,22 +24,23 @@ const defaultPath = "/var/lib/docker-lxc-daemon"
 // flow re-posts whatever inspect returned) but not necessarily enforced by
 // the LXC runtime.
 type ContainerRecord struct {
-	ID           string            `json:"id"`       // Docker hex ID (API-facing)
-	VMID         int               `json:"vmid"`     // Proxmox CT VMID (0 = legacy direct LXC)
-	Name         string            `json:"name"`     // Docker-style name (no leading slash)
-	Image        string            `json:"image"`    // Original image:tag as requested
-	ImageID      string            `json:"image_id"` // Resolved image identifier
-	Created      time.Time         `json:"created"`
-	Entrypoint   []string          `json:"entrypoint"`
-	Cmd          []string          `json:"cmd"`
-	Env          []string          `json:"env"`
-	Labels       map[string]string `json:"labels"`
-	IPAddress    string            `json:"ip_address"`
-	PortBindings []PortBinding     `json:"port_bindings,omitempty"`
-	Mounts       []MountSpec       `json:"mounts"`
-	StartedAt    *time.Time        `json:"started_at,omitempty"`  // nil until first start; distinguishes "created" from "exited"
-	FinishedAt   *time.Time        `json:"finished_at,omitempty"` // last stop/kill timestamp, for Portainer's "Stopped X ago"
-	ExitCode     int               `json:"exit_code,omitempty"`   // last observed exit code (best-effort)
+	ID            string            `json:"id"`       // Docker hex ID (API-facing)
+	VMID          int               `json:"vmid"`     // Proxmox CT VMID (0 = legacy direct LXC)
+	Name          string            `json:"name"`     // Docker-style name (no leading slash)
+	Image         string            `json:"image"`    // Original image:tag as requested
+	ImageID       string            `json:"image_id"` // Resolved image identifier
+	Created       time.Time         `json:"created"`
+	Entrypoint    []string          `json:"entrypoint"`
+	Cmd           []string          `json:"cmd"`
+	Env           []string          `json:"env"`
+	Labels        map[string]string `json:"labels"`
+	IPAddress     string            `json:"ip_address"`
+	LANMacAddress string            `json:"lan_mac_address,omitempty"`
+	PortBindings  []PortBinding     `json:"port_bindings,omitempty"`
+	Mounts        []MountSpec       `json:"mounts"`
+	StartedAt     *time.Time        `json:"started_at,omitempty"`  // nil until first start; distinguishes "created" from "exited"
+	FinishedAt    *time.Time        `json:"finished_at,omitempty"` // last stop/kill timestamp, for Portainer's "Stopped X ago"
+	ExitCode      int               `json:"exit_code,omitempty"`   // last observed exit code (best-effort)
 	// Echo-back fields: persisted verbatim so `docker inspect` returns
 	// whatever the client sent on create. Not wired to the LXC runtime.
 	Hostname     string              `json:"hostname,omitempty"`
