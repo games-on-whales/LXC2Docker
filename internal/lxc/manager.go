@@ -673,6 +673,12 @@ func (m *Manager) PullImage(ref, arch string, progress func(string)) error {
 	return m.PullImageWith(ref, arch, PullOpts{OnStatus: progress})
 }
 
+// ociRemoteDigest resolves a ref's current registry manifest digest (the
+// arch-specific child digest, comparable to what pullOCI records). It is a
+// package variable so tests can stub the registry round-trip; in production it
+// points at oci.RemoteDigest (a metadata-only `skopeo inspect`).
+var ociRemoteDigest = oci.RemoteDigest
+
 // isDigestPinnedRef reports whether ref pins an immutable content digest
 // (e.g. "repo@sha256:…"), as opposed to a mutable tag like ":latest". A
 // digest-pinned ref always resolves to the same bytes, so a cached template
@@ -719,7 +725,7 @@ func (m *Manager) PullImageWith(ref, arch string, opts PullOpts) error {
 			return nil
 		}
 
-		remoteDigest, derr := oci.RemoteDigest(resolved.Ref, arch, opts.Credentials)
+		remoteDigest, derr := ociRemoteDigest(resolved.Ref, arch, opts.Credentials)
 		switch {
 		case derr != nil:
 			// Registry unreachable (offline / transient error): keep the
@@ -881,6 +887,21 @@ func (m *Manager) pullOCI(r *image.ResolvedImage, opts PullOpts) error {
 		return fmt.Errorf("manager: oci pull: %w", err)
 	}
 
+	// Record the REGISTRY source digest as RepoDigest — NOT cfg.Digest, which
+	// is the digest skopeo writes into the local OCI layout. skopeo converts
+	// Docker schema2 manifests to OCI media types on copy, so the layout digest
+	// differs from the registry's; storing it would make the staleness check in
+	// PullImageWith compare unlike values and re-pull the full image on every
+	// materialise even when the tag never moved. RemoteDigest is the same call
+	// that check uses, so an unchanged tag now compares equal and reuses the
+	// cached template. Best-effort: an empty digest just forces one re-pull next
+	// time (correct, only slower). It also makes the RepoDigests we report match
+	// what `docker inspect` shows (the registry digest).
+	repoDigest, derr := ociRemoteDigest(r.Ref, r.Arch, opts.Credentials)
+	if derr != nil || repoDigest == "" {
+		log.Printf("pullOCI: could not record registry digest for %s: %v (will re-pull next materialise)", r.Ref, derr)
+	}
+
 	var templateVMID int
 	var templateTarball string
 
@@ -949,6 +970,7 @@ lxc.uts.name = %s
 			OCIWorkingDir: cfg.WorkingDir,
 			OCIPorts:      cfg.Ports,
 			OCILabels:     cfg.Labels,
+			RepoDigest:    repoDigest,
 		}); err == nil {
 			os.WriteFile(filepath.Join(templateDir, "oci-meta.json"), data, 0o644)
 		}
@@ -969,7 +991,7 @@ lxc.uts.name = %s
 		OCIWorkingDir:   cfg.WorkingDir,
 		OCIPorts:        cfg.Ports,
 		OCILabels:       cfg.Labels,
-		RepoDigest:      cfg.Digest,
+		RepoDigest:      repoDigest,
 	})
 }
 
