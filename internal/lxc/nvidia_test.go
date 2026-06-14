@@ -137,3 +137,26 @@ func TestWriteNvidiaMountHookContent(t *testing.T) {
 		t.Fatalf("hook script not executable: %v", fi.Mode())
 	}
 }
+
+func TestHasNvidiaDriverVolume(t *testing.T) {
+	cases := []struct {
+		name   string
+		mounts []MountSpec
+		want   bool
+	}{
+		{"driver volume present", []MountSpec{{Source: "/etc/wolf/nvidia-fedora", Destination: "/usr/nvidia"}}, true},
+		{"trailing slash", []MountSpec{{Destination: "/usr/nvidia/"}}, true},
+		{"among other mounts", []MountSpec{{Destination: "/home/retro"}, {Destination: "/usr/nvidia"}}, true},
+		{"no driver volume", []MountSpec{{Destination: "/home/retro"}, {Destination: "/run/wolf"}}, false},
+		{"similar but different path", []MountSpec{{Destination: "/usr/nvidia-fedora"}}, false},
+		{"nested deeper is not the volume", []MountSpec{{Destination: "/usr/nvidia/lib"}}, false},
+		{"empty", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := hasNvidiaDriverVolume(c.mounts); got != c.want {
+				t.Fatalf("hasNvidiaDriverVolume(%v) = %v, want %v", c.mounts, got, c.want)
+			}
+		})
+	}
+}
