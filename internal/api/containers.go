@@ -183,6 +183,12 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		LAN:               req.Labels["gow.lan"] == "true",
 		LANIPRequest:      strings.TrimSpace(req.Labels["gow.lan.ip"]),
 	}
+	// GPU access: Docker's --gpus (HostConfig.DeviceRequests) or an NVIDIA
+	// container env (NVIDIA_VISIBLE_DEVICES) both mean "give this container the
+	// NVIDIA GPU". When requested, the daemon injects the host driver via CDI
+	// (see lxc/nvidia.go) instead of relying on a hand-populated driver volume.
+	cfg.GPU = wantsNvidiaGPU(req.HostConfig.DeviceRequests, env)
+
 	// Rootfs disk size: the "dld.disksize" label takes precedence over
 	// Docker's --storage-opt size (HostConfig.StorageOpt["size"]). Either way
 	// 0/unset leaves the daemon to size the rootfs from the image.
@@ -2425,6 +2431,42 @@ func (h *Handler) volumeByMountpoint(path string) *store.VolumeRecord {
 
 // mergeEnv merges image-level env vars with request-level env vars.
 // Request vars override image vars with the same key (KEY=value format).
+// wantsNvidiaGPU reports whether the container requested NVIDIA GPU access,
+// the same way the NVIDIA container runtime decides to inject the driver:
+//   - Docker's --gpus (DeviceRequests) with the "gpu" capability and the
+//     nvidia (or unset) driver, or a Count/DeviceIDs selection.
+//   - NVIDIA_VISIBLE_DEVICES env set to anything other than ""/"void"/"none"
+//     (this is how Wolf asks for GPUs in its app/session containers).
+func wantsNvidiaGPU(reqs []DeviceRequest, env []string) bool {
+	for _, dr := range reqs {
+		if dr.Driver != "" && dr.Driver != "nvidia" {
+			continue
+		}
+		for _, capSet := range dr.Capabilities {
+			for _, c := range capSet {
+				if c == "gpu" || c == "nvidia" {
+					return true
+				}
+			}
+		}
+		// `--gpus all` / `--gpus N` with no explicit capabilities still means GPUs.
+		if len(dr.Capabilities) == 0 && (dr.Count != 0 || len(dr.DeviceIDs) > 0) {
+			return true
+		}
+	}
+	for _, e := range env {
+		if v, ok := strings.CutPrefix(e, "NVIDIA_VISIBLE_DEVICES="); ok {
+			switch strings.TrimSpace(v) {
+			case "", "void", "none":
+				return false
+			default:
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func mergeEnv(imageEnv, requestEnv []string) []string {
 	m := make(map[string]string, len(imageEnv)+len(requestEnv))
 	order := make([]string, 0, len(imageEnv)+len(requestEnv))

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -176,6 +177,11 @@ func RemovePortForwards(containerIP string) error {
 // historical "<prefix>.<vmid>/<subnet>" derivation.
 func resolveLANIP(cfg *ContainerConfig, lan LANConfig, vmid int) string {
 	if req := strings.TrimSpace(cfg.LANIPRequest); req != "" {
+		// "dhcp" (gow.lan.ip=dhcp) requests a DHCP lease on the LAN instead of a
+		// daemon-assigned static address; DualNICConfig wires the client hook.
+		if strings.EqualFold(req, "dhcp") {
+			return "dhcp"
+		}
 		if strings.Contains(req, "/") {
 			return req
 		}
@@ -233,10 +239,18 @@ func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem
 		{"lxc.net.0.type", "veth"},
 		{"lxc.net.0.link", lanBridge},
 		{"lxc.net.0.flags", "up"},
-		{"lxc.net.0.ipv4.address", lanIP},
 	}
-	if lanGateway != "" {
-		items = append(items, configItem{"lxc.net.0.ipv4.gateway", lanGateway})
+	if lanIP == "dhcp" {
+		// DHCP: bring the NIC up with a known name but no static address. The
+		// lease itself is obtained by the daemon after start (see maybeLANDHCP) —
+		// PVE silently rejects custom lxc.hook.* directives, and the unmanaged gow
+		// images ship no DHCP client, so the daemon runs one in the netns.
+		items = append(items, configItem{"lxc.net.0.name", "eth0"})
+	} else {
+		items = append(items, configItem{"lxc.net.0.ipv4.address", lanIP})
+		if lanGateway != "" {
+			items = append(items, configItem{"lxc.net.0.ipv4.gateway", lanGateway})
+		}
 	}
 	// net.1 = internal managed bridge (no gateway — connected route only).
 	items = append(items,
@@ -246,4 +260,26 @@ func DualNICConfig(lanBridge, lanIP, lanGateway, internalIP string) []configItem
 		configItem{"lxc.net.1.ipv4.address", internalIP + "/24"},
 	)
 	return items
+}
+
+// leaseLANDHCP obtains a DHCP lease for the LAN NIC (eth0) from inside the
+// container's network namespace, using the host's dhcpcd (the unmanaged gow
+// images ship no DHCP client, and PVE silently rejects custom lxc.hook.*
+// directives — so the daemon drives the client itself after start).
+//
+// One-shot (-1): dhcpcd configures the address then exits, leaving no lingering
+// host-wide master to collide with the next start (dhcpcd keys its control state
+// on the interface name, which repeats as "eth0" across netns). Synchronous and
+// bounded (-t), so the lease lands before the workload's later mDNS bind.
+// --nohook resolv.conf keeps it from rewriting the host's DNS config.
+func leaseLANDHCP(initPID int) error {
+	if _, err := exec.LookPath("dhcpcd"); err != nil {
+		return fmt.Errorf("dhcpcd not found on host: %w", err)
+	}
+	out, err := exec.Command("nsenter", "-t", strconv.Itoa(initPID), "-n",
+		"dhcpcd", "-1", "-t", "12", "-q", "--nohook", "resolv.conf", "eth0").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("dhcpcd: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }

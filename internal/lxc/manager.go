@@ -1514,7 +1514,12 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 		// bad config/rootfs — errors earlier with a different message.)
 		so := string(out)
 		if strings.Contains(so, "get_init_pid") || strings.Contains(so, "not running?") {
+			// pct couldn't read the init PID. Usually a genuine fast-exit
+			// (echo/true), but privileged/nested CTs (e.g. Wolf) can hit this
+			// while actually running. maybeLeaseLANDHCP polls for the PID, so it
+			// leases when the CT is really up and no-ops otherwise.
 			log.Printf("StartContainer[PVE]: VMID %d (%s) started and exited immediately", vmid, id[:12])
+			m.maybeLeaseLANDHCP(id)
 			return nil
 		}
 		// Dump config for debugging a real failure.
@@ -1528,6 +1533,7 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 		state, _ := m.State(id)
 		if state == "running" {
 			log.Printf("StartContainer[PVE]: VMID %d (%s) is running", vmid, id[:12])
+			m.maybeLeaseLANDHCP(id)
 			return nil
 		}
 		if state == "exited" {
@@ -1540,6 +1546,35 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("manager: VMID %d did not reach RUNNING within 30s", vmid)
+}
+
+// maybeLeaseLANDHCP gives the container's LAN NIC a DHCP lease when it requested
+// one (gow.lan.ip=dhcp). PVE silently ignores custom LXC hooks, so the daemon
+// drives the DHCP client itself once the container's netns is up. Best-effort:
+// failures are logged, never fatal to the start.
+func (m *Manager) maybeLeaseLANDHCP(id string) {
+	rec := m.store.GetContainer(id)
+	if rec == nil || !strings.EqualFold(rec.Labels["gow.lan.ip"], "dhcp") {
+		return
+	}
+	// pct doesn't always expose the init PID immediately for privileged/nested
+	// CTs; poll briefly so we lease once the netns is actually up.
+	var pid int
+	for i := 0; i < 30; i++ {
+		if pid = m.InitPID(id); pid > 0 {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	if pid <= 0 {
+		log.Printf("LAN DHCP: no init PID for %s, skipping lease", id[:12])
+		return
+	}
+	if err := leaseLANDHCP(pid); err != nil {
+		log.Printf("LAN DHCP: %s: %v", id[:12], err)
+		return
+	}
+	log.Printf("LAN DHCP: leased LAN address for %s", id[:12])
 }
 
 func (m *Manager) startLXCContainer(id string) error {
