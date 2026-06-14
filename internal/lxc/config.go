@@ -711,8 +711,13 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	// the device files must physically exist in the container's /dev.
 	items = append(items, autoMountDeviceDirs(cfg.DeviceCgroupRules)...)
 
-	// NVIDIA GPU via CDI (see buildPVEItems for details).
-	if cfg.GPU {
+	// NVIDIA GPU via CDI (see buildPVEItems for details). Skip when the
+	// container brings its own /usr/nvidia driver volume and self-provisions —
+	// otherwise CDI's read-only loader-config binds collide with the image's
+	// own nvidia init (see hasNvidiaDriverVolume).
+	if cfg.GPU && hasNvidiaDriverVolume(cfg.Mounts) {
+		log.Printf("buildItems: container provides its own %s driver volume; skipping CDI injection", nvidiaDriverVolume)
+	} else if cfg.GPU {
 		if gpu, err := nvidiaGPUConfigItems(); err != nil {
 			log.Printf("buildItems: NVIDIA GPU setup failed: %v (container will start without GPU)", err)
 		} else {
@@ -974,6 +979,30 @@ func nvidiaGPUItems(cfg *ContainerConfig) []configItem {
 func nvidiaGPURequested(env []string) bool {
 	v := envValue(env, "NVIDIA_VISIBLE_DEVICES")
 	return v != "" && v != "void"
+}
+
+// nvidiaDriverVolume is the conventional mountpoint at which an image that
+// manages its own NVIDIA userspace driver expects the driver tree (the
+// "driver volume" used by the Games-on-Whales images).
+const nvidiaDriverVolume = "/usr/nvidia"
+
+// hasNvidiaDriverVolume reports whether the container already carries its own
+// NVIDIA driver at /usr/nvidia. Such images (e.g. the GOW app images) populate
+// the EGL/Vulkan/glvnd loader config from that volume themselves at init time.
+//
+// When that volume is present the daemon must NOT also inject the host driver
+// via CDI: the CDI spec read-only-binds the exact files the image's own nvidia
+// init then copies over (e.g. /usr/share/egl/egl_external_platform.d/*.json),
+// so the copy fails on the read-only mount and aborts container startup under
+// `set -e`. Skipping CDI here lets the container self-provision — matching the
+// pre-CDI behaviour — while CDI still serves containers that bring no driver.
+func hasNvidiaDriverVolume(mounts []MountSpec) bool {
+	for _, m := range mounts {
+		if strings.TrimRight(m.Destination, "/") == nvidiaDriverVolume {
+			return true
+		}
+	}
+	return false
 }
 
 // envValue returns the value of key from a Docker-style ["K=V", ...] env slice,
@@ -1439,8 +1468,13 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 
 	// NVIDIA GPU: inject the host driver via the CDI spec (driver libs, device
 	// nodes, symlink/ldcache hook). On failure, log and continue without GPU
-	// rather than failing the whole container build.
-	if cfg.GPU {
+	// rather than failing the whole container build. Skip entirely when the
+	// container brings its own /usr/nvidia driver volume and self-provisions:
+	// CDI's read-only loader-config binds otherwise collide with the image's
+	// own nvidia init scripts and abort startup (see hasNvidiaDriverVolume).
+	if cfg.GPU && hasNvidiaDriverVolume(cfg.Mounts) {
+		log.Printf("buildPVEItems: container provides its own %s driver volume; skipping CDI injection", nvidiaDriverVolume)
+	} else if cfg.GPU {
 		if gpu, err := nvidiaGPUConfigItems(); err != nil {
 			log.Printf("buildPVEItems: NVIDIA GPU setup failed: %v (container will start without GPU)", err)
 		} else {
