@@ -1060,6 +1060,22 @@ func (m *Manager) writeContainerIDHostname(id, hostname string) (string, error) 
 	return p, nil
 }
 
+func (m *Manager) lanMACForContainer(id string) string {
+	mac := stableLANMac(id)
+	rec := m.store.GetContainer(id)
+	if rec == nil {
+		return mac
+	}
+	if strings.TrimSpace(rec.LANMacAddress) != "" {
+		return strings.TrimSpace(rec.LANMacAddress)
+	}
+	rec.LANMacAddress = mac
+	if err := m.store.AddContainer(rec); err != nil {
+		log.Printf("lan mac: persist %s for %s: %v", mac, id[:12], err)
+	}
+	return mac
+}
+
 func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
 	vmid, err := allocateVMID()
 	if err != nil {
@@ -1070,7 +1086,7 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	// This may also convert a --network=host container into LAN mode (a CT
 	// can't share the host netns), so it must run before the IP allocation
 	// below keys off cfg.NetworkMode.
-	applyLANNetworking(&cfg, m.lan, vmid)
+	applyLANNetworking(&cfg, m.lan, vmid, m.lanMACForContainer(id))
 
 	log.Printf("CreateContainer[PVE]: pct clone %d → VMID %d for %s", imgRec.TemplateVMID, vmid, id[:12])
 	out, err := exec.Command("pct", "clone",

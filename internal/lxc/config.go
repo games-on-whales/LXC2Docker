@@ -86,22 +86,22 @@ type ContainerConfig struct {
 	// driver via the CDI spec (see nvidia.go) — driver libs, device nodes, and
 	// the symlink/ldcache setup — so the container can use the GPU without a
 	// hand-populated driver volume.
-	GPU bool
-	NetworkMode       string       // "host" or "" (bridge)
-	IpcMode           string       // "host" or "" (private)
-	UTSMode           string       // "host" or "" (private)
-	PidMode           string       // "host" or "" (private)
-	MemoryBytes       int64        // 0 = unlimited
-	CPUShares         int64        // 0 = unlimited (relative weight)
-	CPUQuota          int64        // microseconds per 100ms period, 0 = unlimited
-	NanoCPUs          int64        // Docker's CPU limit in units of 1e-9 CPU; 1.5 CPU = 1.5e9
-	CpusetCpus        string       // Docker's --cpuset-cpus (e.g. "0-3", "0,2")
-	CpusetMems        string       // Docker's --cpuset-mems (e.g. "0")
-	PidsLimit         int64        // Maximum PIDs in the container (0 = unlimited)
-	Ulimits           []Ulimit     // Docker-style ulimits (lxc.prlimit.<name>)
-	ShmSize           int64        // /dev/shm tmpfs size in bytes (0 = kernel default)
-	BlkioWeight       uint16       // Block I/O weight (10-1000, mapped to io.weight)
-	WorkingDir        string       // container cwd; maps to lxc.init.cwd
+	GPU         bool
+	NetworkMode string   // "host" or "" (bridge)
+	IpcMode     string   // "host" or "" (private)
+	UTSMode     string   // "host" or "" (private)
+	PidMode     string   // "host" or "" (private)
+	MemoryBytes int64    // 0 = unlimited
+	CPUShares   int64    // 0 = unlimited (relative weight)
+	CPUQuota    int64    // microseconds per 100ms period, 0 = unlimited
+	NanoCPUs    int64    // Docker's CPU limit in units of 1e-9 CPU; 1.5 CPU = 1.5e9
+	CpusetCpus  string   // Docker's --cpuset-cpus (e.g. "0-3", "0,2")
+	CpusetMems  string   // Docker's --cpuset-mems (e.g. "0")
+	PidsLimit   int64    // Maximum PIDs in the container (0 = unlimited)
+	Ulimits     []Ulimit // Docker-style ulimits (lxc.prlimit.<name>)
+	ShmSize     int64    // /dev/shm tmpfs size in bytes (0 = kernel default)
+	BlkioWeight uint16   // Block I/O weight (10-1000, mapped to io.weight)
+	WorkingDir  string   // container cwd; maps to lxc.init.cwd
 	// User is the Docker-style spec the container's PID 1 runs as: "uid",
 	// "uid:gid", "user", or "user:group". Maps to lxc.init.uid / lxc.init.gid
 	// (names resolved against the rootfs /etc/passwd + /etc/group). Empty runs
@@ -184,9 +184,10 @@ type ContainerConfig struct {
 	ISOs []ISOMount
 	// LANBridge, LANIP, LANGateway are filled in by the manager (not the
 	// API layer) once Bridge has been resolved against LANConfig.
-	LANBridge  string
-	LANIP      string
-	LANGateway string
+	LANBridge     string
+	LANIP         string
+	LANGateway    string
+	LANMacAddress string
 }
 
 // ISOMount describes one read-only ISO bind-mount.
@@ -547,7 +548,7 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 
 	// Network configuration.
 	if cfg.LANBridge != "" {
-		items = append(items, DualNICConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway, ip)...)
+		items = append(items, DualNICConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway, cfg.LANMacAddress, ip)...)
 	} else if cfg.NetworkMode == "host" {
 		// Handled below via lxc.namespace.clone.
 	} else {
@@ -1319,7 +1320,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 
 	// Network configuration.
 	if cfg.LANBridge != "" {
-		items = append(items, DualNICConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway, ip)...)
+		items = append(items, DualNICConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway, cfg.LANMacAddress, ip)...)
 	} else if cfg.NetworkMode == "host" {
 		// Handled below via lxc.namespace.clone.
 	} else {
