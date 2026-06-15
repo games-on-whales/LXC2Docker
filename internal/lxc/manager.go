@@ -573,6 +573,19 @@ func (m *Manager) gc() {
 
 		state, _ := m.State(rec.ID)
 		if state == "exited" {
+			// A container that has never been started also reads as "exited"
+			// (lxc-info returns nothing for a not-yet-running or still-being-
+			// created CT). It is really in "created" state: a `docker run` is
+			// mid-flight between the create and start calls, and a slow image
+			// clone (e.g. a freshly built image whose template dataset has to be
+			// materialized first) can stretch that window to several seconds.
+			// Reaping it here deletes the container out from under the imminent
+			// attach/start, which then 404s. Only ephemeral containers that have
+			// actually run and exited are eligible for GC — this mirrors
+			// enforceRestartPolicies, which already skips never-started CTs.
+			if rec.StartedAt == nil {
+				continue
+			}
 			stopped = append(stopped, rec)
 		} else if state == "running" {
 			if smoothNASRunnerWorker(rec) {
