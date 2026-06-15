@@ -56,10 +56,22 @@ func (r skopeoMetaResolver) ResolveImageConfig(ctx context.Context, ref string, 
 
 // imageRecordToOCIImage reconstructs an OCI image config from a stored image
 // record (env/cmd/entrypoint/etc.), for FROM resolution and build export.
+//
+// RootFS.DiffIDs must be non-empty: dockerfile2llb treats a base image config
+// with zero diff IDs as "scratch" (convert.go: len(img.RootFS.DiffIDs)==0 →
+// llb.Scratch()), which silently drops the FROM base so every RUN executes on
+// an empty rootfs. Our executor materialises the base by ref (not by diff ID),
+// so a single stable synthetic diff ID keeps the base a real image while
+// staying deterministic across builds (important for LLB cache keys).
 func imageRecordToOCIImage(rec *store.ImageRecord) dockerspec.DockerOCIImage {
+	baseDiffID := digest.FromString("dld-base:" + rec.ID)
 	return dockerspec.DockerOCIImage{
 		Image: ocispecs.Image{
 			Platform: ocispecs.Platform{Architecture: "amd64", OS: "linux"},
+			RootFS: ocispecs.RootFS{
+				Type:    "layers",
+				DiffIDs: []digest.Digest{baseDiffID},
+			},
 			Config: ocispecs.ImageConfig{
 				Env:        rec.OCIEnv,
 				Cmd:        rec.OCICmd,
