@@ -33,6 +33,7 @@ type gatewayBuild struct {
 	sessionID string
 
 	mu        sync.Mutex
+	localsMu  sync.Mutex        // serialises ensureLocals: one FileSync per session at a time
 	localDirs map[string]string // FileSync'd "context"/"dockerfile" dirs (fetched once)
 	cleanups  []func()
 	refs      map[string]string // LLBBridge result ref id -> materialised dir
@@ -72,6 +73,13 @@ func (b *gatewayBuild) cleanupAll() {
 // ensureLocals FileSyncs the build context and Dockerfile dir from the client
 // session into temp dirs, once per build. Returns the local://<name> dir map.
 func (s *controlServer) ensureLocals(ctx context.Context, b *gatewayBuild) (map[string]string, error) {
+	// Serialise the whole resolve: concurrent callers must not both FileSync the
+	// same session (BuildKit allows only one session connection at a time) nor
+	// race to populate localDirs. localsMu (not mu) is held across the FSSync so
+	// other short b.mu-guarded accesses aren't blocked for its duration.
+	b.localsMu.Lock()
+	defer b.localsMu.Unlock()
+
 	b.mu.Lock()
 	if b.localDirs != nil {
 		ld := b.localDirs
