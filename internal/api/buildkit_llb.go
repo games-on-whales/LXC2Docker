@@ -61,10 +61,14 @@ func (r skopeoMetaResolver) ResolveImageConfig(ctx context.Context, ref string, 
 // with zero diff IDs as "scratch" (convert.go: len(img.RootFS.DiffIDs)==0 →
 // llb.Scratch()), which silently drops the FROM base so every RUN executes on
 // an empty rootfs. Our executor materialises the base by ref (not by diff ID),
-// so a single stable synthetic diff ID keeps the base a real image while
-// staying deterministic across builds (important for LLB cache keys).
+// so a single synthetic diff ID keeps the base a real image while staying
+// deterministic across builds (important for LLB cache keys). It is derived
+// from the image's content identity (RepoDigest) so that re-pulling a moving
+// tag with new content changes the diff ID — and thus the base Source op and
+// every downstream RUN's cache key — instead of serving a stale cached result.
+// It falls back to the record ID when no digest is recorded yet.
 func imageRecordToOCIImage(rec *store.ImageRecord) dockerspec.DockerOCIImage {
-	baseDiffID := digest.FromString("dld-base:" + rec.ID)
+	baseDiffID := digest.FromString("dld-base:" + rec.ID + ":" + rec.RepoDigest)
 	return dockerspec.DockerOCIImage{
 		Image: ocispecs.Image{
 			Platform: ocispecs.Platform{Architecture: "amd64", OS: "linux"},
