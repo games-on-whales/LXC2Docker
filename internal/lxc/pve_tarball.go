@@ -303,6 +303,24 @@ func (m *Manager) BuildTarballFromContainer(tmpID, ref string) (string, error) {
 	return tarball, nil
 }
 
+// TarballFromDir captures a plain rootfs directory as an image tarball under
+// pve-templates/. The BuildKit LLB path stages its result as a directory (not a
+// CT), so finalize uses this instead of BuildTarballFromContainer. Returns the
+// tarball path.
+func (m *Manager) TarballFromDir(rootfsPath, ref string) (string, error) {
+	tarball := m.pveTemplateTarballPath(ref)
+	if err := os.MkdirAll(filepath.Dir(tarball), 0o755); err != nil {
+		return "", fmt.Errorf("manager: mkdir tarball dir: %w", err)
+	}
+	os.Remove(tarball)
+	if out, err := exec.Command("tar", "czf", tarball, "-C", rootfsPath, ".").CombinedOutput(); err != nil {
+		os.Remove(tarball)
+		return "", fmt.Errorf("manager: tar build rootfs: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	log.Printf("TarballFromDir: stored built image tarball %s for %s", tarball, ref)
+	return tarball, nil
+}
+
 // dirSizeGB returns the apparent on-disk size of a tarball's contents in whole
 // gigabytes. We size the CT rootfs from the tarball file size as a cheap proxy,
 // padded generously, with a 4G floor.

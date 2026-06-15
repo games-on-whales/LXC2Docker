@@ -209,6 +209,19 @@ func (h *Handler) openImageRootfs(rec *store.ImageRecord) (string, func(), error
 			return path, noop, nil
 		}
 	}
+	// Tarball-backed image (current PVE scheme): extract the rootfs to a temp
+	// dir so the build executor can use it as a base (FROM) source.
+	if rec.TemplateTarball != "" {
+		dir, err := os.MkdirTemp("", "build-base-*")
+		if err != nil {
+			return "", noop, err
+		}
+		if out, err := exec.Command("tar", "xzf", rec.TemplateTarball, "-C", dir).CombinedOutput(); err != nil {
+			os.RemoveAll(dir)
+			return "", noop, fmt.Errorf("extract image tarball %s: %s: %w", rec.TemplateTarball, strings.TrimSpace(string(out)), err)
+		}
+		return dir, func() { os.RemoveAll(dir) }, nil
+	}
 	// Legacy OCI records that kept only TemplateName can still point at
 	// a dataset — mirror recoverImageRecord's guess so they work too.
 	if rec.TemplateDataset == "" {

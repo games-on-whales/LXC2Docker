@@ -90,6 +90,12 @@ func (s *controlServer) Status(req *controlapi.StatusRequest, stream grpc.Server
 // (buildFromContext), streaming progress to the Status RPC as a single vertex
 // whose logs carry the build output.
 func (s *controlServer) Solve(ctx context.Context, req *controlapi.SolveRequest) (*controlapi.SolveResponse, error) {
+	// buildx's docker driver drives the Dockerfile frontend client-side: it
+	// sends an empty-frontend Solve and runs the build over the LLBBridge
+	// service (buildkit_gateway.go). Route those to the gateway coordinator.
+	if req.Frontend == "" && (req.Definition == nil || len(req.Definition.Def) == 0) {
+		return s.solveGateway(ctx, req)
+	}
 	if req.Frontend != dockerfileFrontend {
 		return nil, status.Errorf(codes.Unimplemented,
 			"docker-lxc-daemon only supports the %q frontend, got %q", dockerfileFrontend, req.Frontend)
