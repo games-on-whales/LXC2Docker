@@ -204,15 +204,6 @@ func (h *Handler) buildFromContext(ctxDir, dockerfilePath, tag, targetStage stri
 
 	step := 1
 	for idx, stage := range stages[:targetIdx+1] {
-		state, err := evaluateBuildStage(stage)
-		if err != nil {
-			cleanupStageImages()
-			fail(err.Error())
-			return
-		}
-		for k, v := range queryLabels {
-			state.labels[k] = v
-		}
 		resolvedBaseRef := resolveStageBaseRef(stage.baseRef, stageRefs)
 		scratchBase := isScratchBuildRef(resolvedBaseRef)
 		baseRef := normalizeImageRef(resolvedBaseRef)
@@ -229,6 +220,26 @@ func (h *Handler) buildFromContext(ctxDir, dockerfilePath, tag, targetStage stri
 			}
 		} else {
 			send(map[string]string{"stream": "Using empty scratch rootfs\n"})
+		}
+
+		// Resolve the base image's environment first so the stage inherits it
+		// (HOME, base PATH, ...). For a `FROM <previous-stage>` base this picks up
+		// that stage's committed env; for an external base it's the pulled image
+		// config. Scratch contributes none.
+		var baseEnv []string
+		if !scratchBase {
+			if baseImg := h.store.GetImage(baseRef); baseImg != nil {
+				baseEnv = baseImg.OCIEnv
+			}
+		}
+		state, err := evaluateBuildStage(stage, baseEnv)
+		if err != nil {
+			cleanupStageImages()
+			fail(err.Error())
+			return
+		}
+		for k, v := range queryLabels {
+			state.labels[k] = v
 		}
 
 		tmpID := "build-" + generateID()[:12]
@@ -499,10 +510,19 @@ func parseDockerfile(contents string) ([]dockerfileInstruction, error) {
 	return out, nil
 }
 
-func evaluateBuildStage(stage dockerfileStage) (buildState, error) {
+func evaluateBuildStage(stage dockerfileStage, baseEnv []string) (buildState, error) {
+	// Seed the environment from the base image so ENV instructions and RUN steps
+	// inherit it (notably HOME and the base PATH), matching Docker semantics —
+	// `ENV PATH="$HOME/.cargo/bin:$PATH"` only expands correctly if the base's
+	// HOME is in scope. Fall back to a sane default PATH for `FROM scratch` or a
+	// base that declares no environment of its own.
+	initEnv := baseEnv
+	if len(initEnv) == 0 {
+		initEnv = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+	}
 	state := buildState{
 		workdir: "/",
-		env:     []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+		env:     append([]string{}, initEnv...),
 		labels:  map[string]string{},
 	}
 	state.baseRef = stage.baseRef

@@ -82,7 +82,7 @@ func TestEvaluateBuildStagePreservesPortainerMetadata(t *testing.T) {
 		},
 	}
 
-	state, err := evaluateBuildStage(stage)
+	state, err := evaluateBuildStage(stage, nil)
 	if err != nil {
 		t.Fatalf("evaluate stage: %v", err)
 	}
