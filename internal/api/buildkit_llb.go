@@ -2,9 +2,11 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 
+	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/client/llb/sourceresolver"
 	"github.com/moby/buildkit/frontend/dockerfile/dockerfile2llb"
@@ -12,6 +14,7 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	"github.com/opencontainers/go-digest"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -20,15 +23,69 @@ import (
 // shells out to `skopeo inspect --config`, matching how the rest of the daemon
 // talks to registries (internal/oci). It only fetches metadata — the base
 // rootfs is materialised later by the executor's Source op.
-type skopeoMetaResolver struct{}
+type skopeoMetaResolver struct{ h *Handler }
 
-func (skopeoMetaResolver) ResolveImageConfig(ctx context.Context, ref string, _ sourceresolver.Opt) (string, digest.Digest, []byte, error) {
+func (r skopeoMetaResolver) ResolveImageConfig(ctx context.Context, ref string, _ sourceresolver.Opt) (string, digest.Digest, []byte, error) {
 	normalized := normalizeImageRef(ref)
+	// Prefer the local image store: ensure the base is pulled, then reconstruct
+	// its config from the record. This avoids a separate live-registry round-trip
+	// (skopeo inspect) per FROM — which is slow and rate-limited — and reuses the
+	// same image the executor will mount.
+	if r.h != nil {
+		// Already-pulled image: use its stored config directly.
+		if rec := r.h.store.GetImage(normalized); rec != nil {
+			if cfg, mErr := json.Marshal(imageRecordToOCIImage(rec)); mErr == nil {
+				return normalized, digest.FromBytes(cfg), cfg, nil
+			}
+		}
+		// Not local yet: pull it, then use the stored config.
+		if err := r.h.ensureBuildBaseImage(normalized, func(any) {}); err == nil {
+			if rec := r.h.store.GetImage(normalized); rec != nil {
+				if cfg, mErr := json.Marshal(imageRecordToOCIImage(rec)); mErr == nil {
+					return normalized, digest.FromBytes(cfg), cfg, nil
+				}
+			}
+		}
+	}
 	out, err := exec.CommandContext(ctx, "skopeo", "inspect", "--config", "docker://"+normalized).Output()
 	if err != nil {
 		return "", "", nil, fmt.Errorf("resolve base image %s: %w", normalized, err)
 	}
 	return normalized, digest.FromBytes(out), out, nil
+}
+
+// imageRecordToOCIImage reconstructs an OCI image config from a stored image
+// record (env/cmd/entrypoint/etc.), for FROM resolution and build export.
+//
+// RootFS.DiffIDs must be non-empty: dockerfile2llb treats a base image config
+// with zero diff IDs as "scratch" (convert.go: len(img.RootFS.DiffIDs)==0 →
+// llb.Scratch()), which silently drops the FROM base so every RUN executes on
+// an empty rootfs. Our executor materialises the base by ref (not by diff ID),
+// so a single synthetic diff ID keeps the base a real image while staying
+// deterministic across builds (important for LLB cache keys). It is derived
+// from the image's content identity (RepoDigest) so that re-pulling a moving
+// tag with new content changes the diff ID — and thus the base Source op and
+// every downstream RUN's cache key — instead of serving a stale cached result.
+// It falls back to the record ID when no digest is recorded yet.
+func imageRecordToOCIImage(rec *store.ImageRecord) dockerspec.DockerOCIImage {
+	baseDiffID := digest.FromString("dld-base:" + rec.ID + ":" + rec.RepoDigest)
+	return dockerspec.DockerOCIImage{
+		Image: ocispecs.Image{
+			Platform: ocispecs.Platform{Architecture: "amd64", OS: "linux"},
+			RootFS: ocispecs.RootFS{
+				Type:    "layers",
+				DiffIDs: []digest.Digest{baseDiffID},
+			},
+			Config: ocispecs.ImageConfig{
+				Env:        rec.OCIEnv,
+				Cmd:        rec.OCICmd,
+				Entrypoint: rec.OCIEntrypoint,
+				WorkingDir: rec.OCIWorkingDir,
+				User:       rec.OCIUser,
+				Labels:     rec.OCILabels,
+			},
+		},
+	}
 }
 
 // dockerfileToLLB converts Dockerfile bytes into a real BuildKit LLB definition

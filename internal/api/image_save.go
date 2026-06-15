@@ -209,6 +209,19 @@ func (h *Handler) openImageRootfs(rec *store.ImageRecord) (string, func(), error
 			return path, noop, nil
 		}
 	}
+	// Tarball-backed image (current PVE scheme): extract the rootfs to a temp
+	// dir so the build executor can use it as a base (FROM) source.
+	if rec.TemplateTarball != "" {
+		dir, err := os.MkdirTemp("", "build-base-*")
+		if err != nil {
+			return "", noop, err
+		}
+		if out, err := exec.Command("tar", "xzf", rec.TemplateTarball, "-C", dir).CombinedOutput(); err != nil {
+			os.RemoveAll(dir)
+			return "", noop, fmt.Errorf("extract image tarball %s: %s: %w", rec.TemplateTarball, strings.TrimSpace(string(out)), err)
+		}
+		return dir, func() { os.RemoveAll(dir) }, nil
+	}
 	// Legacy OCI records that kept only TemplateName can still point at
 	// a dataset — mirror recoverImageRecord's guess so they work too.
 	if rec.TemplateDataset == "" {
@@ -518,9 +531,10 @@ func (h *Handler) loadImage(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// importLoadedImage imports a single manifest entry: extracts its layer
-// into a fresh ZFS dataset, snapshots @tmpl, and persists an ImageRecord
-// carrying the OCI metadata from the config JSON.
+// importLoadedImage imports a single manifest entry: assembles its layers into
+// a rootfs tarball under pve-templates/ (the daemon's standard template
+// backing) and persists an ImageRecord carrying the OCI metadata from the
+// config JSON.
 func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send func(any)) error {
 	if len(entry.Layers) == 0 {
 		return fmt.Errorf("manifest entry has no layers")
@@ -543,15 +557,15 @@ func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send 
 	for _, ref := range entry.RepoTags {
 		normRef := normalizeImageRef(ref)
 		send(map[string]string{"status": fmt.Sprintf("Loading layer for image: %s", normRef)})
-		dataset, err := h.createLoadedImageDataset(stage, entry.Layers, normRef)
+		tarball, err := h.stageLoadedImageTarball(stage, entry.Layers, normRef)
 		if err != nil {
-			return fmt.Errorf("create dataset for %s: %w", normRef, err)
+			return fmt.Errorf("stage rootfs for %s: %w", normRef, err)
 		}
 		rec := &store.ImageRecord{
 			ID:                 "loaded_" + oci.SafeDirName(normRef),
 			Ref:                normRef,
 			Arch:               orDefault(cfg.Architecture, "amd64"),
-			TemplateDataset:    dataset,
+			TemplateTarball:    tarball,
 			Created:            createdAt,
 			Release:            cfg.OSVersion,
 			OCIAuthor:          cfg.Author,
@@ -601,37 +615,26 @@ func (h *Handler) importLoadedImage(stage string, entry saveManifestEntry, send 
 	return nil
 }
 
-// createLoadedImageDataset picks a fresh ZFS dataset name, creates it
-// with an explicit mountpoint (the parent dataset inherits mountpoint=none,
-// so children need their own), extracts every referenced layer tar into
-// it in order, takes the @tmpl snapshot the rest of the daemon expects on
-// templates, and returns the dataset path.
-func (h *Handler) createLoadedImageDataset(stage string, layers []string, ref string) (string, error) {
-	storage := h.mgr.PVEStorage()
-	parentDS := storage + "/dld-templates"
-	dataset := fmt.Sprintf("%s/%s", parentDS, oci.SafeDirName(ref))
-	mountPoint := "/" + dataset
-	// Mirror pullOCI: ensure the parent dataset exists and force the new
-	// per-image dataset's mountpoint so /.zfs/snapshot/tmpl is reachable.
-	_, _ = exec.Command("zfs", "create", "-p", "-o", "mountpoint=none", parentDS).CombinedOutput()
-	// Idempotent re-load: destroy any stale dataset first so the @tmpl
-	// snapshot is replaced cleanly.
-	_, _ = exec.Command("zfs", "destroy", "-r", dataset).CombinedOutput()
-	if out, err := exec.Command("zfs", "create", "-o", "mountpoint="+mountPoint, dataset).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("zfs create %s: %s: %w", dataset, out, err)
+// stageLoadedImageTarball assembles a docker-save image's layers into a rootfs
+// tarball under pve-templates/, exactly as pulled and built images are stored
+// (TemplateTarball). This keeps loaded images on the daemon's single template
+// scheme: ImageReady recognises the tarball, and the first `docker run`
+// materialises the dld-tmpl-<id>@base clone source from it via
+// ensureImageTemplateDataset — so a loaded image runs identically to a pulled
+// one. Layers are extracted in manifest order (later layers overlay earlier
+// ones). Returns the tarball path.
+func (h *Handler) stageLoadedImageTarball(stage string, layers []string, ref string) (string, error) {
+	rootfs, err := os.MkdirTemp(h.mgr.CacheDir(), "dld-load-rootfs-*")
+	if err != nil {
+		return "", err
 	}
+	defer os.RemoveAll(rootfs)
 	for _, layer := range layers {
-		layerPath := filepath.Join(stage, layer)
-		if err := extractTarInto(layerPath, mountPoint); err != nil {
-			_, _ = exec.Command("zfs", "destroy", "-r", dataset).CombinedOutput()
+		if err := extractTarInto(filepath.Join(stage, layer), rootfs); err != nil {
 			return "", fmt.Errorf("extract %s: %w", layer, err)
 		}
 	}
-	if out, err := exec.Command("zfs", "snapshot", dataset+"@tmpl").CombinedOutput(); err != nil {
-		_, _ = exec.Command("zfs", "destroy", "-r", dataset).CombinedOutput()
-		return "", fmt.Errorf("zfs snapshot %s@tmpl: %s: %w", dataset, out, err)
-	}
-	return dataset, nil
+	return h.mgr.TarballFromDir(rootfs, ref)
 }
 
 // extractBundleTar unpacks a docker-save bundle into destDir. Used by

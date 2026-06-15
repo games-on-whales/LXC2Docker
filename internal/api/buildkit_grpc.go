@@ -11,6 +11,7 @@ import (
 
 	controlapi "github.com/moby/buildkit/api/services/control"
 	bktypes "github.com/moby/buildkit/api/types"
+	gwpb "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/session"
 	pb "github.com/moby/buildkit/solver/pb"
 	"google.golang.org/grpc"
@@ -37,6 +38,7 @@ func newBuildkitControlServer(h *Handler) *grpc.Server {
 		h:        h,
 		sm:       sm,
 		statuses: map[string]*solveStatus{},
+		gwBuilds: map[string]*gatewayBuild{},
 	}
 	// Share the session manager with the HTTP layer so the /session endpoint
 	// (buildx's docker driver opens it for build-context FileSync) registers
@@ -48,6 +50,10 @@ func newBuildkitControlServer(h *Handler) *grpc.Server {
 	cs.fetchFn = cs.fetchBuildContext
 	srv := grpc.NewServer()
 	controlapi.RegisterControlServer(srv, cs)
+	// buildx's docker driver drives the Dockerfile frontend client-side and
+	// calls the LLBBridge service back over this same connection. A separate
+	// type is required because both services declare a Solve method.
+	gwpb.RegisterLLBBridgeServer(srv, &gatewayBridge{cs: cs})
 	return srv
 }
 
@@ -82,6 +88,12 @@ type controlServer struct {
 	// stream by build Ref. See buildkit_solve.go.
 	statusMu sync.Mutex
 	statuses map[string]*solveStatus
+
+	// gwBuilds holds in-flight gateway-mode builds (buildx's docker driver),
+	// keyed by build ref. The LLBBridge service (buildkit_gateway.go) drives
+	// them; the outer Control.Solve waits on Return.
+	gwMu     sync.Mutex
+	gwBuilds map[string]*gatewayBuild
 
 	// buildFn runs the actual Dockerfile build once the context is fetched.
 	// It defaults to buildViaLLB; tests override it to exercise the Solve

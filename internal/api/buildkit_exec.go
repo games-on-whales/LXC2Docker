@@ -30,16 +30,20 @@ type secretFunc func(ctx context.Context, id string) ([]byte, error)
 type llbExecutor struct {
 	h         *Handler
 	ctx       context.Context
-	ctxDir    string       // local://context root (FileSync'd build context)
-	scratch   string       // parent dir for all snapshots, removed after the build
-	emit      func(string) // progress log sink
-	getSecret secretFunc   // RUN --mount=type=secret resolver (may be nil)
+	ctxDir    string            // local://context root (FileSync'd build context)
+	localDirs map[string]string // every local://<name> source root (gateway builds use "context" + "dockerfile")
+	scratch   string            // parent dir for all snapshots, removed after the build
+	emit      func(string)      // progress log sink
+	getSecret secretFunc        // RUN --mount=type=secret resolver (may be nil)
 
 	byDigest map[digest.Digest]*pb.Op
 	// opOutputs memoises every output directory of an op, keyed by output index.
 	opOutputs map[digest.Digest]map[int64]string
 	// images caches resolved base-image rootfs dirs within a single build.
 	images map[string]string
+	// cleanups release resources acquired during the build (e.g. base-image
+	// rootfs extractions/mounts from openImageRootfs); run once at build end.
+	cleanups []func()
 
 	// cacheDir is the persistent cross-build op-output cache (empty = off).
 	cacheDir      string
@@ -50,6 +54,14 @@ type llbExecutor struct {
 // returns the directory holding the final build result. The caller imports it
 // as an image.
 func (h *Handler) solveLLB(ctx context.Context, ctxDir string, def *llb.Definition, emit func(string), getSecret secretFunc) (resultDir string, cleanup func(), err error) {
+	return h.solveLLBLocals(ctx, map[string]string{"context": ctxDir}, def, emit, getSecret)
+}
+
+// solveLLBLocals is solveLLB with arbitrary named local sources. The classic
+// dockerfile path has only "context"; gateway builds (buildx's client-side
+// dockerfile frontend) also reference "dockerfile". The "context" entry, if
+// present, doubles as the legacy ctxDir.
+func (h *Handler) solveLLBLocals(ctx context.Context, localDirs map[string]string, def *llb.Definition, emit func(string), getSecret secretFunc) (resultDir string, cleanup func(), err error) {
 	verts, byDigest, err := llbOps(def)
 	if err != nil {
 		return "", nil, err
@@ -76,7 +88,6 @@ func (h *Handler) solveLLB(ctx context.Context, ctxDir string, def *llb.Definiti
 	if err != nil {
 		return "", nil, err
 	}
-	cleanup = func() { os.RemoveAll(scratch) }
 
 	cacheDir := filepath.Join(h.cacheDir(), buildCacheSubdir)
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
@@ -86,7 +97,8 @@ func (h *Handler) solveLLB(ctx context.Context, ctxDir string, def *llb.Definiti
 	e := &llbExecutor{
 		h:             h,
 		ctx:           ctx,
-		ctxDir:        ctxDir,
+		ctxDir:        localDirs["context"],
+		localDirs:     localDirs,
 		scratch:       scratch,
 		emit:          emit,
 		getSecret:     getSecret,
@@ -95,6 +107,15 @@ func (h *Handler) solveLLB(ctx context.Context, ctxDir string, def *llb.Definiti
 		images:        map[string]string{},
 		cacheDir:      cacheDir,
 		cacheableMemo: map[digest.Digest]bool{},
+	}
+	// Run base-image extractions/mounts acquired during the build, then remove
+	// the snapshot scratch. Ordered so the result dir (consumed by the caller
+	// before cleanup) outlives nothing it depends on.
+	cleanup = func() {
+		for _, fn := range e.cleanups {
+			fn()
+		}
+		os.RemoveAll(scratch)
 	}
 	dir, err := e.inputDir(resultEdge)
 	if err != nil {
@@ -200,9 +221,13 @@ func (e *llbExecutor) execSource(src *pb.SourceOp) (string, error) {
 	id := src.GetIdentifier()
 	switch {
 	case strings.HasPrefix(id, "local://"):
-		// The build context (and any named context) — surfaced read-only.
+		// The build context and any named local (gateway builds also send
+		// "dockerfile") — surfaced read-only from the FileSync'd dirs.
 		name := strings.TrimPrefix(id, "local://")
-		if name == "context" {
+		if dir, ok := e.localDirs[name]; ok {
+			return dir, nil
+		}
+		if name == "context" && e.ctxDir != "" {
 			return e.ctxDir, nil
 		}
 		return "", fmt.Errorf("unsupported local source %q", name)
@@ -243,10 +268,11 @@ func (e *llbExecutor) resolveImageRootfs(ref string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("open image rootfs %s: %w", norm, err)
 	}
-	// openImageRootfs may mount; keep it mounted for the build and unmount at
-	// scratch teardown by deferring through the executor's cleanup chain.
+	// openImageRootfs may extract a tarball to a temp dir (or mount): keep it
+	// for the duration of the build and release it via the executor cleanup
+	// chain at build end, so per-build base extractions don't leak.
 	e.images[norm] = root
-	_ = cleanup // mounts are released when the daemon GCs; acceptable for v1
+	e.cleanups = append(e.cleanups, cleanup)
 	return root, nil
 }
 

@@ -52,7 +52,7 @@ func (h *Handler) buildLLBResult(ctx context.Context, ctxDir, dockerfilePath, ta
 	emit := func(s string) { send(map[string]string{"stream": s}) }
 	emit(fmt.Sprintf("Converting %s to LLB\n", dockerfilePath))
 
-	def, image, err := dockerfileToLLB(ctx, dfBytes, target, buildArgs, labels, skopeoMetaResolver{})
+	def, image, err := dockerfileToLLB(ctx, dfBytes, target, buildArgs, labels, skopeoMetaResolver{h: h})
 	if err != nil {
 		return "", nil, nil, fmt.Errorf("dockerfile to LLB: %w", err)
 	}
