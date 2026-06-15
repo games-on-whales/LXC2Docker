@@ -41,6 +41,9 @@ type llbExecutor struct {
 	opOutputs map[digest.Digest]map[int64]string
 	// images caches resolved base-image rootfs dirs within a single build.
 	images map[string]string
+	// cleanups release resources acquired during the build (e.g. base-image
+	// rootfs extractions/mounts from openImageRootfs); run once at build end.
+	cleanups []func()
 
 	// cacheDir is the persistent cross-build op-output cache (empty = off).
 	cacheDir      string
@@ -85,7 +88,6 @@ func (h *Handler) solveLLBLocals(ctx context.Context, localDirs map[string]strin
 	if err != nil {
 		return "", nil, err
 	}
-	cleanup = func() { os.RemoveAll(scratch) }
 
 	cacheDir := filepath.Join(h.cacheDir(), buildCacheSubdir)
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
@@ -105,6 +107,15 @@ func (h *Handler) solveLLBLocals(ctx context.Context, localDirs map[string]strin
 		images:        map[string]string{},
 		cacheDir:      cacheDir,
 		cacheableMemo: map[digest.Digest]bool{},
+	}
+	// Run base-image extractions/mounts acquired during the build, then remove
+	// the snapshot scratch. Ordered so the result dir (consumed by the caller
+	// before cleanup) outlives nothing it depends on.
+	cleanup = func() {
+		for _, fn := range e.cleanups {
+			fn()
+		}
+		os.RemoveAll(scratch)
 	}
 	dir, err := e.inputDir(resultEdge)
 	if err != nil {
@@ -257,10 +268,11 @@ func (e *llbExecutor) resolveImageRootfs(ref string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("open image rootfs %s: %w", norm, err)
 	}
-	// openImageRootfs may mount; keep it mounted for the build and unmount at
-	// scratch teardown by deferring through the executor's cleanup chain.
+	// openImageRootfs may extract a tarball to a temp dir (or mount): keep it
+	// for the duration of the build and release it via the executor cleanup
+	// chain at build end, so per-build base extractions don't leak.
 	e.images[norm] = root
-	_ = cleanup // mounts are released when the daemon GCs; acceptable for v1
+	e.cleanups = append(e.cleanups, cleanup)
 	return root, nil
 }
 
