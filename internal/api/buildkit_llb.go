@@ -76,7 +76,15 @@ func imageRecordToOCIImage(rec *store.ImageRecord) dockerspec.DockerOCIImage {
 				Type:    "layers",
 				DiffIDs: []digest.Digest{baseDiffID},
 			},
-			Config: ocispecs.ImageConfig{
+		},
+		// DockerOCIImage shadows the embedded ocispecs.Image.Config with its own
+		// Config field (json:"config"), so the config MUST be set here — setting
+		// the embedded ocispecs.Image.Config instead marshals an empty "config",
+		// dropping the base image's Env (HOME, PATH, ...). dockerfile2llb then sees
+		// a base with no environment and falls back to a default PATH, breaking
+		// `ENV PATH="$HOME/.cargo/bin:$PATH"`-style instructions during the build.
+		Config: dockerspec.DockerOCIImageConfig{
+			ImageConfig: ocispecs.ImageConfig{
 				Env:        rec.OCIEnv,
 				Cmd:        rec.OCICmd,
 				Entrypoint: rec.OCIEntrypoint,
