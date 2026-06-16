@@ -38,9 +38,12 @@ type Manager struct {
 	pveStgType string // backend type of pveStorage: "zfspool", "lvmthin", "dir", …
 	lan        LANConfig
 	store      *store.Store
-	// tmplMu serializes ZFS image-template materialization so two concurrent
-	// launches of the same image don't race to create the template dataset.
-	tmplMu sync.Mutex
+	// tmplMu guards tmplLocks. tmplLocks holds one mutex per image so concurrent
+	// launches of the SAME image serialize their template materialization (no
+	// racing to create the dataset/CT), while launches of DIFFERENT images
+	// materialize in parallel instead of queueing behind one global lock.
+	tmplMu    sync.Mutex
+	tmplLocks map[string]*sync.Mutex
 	// minFreeBytes is the low-space threshold for the create pre-flight and the
 	// disk-pressure watcher. Zero disables both. Set via SetMinFreeBytes.
 	minFreeBytes uint64
@@ -1086,7 +1089,11 @@ func (m *Manager) CreateContainer(id, imageRef string, cfg ContainerConfig) erro
 		if m.pveStorageIsZFS() && !cfg.ProxmoxCT {
 			return m.createZFSCloneFromTarball(id, rec, cfg)
 		}
-		if m.pveStorageSupportsLinkedClone() {
+		// A UI-visible CT (ProxmoxCT) can't use the raw-clone path above — that
+		// yields a raw-LXC CT invisible to the Proxmox UI. But ZFS still backs
+		// linked CT clones, so route it through the linked-clone path rather than
+		// re-extracting the whole tarball via pct create on every launch.
+		if m.pveStorageSupportsLinkedClone() || m.pveStorageIsZFS() {
 			return m.createPVELinkedCloneFromTarball(id, rec, cfg)
 		}
 		return m.createPVEFromTarball(id, rec, cfg)
@@ -1664,13 +1671,21 @@ func (m *Manager) maybeLeaseLANDHCP(id string) {
 		return
 	}
 	// pct doesn't always expose the init PID immediately for privileged/nested
-	// CTs; poll briefly so we lease once the netns is actually up.
+	// CTs; poll briefly so we lease once the netns is actually up. Ramp the
+	// interval (20ms → 300ms) like startPVEContainer: a CT whose PID is ready
+	// almost immediately is detected in tens of ms instead of waiting out a flat
+	// 300ms tick, while a slow one still backs off to the same ~9s ceiling.
 	var pid int
-	for i := 0; i < 30; i++ {
+	deadline := time.Now().Add(9 * time.Second)
+	interval := 20 * time.Millisecond
+	for time.Now().Before(deadline) {
 		if pid = m.InitPID(id); pid > 0 {
 			break
 		}
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(interval)
+		if interval < 300*time.Millisecond {
+			interval *= 2
+		}
 	}
 	if pid <= 0 {
 		log.Printf("LAN DHCP: no init PID for %s, skipping lease", id[:12])
@@ -2458,16 +2473,72 @@ func sanitizeHostname(s string) string {
 }
 
 // allocateVMID requests the next available Proxmox VMID.
+// vmidLowerBound is the first VMID we hand out, matching Proxmox's default
+// floor for `pvesh get /cluster/nextid` (datacenter.cfg can raise it, but a
+// non-default lower bound is rare and a higher free ID is always safe to use).
+const vmidLowerBound = 100
+
+var (
+	// vmidMu serializes allocateVMID so concurrent container creates in this
+	// process can't be handed the same free VMID between the disk scan and the
+	// config write that commits it.
+	vmidMu sync.Mutex
+	// vmidReserved holds IDs allocateVMID handed out that aren't yet visible on
+	// disk (the caller hasn't written /etc/pve/.../<id>.conf). Entries are pruned
+	// once they appear on disk; a create that fails before writing its config
+	// leaks one entry until restart, which is harmless given the VMID space.
+	vmidReserved = map[int]bool{}
+)
+
+// allocateVMID returns the lowest unused Proxmox VMID >= vmidLowerBound. It
+// replaces `pvesh get /cluster/nextid` — which loads the entire PVE Perl API
+// (~0.5–1s) on every invocation and is called once or twice per create — with a
+// direct scan of the cluster config dirs. An in-process reservation set closes
+// the same-instant race two concurrent creates would otherwise hit (the same
+// race `pvesh`-then-create has across the cluster, which Proxmox accepts).
 func allocateVMID() (int, error) {
-	out, err := exec.Command("pvesh", "get", "/cluster/nextid").Output()
+	vmidMu.Lock()
+	defer vmidMu.Unlock()
+
+	used, err := usedVMIDs()
 	if err != nil {
 		return 0, fmt.Errorf("allocate VMID: %w", err)
 	}
-	var vmid int
-	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &vmid); err != nil {
-		return 0, fmt.Errorf("parse VMID %q: %w", string(out), err)
+	// Drop reservations that have since been committed to disk; only genuinely
+	// in-flight IDs need to stay reserved.
+	for id := range vmidReserved {
+		if used[id] {
+			delete(vmidReserved, id)
+		}
 	}
-	return vmid, nil
+	for id := vmidLowerBound; ; id++ {
+		if used[id] || vmidReserved[id] {
+			continue
+		}
+		vmidReserved[id] = true
+		return id, nil
+	}
+}
+
+// usedVMIDs returns the set of VMIDs currently allocated on this node, read from
+// the cluster config: every <vmid>.conf under /etc/pve/lxc (containers) and
+// /etc/pve/qemu-server (VMs). A missing dir is not an error — a node may have no
+// CTs or no VMs.
+func usedVMIDs() (map[int]bool, error) {
+	used := map[int]bool{}
+	for _, dir := range []string{"/etc/pve/lxc", "/etc/pve/qemu-server"} {
+		entries, err := filepath.Glob(filepath.Join(dir, "*.conf"))
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range entries {
+			base := strings.TrimSuffix(filepath.Base(path), ".conf")
+			if vmid, err := strconv.Atoi(base); err == nil {
+				used[vmid] = true
+			}
+		}
+	}
+	return used, nil
 }
 
 // pveRootfsPath returns the rootfs path for a Proxmox CT on ZFS storage.
