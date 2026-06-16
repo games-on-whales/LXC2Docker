@@ -390,12 +390,21 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Capture the image's resolved digest so warm reuse can later detect a
+	// mutable-tag (":latest") repoint and re-clone instead of adopting a stale
+	// rootfs. The image is guaranteed present here (ensured/pulled above).
+	imageDigest := ""
+	if ir := h.store.GetImage(imageRef); ir != nil {
+		imageDigest = ir.RepoDigest
+	}
+
 	// Persist record before creating so the IP is allocated.
 	rec := &store.ContainerRecord{
 		ID:              id,
 		Name:            name,
 		Image:           req.Image,
 		ImageID:         imageRef,
+		ImageDigest:     imageDigest,
 		Created:         time.Now(),
 		Entrypoint:      entrypoint,
 		Cmd:             cmd,
@@ -522,7 +531,24 @@ func (h *Handler) reusableContainer(old *store.ContainerRecord, imageRef string)
 		return false
 	}
 	if old.ImageID != imageRef {
-		return false // image changed — the warm rootfs is stale, clone fresh
+		return false // image ref/tag changed — the warm rootfs is stale, clone fresh
+	}
+	// A mutable tag (e.g. ":latest") can be repointed to a NEW digest under the
+	// same ref, so the ref matching is not enough — the warm rootfs is only valid
+	// if it was cloned from the image content currently backing that ref. Compare
+	// the resolved manifest digest; reuse ONLY when both are known and equal.
+	// Otherwise (digest changed, or either side unknown) the rootfs can't be
+	// confirmed current, so clone fresh — this is the fix for a `:latest` image
+	// bump silently leaving a reused container on its old rootfs.
+	cur := h.store.GetImage(imageRef)
+	curDigest := ""
+	if cur != nil {
+		curDigest = cur.RepoDigest
+	}
+	if old.ImageDigest == "" || curDigest == "" || old.ImageDigest != curDigest {
+		log.Printf("reusableContainer: not reusing CT %d (%s): image digest drift (rootfs=%q current=%q)",
+			old.VMID, imageRef, old.ImageDigest, curDigest)
+		return false
 	}
 	if st, _ := h.mgr.State(old.ID); st == "running" {
 		return false // can't reconfigure a live container out from under itself

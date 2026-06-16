@@ -29,6 +29,12 @@ type ContainerRecord struct {
 	Name          string            `json:"name"`     // Docker-style name (no leading slash)
 	Image         string            `json:"image"`    // Original image:tag as requested
 	ImageID       string            `json:"image_id"` // Resolved image identifier
+	// ImageDigest is the registry manifest digest ("sha256:…") of the image this
+	// container's warm rootfs was cloned from. Recorded at create so warm reuse
+	// (DLD_REUSE_CONTAINERS) can tell when a mutable tag (e.g. ":latest") has been
+	// repointed to a NEW digest — in which case the warm rootfs is stale and must
+	// be re-cloned rather than adopted. Empty for pre-existing/legacy records.
+	ImageDigest string `json:"image_digest,omitempty"`
 	Created       time.Time         `json:"created"`
 	Entrypoint    []string          `json:"entrypoint"`
 	Cmd           []string          `json:"cmd"`
