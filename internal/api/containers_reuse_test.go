@@ -59,3 +59,43 @@ func TestReusableContainerGuards(t *testing.T) {
 		t.Error("nil record: expected not reusable")
 	}
 }
+
+// TestReusableContainerDigestDrift covers the core fix: a mutable tag (":latest")
+// can be repointed to a NEW digest under the SAME ref, so ref-match alone must not
+// adopt a stale warm rootfs. These cases all return before the running-state check
+// (so a nil mgr is fine) but need a real store for the image-digest lookup.
+func TestReusableContainerDigestDrift(t *testing.T) {
+	t.Setenv("DLD_REUSE_CONTAINERS", "1")
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	h := &Handler{store: st}
+
+	// Current image backing :latest is at digest NEW.
+	if err := st.AddImage(&store.ImageRecord{Ref: "img:latest", RepoDigest: "sha256:NEW"}); err != nil {
+		t.Fatalf("AddImage: %v", err)
+	}
+
+	// Warm rootfs cloned from the OLD digest → must NOT be reused (the bug:
+	// previously reused because the ref ":latest" still matched).
+	old := &store.ContainerRecord{ID: "c1", Name: "n", ImageID: "img:latest", VMID: 100,
+		ImageDigest: "sha256:OLD"}
+	if h.reusableContainer(old, "img:latest") {
+		t.Error("digest drift (OLD vs NEW): expected not reusable")
+	}
+
+	// Unknown clone-time digest (legacy record) can't be confirmed current → not reusable.
+	legacy := &store.ContainerRecord{ID: "c2", Name: "n", ImageID: "img:latest", VMID: 100,
+		ImageDigest: ""}
+	if h.reusableContainer(legacy, "img:latest") {
+		t.Error("unknown clone digest: expected not reusable")
+	}
+
+	// Current image digest unknown (image not recorded / no RepoDigest) → not reusable.
+	missing := &store.ContainerRecord{ID: "c3", Name: "n", ImageID: "img:unknown", VMID: 100,
+		ImageDigest: "sha256:OLD"}
+	if h.reusableContainer(missing, "img:unknown") {
+		t.Error("unknown current digest: expected not reusable")
+	}
+}
