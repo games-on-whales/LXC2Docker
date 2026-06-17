@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/games-on-whales/LXC2Docker/internal/oci"
@@ -561,14 +562,34 @@ func (m *Manager) imageTemplateDataset(imgRec *store.ImageRecord) string {
 	return fmt.Sprintf("%s/dld-tmpl-%s", m.pveStorage, sanitizeDatasetToken(imgRec.ID))
 }
 
+// imageTemplateLock returns the mutex guarding template materialization for one
+// image, creating it on first use. Per-image locking lets different images
+// materialize concurrently while same-image launches still serialize. The
+// returned lock is held for the duration of a materialization, so the brief
+// tmplMu critical section here only protects the map itself.
+func (m *Manager) imageTemplateLock(imageID string) *sync.Mutex {
+	m.tmplMu.Lock()
+	defer m.tmplMu.Unlock()
+	if m.tmplLocks == nil {
+		m.tmplLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := m.tmplLocks[imageID]
+	if !ok {
+		mu = &sync.Mutex{}
+		m.tmplLocks[imageID] = mu
+	}
+	return mu
+}
+
 // ensureImageTemplateDataset materializes an image's rootfs tarball into its
 // template dataset exactly once and returns the @base snapshot to clone from.
 // Subsequent calls (and launches after a daemon restart) detect the existing
 // snapshot and return immediately. Serialized by tmplMu so concurrent launches
 // of the same image can't race the create/unpack/snapshot sequence.
 func (m *Manager) ensureImageTemplateDataset(imgRec *store.ImageRecord) (string, error) {
-	m.tmplMu.Lock()
-	defer m.tmplMu.Unlock()
+	mu := m.imageTemplateLock(imgRec.ID)
+	mu.Lock()
+	defer mu.Unlock()
 
 	ds := m.imageTemplateDataset(imgRec)
 	snap := ds + "@base"
@@ -648,8 +669,9 @@ func imageTemplateCTHostname(imgRec *store.ImageRecord) string {
 // Proxmox UI — the cost of staying on the supported `pct clone` path for
 // block-device storages that expose no raw clone primitive the daemon can drive.
 func (m *Manager) ensureImageTemplateCT(imgRec *store.ImageRecord) (int, error) {
-	m.tmplMu.Lock()
-	defer m.tmplMu.Unlock()
+	mu := m.imageTemplateLock(imgRec.ID)
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Already materialized? (record carries the VMID and its config still exists)
 	if rec := m.store.GetImage(imgRec.Ref); rec != nil && rec.TemplateVMID > 0 {
@@ -705,10 +727,11 @@ func (m *Manager) ensureImageTemplateCT(imgRec *store.ImageRecord) (int, error) 
 // createPVELinkedCloneFromTarball provisions a Proxmox CT by linked-cloning the
 // image's template CT — an instant copy-on-write clone instead of re-extracting
 // the rootfs tarball with `pct create` on every launch. Used on snapshot-capable
-// block storages (lvmthin) where the ZFS raw-clone fast path doesn't apply. The
-// container is a normal CT, visible and managed via pct exactly like the
-// pct-create path. Any failure falls back to that path so a launch never
-// hard-fails on the fast path.
+// storages: lvmthin (where the ZFS raw-clone fast path doesn't apply) and ZFS
+// for UI-visible CTs, which can't take the raw-clone path because it yields an
+// invisible raw-LXC CT. The container is a normal CT, visible and managed via
+// pct exactly like the pct-create path. Any failure falls back to that path so a
+// launch never hard-fails on the fast path.
 func (m *Manager) createPVELinkedCloneFromTarball(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
 	tmplVMID, err := m.ensureImageTemplateCT(imgRec)
 	if err != nil {

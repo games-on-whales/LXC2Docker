@@ -497,6 +497,12 @@ func (e *llbExecutor) execFile(file *pb.FileOp, inputDirs []string) (map[int64]s
 	return outs, nil
 }
 
+// pathHasWildcard reports whether p contains a shell glob metacharacter that
+// filepath.Glob would expand.
+func pathHasWildcard(p string) bool {
+	return strings.ContainsAny(p, "*?[")
+}
+
 func (e *llbExecutor) applyFileAction(work string, state []string, act *pb.FileAction) error {
 	switch a := act.GetAction().(type) {
 	case *pb.FileAction_Copy:
@@ -515,6 +521,35 @@ func (e *llbExecutor) applyFileAction(work string, state []string, act *pb.FileA
 		dstAbs, err := safeJoin(work, c.GetDest())
 		if err != nil {
 			return err
+		}
+		// Wildcard source (e.g. `COPY foo/* /dest/`): BuildKit leaves the pattern
+		// in Src and sets AllowWildcard, expecting the executor to glob it. Expand
+		// and copy each match into the destination directory (matching Docker's
+		// multi-source COPY semantics). Without this the literal `*` is stat'd and
+		// the copy fails with "no such file or directory".
+		if c.GetAllowWildcard() && pathHasWildcard(c.GetSrc()) {
+			matches, gerr := filepath.Glob(srcAbs)
+			if gerr != nil {
+				return fmt.Errorf("copy: bad wildcard %q: %w", c.GetSrc(), gerr)
+			}
+			if len(matches) == 0 {
+				// The Dockerfile frontend always sets AllowEmptyWildcard for COPY, so a
+				// wildcard that matches nothing is a no-op (e.g. an optional set of files
+				// already provided elsewhere), not an error — matching buildkit.
+				if c.GetAllowEmptyWildcard() {
+					return nil
+				}
+				return fmt.Errorf("copy: no source files match %q", c.GetSrc())
+			}
+			if err := os.MkdirAll(dstAbs, 0o755); err != nil {
+				return err
+			}
+			for _, m := range matches {
+				if err := copyTree(m, filepath.Join(dstAbs, filepath.Base(m))); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
 		if c.GetCreateDestPath() {
 			if err := os.MkdirAll(filepath.Dir(dstAbs), 0o755); err != nil {
