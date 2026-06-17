@@ -356,7 +356,14 @@ func (h *Handler) buildFromContext(ctxDir, dockerfilePath, tag, targetStage stri
 				// command runs in a real container (working /proc, reliable exec,
 				// and networking for apt) instead of a chroot.
 				runArgv := buildRunArgv(shellArgs, currentUser, script)
-				cmd := h.mgr.ExecAs(tmpID, runArgv, append(os.Environ(), state.env...), "")
+				// The stage env (base image config + Dockerfile ENV) must be
+				// authoritative for RUN, not the daemon's. append(os.Environ(),
+				// state.env...) left a duplicate PATH= with the daemon's value
+				// first; glibc getenv reads the first, so tools the base image puts
+				// outside the default PATH (e.g. golang's /usr/local/go/bin) were
+				// invisible → "go: not found". mergeEnv dedupes and lets state.env
+				// win, so the image's PATH/HOME/GOPATH take effect.
+				cmd := h.mgr.ExecAs(tmpID, runArgv, mergeEnv(os.Environ(), state.env), "")
 				out, err := cmd.CombinedOutput()
 				if len(out) > 0 {
 					send(map[string]string{"stream": string(out)})
