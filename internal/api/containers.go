@@ -1242,6 +1242,14 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Whether to multiplex the stream depends on the container's TTY config,
+	// exactly as in attachContainer: the Docker CLI/SDK strips the 8-byte
+	// stdout/stderr frame header ONLY when Config.Tty is false. A TTY container
+	// has its log body io.Copy'd raw, so framing it splices binary headers into
+	// the user's output. Match the container's recorded Tty.
+	rec := h.store.GetContainer(id)
+	tty := rec != nil && rec.Tty
+
 	q := r.URL.Query()
 	stdout := q.Get("stdout") == "1" || q.Get("stdout") == "true"
 	stderr := q.Get("stderr") == "1" || q.Get("stderr") == "true"
@@ -1275,27 +1283,19 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 		streamID = 2
 	}
 
-	// When since/until are active we gate every line through the current
-	// wall clock — the console.log has no per-line timestamps, so the best
-	// we can do is accept lines when "now" is inside the window. For a
-	// live-tailing session (follow=1) this filters out nothing initially
-	// but correctly clips when until fires.
-	inWindow := func() bool {
-		t := time.Now()
-		if !since.IsZero() && t.Before(since) {
-			return false
+	// emit writes one payload to the client. Non-TTY containers use Docker's
+	// multiplexed stream framing (an 8-byte stdout/stderr header); TTY
+	// containers get the bytes raw. When stamp is set the line is prefixed with
+	// `observed` in RFC3339Nano, matching `docker logs --timestamps`.
+	emit := func(line []byte, observed time.Time, stamp bool) {
+		if stamp {
+			line = append([]byte(observed.UTC().Format(time.RFC3339Nano)+" "), line...)
 		}
-		if !until.IsZero() && t.After(until) {
-			return false
+		if tty {
+			w.Write(line)
+		} else {
+			writeLogFrame(w, streamID, line)
 		}
-		return true
-	}
-	emit := func(line []byte) {
-		if timestamps {
-			prefix := time.Now().UTC().Format(time.RFC3339Nano) + " "
-			line = append([]byte(prefix), line...)
-		}
-		writeLogFrame(w, streamID, line)
 	}
 
 	// Backfill phase. When tail is set we collect the last N lines into a
@@ -1305,6 +1305,16 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	// rotated we may need to pull older lines from <log>.1 to satisfy the
 	// request; otherwise tail=100 returns mostly-empty output right after
 	// a rotation.
+	//
+	// since/until/timestamps caveat: the LXC console log has NO per-line
+	// timestamps, so historical lines carry no time we can filter or stamp
+	// with. We emit the requested tail verbatim and apply since/until +
+	// --timestamps only to live-followed lines below, where the arrival time
+	// is a faithful proxy for the entry time. (The previous code stamped every
+	// backfilled line with time.Now(), making old output look like it happened
+	// "now", and gated backfill on time.Now() too, which silently turned
+	// --since into a no-op. Accurate historical timestamps would require the
+	// daemon to capture stdout/stderr into a timestamped log of its own.)
 	if tail != 0 {
 		var lines [][]byte
 		liveLines, _ := readTail(f, tail)
@@ -1317,10 +1327,7 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		lines = append(lines, liveLines...)
 		for _, line := range lines {
-			if !inWindow() {
-				continue
-			}
-			emit(line)
+			emit(line, time.Time{}, false)
 		}
 	}
 
@@ -1339,14 +1346,15 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		buf := make([]byte, 32*1024)
 		n, err := f.Read(buf)
-		if n > 0 && inWindow() {
-			if timestamps {
-				emit(buf[:n])
-			} else {
-				writeLogFrame(w, streamID, buf[:n])
-			}
-			if fl, ok := w.(http.Flusher); ok {
-				fl.Flush()
+		if n > 0 {
+			// Live lines: the arrival time is a faithful proxy for the entry
+			// time, so honor since/until and --timestamps against it.
+			now := time.Now()
+			if (since.IsZero() || !now.Before(since)) && (until.IsZero() || !now.After(until)) {
+				emit(buf[:n], now, timestamps)
+				if fl, ok := w.(http.Flusher); ok {
+					fl.Flush()
+				}
 			}
 		}
 		if !until.IsZero() && time.Now().After(until) {
