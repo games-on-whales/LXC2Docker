@@ -461,9 +461,25 @@ func (m *Manager) StartRestartWatcherWithEmitter(ctx context.Context, emit Resta
 // the appropriate action (restart, remove, or leave).
 func (m *Manager) enforceRestartPolicies(emit RestartEmitter) {
 	for _, rec := range m.store.ListContainers() {
-		// Skip containers that were never started — "created" state shouldn't
-		// trigger restart logic.
+		// A container that was never started ("created") is normally left
+		// alone — a plain `docker create` must not auto-run. But one declared
+		// with an always/unless-stopped policy is *meant* to be running, so a
+		// create whose start never landed (an orchestrator create+start that
+		// raced, or a start that errored transiently) must not be stranded in
+		// "created" forever. Converge it to running. (on-failure/no are left:
+		// a never-started container hasn't failed and "no" means don't manage.)
 		if rec.StartedAt == nil {
+			if shouldStartNeverStarted(rec) {
+				if s, _ := m.State(rec.ID); s != "running" {
+					log.Printf("restart-watcher: starting never-started %s (%s) per policy=%s",
+						rec.Name, rec.ID[:12], rec.RestartPolicy)
+					if err := m.StartContainer(rec.ID); err != nil {
+						log.Printf("restart-watcher: start created %s: %v", rec.ID[:12], err)
+					} else if emit != nil {
+						emit(rec.ID, "start")
+					}
+				}
+			}
 			continue
 		}
 		state, _ := m.State(rec.ID)
@@ -538,6 +554,24 @@ func shouldRestart(rec *store.ContainerRecord) bool {
 		if rec.RestartMaxRetry > 0 && rec.RestartCount >= rec.RestartMaxRetry {
 			return false
 		}
+		return !rec.StoppedByUser
+	default:
+		return false
+	}
+}
+
+// shouldStartNeverStarted reports whether a container that has never been
+// started (StartedAt == nil, i.e. "created") should be brought up by the
+// restart watcher. Only the "keep it running" policies qualify: a never-started
+// container with always/unless-stopped is meant to be running, so the watcher
+// converges it instead of leaving it stranded in "created" (which is what
+// happened when an orchestrator's create+start raced and the start was lost).
+// on-failure does not apply (nothing has failed yet) and "no"/"" means hands-off.
+func shouldStartNeverStarted(rec *store.ContainerRecord) bool {
+	switch rec.RestartPolicy {
+	case "always":
+		return true
+	case "unless-stopped":
 		return !rec.StoppedByUser
 	default:
 		return false
