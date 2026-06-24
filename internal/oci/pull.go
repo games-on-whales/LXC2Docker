@@ -69,6 +69,17 @@ func Pull(storeDir, ref string, opts PullOpts) (*ImageConfig, string, error) {
 		return nil, "", fmt.Errorf("oci: mkdir %s: %w", storeDir, err)
 	}
 
+	// Keep skopeo/umoci scratch on the (spacious) store filesystem rather than the
+	// default $TMPDIR — typically /tmp on a small root fs or a tmpfs. A full /tmp
+	// during unpack produces a silently-incomplete rootfs (a layer, often the
+	// base, is dropped), which later surfaces as an un-execable entrypoint
+	// ("/bin/sh: No such file or directory" -> LXC state ABORTING).
+	tmpDir := filepath.Join(storeDir, "tmp")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return nil, "", fmt.Errorf("oci: mkdir %s: %w", tmpDir, err)
+	}
+	subEnv := append(os.Environ(), "TMPDIR="+tmpDir)
+
 	// Normalize ref: add docker.io/library/ prefix if bare name.
 	dockerRef := normalizeDockerRef(ref)
 	safeName := SafeDirName(ref)
@@ -104,6 +115,7 @@ func Pull(storeDir, ref string, opts PullOpts) (*ImageConfig, string, error) {
 	// lets Portainer's pull modal render per-layer bars instead of sitting
 	// at 0% for minutes.
 	cmd := exec.Command("skopeo", skopeoArgs...)
+	cmd.Env = subEnv
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return nil, "", fmt.Errorf("oci: pipe stderr: %w", err)
@@ -133,7 +145,9 @@ func Pull(storeDir, ref string, opts PullOpts) (*ImageConfig, string, error) {
 		"--image", ociDir + ":" + tag,
 		bundleDir,
 	}
-	out, err := exec.Command("umoci", umociArgs...).CombinedOutput()
+	ucmd := exec.Command("umoci", umociArgs...)
+	ucmd.Env = subEnv
+	out, err := ucmd.CombinedOutput()
 	if err != nil {
 		return nil, "", fmt.Errorf("oci: umoci unpack: %s: %w", out, err)
 	}
@@ -142,6 +156,13 @@ func Pull(storeDir, ref string, opts PullOpts) (*ImageConfig, string, error) {
 	if _, err := os.Stat(rootfs); err != nil {
 		return nil, "", fmt.Errorf("oci: rootfs not found at %s", rootfs)
 	}
+	// umoci can exit 0 yet leave an incomplete rootfs when scratch space runs out
+	// mid-unpack. Reject such a rootfs here so a broken extraction fails loudly
+	// instead of being cached as a "ready" template that yields containers which
+	// cannot start (their entrypoint interpreter is missing -> LXC ABORTING).
+	if err := validateRootfs(rootfs); err != nil {
+		return nil, "", err
+	}
 
 	// Extract the manifest digest from index.json so the caller can persist
 	// a RepoDigest. We already have index.json parsed in parseImageConfig,
@@ -149,6 +170,28 @@ func Pull(storeDir, ref string, opts PullOpts) (*ImageConfig, string, error) {
 	cfg.Digest = manifestDigest(ociDir, tag)
 
 	return cfg, rootfs, nil
+}
+
+// validateRootfs sanity-checks that an unpacked image rootfs contains a usable
+// base OS, not merely the upper application layers. It guards against a partial
+// extraction (e.g. the base layer dropped when unpack scratch ran out of space)
+// that umoci exits 0 on but whose containers cannot exec their entrypoint
+// ("/bin/sh: No such file or directory" -> LXC state ABORTING -> degraded stack).
+//
+// The check requires a resolvable POSIX shell at a conventional path — accepting
+// usr-merged layouts (/bin -> usr/bin). os.Stat follows symlinks, so a dangling
+// /bin/sh (interpreter missing) is also rejected. Container images intended to
+// run a shell entrypoint (smoothnas's use case) always ship one; a shell-less
+// distroless image is out of scope and would not run such an entrypoint anyway.
+func validateRootfs(rootfs string) error {
+	for _, p := range []string{"bin/sh", "usr/bin/sh", "bin/bash", "usr/bin/bash"} {
+		if fi, err := os.Stat(filepath.Join(rootfs, p)); err == nil && !fi.IsDir() {
+			return nil
+		}
+	}
+	return fmt.Errorf("oci: extracted rootfs %s has no usable shell (/bin/sh, /usr/bin/sh): "+
+		"image extraction is incomplete (a base layer was dropped, likely out of "+
+		"unpack scratch space)", rootfs)
 }
 
 // RemoteDigest returns the manifest digest the registry currently serves for
