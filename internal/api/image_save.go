@@ -19,6 +19,7 @@ import (
 	"github.com/games-on-whales/LXC2Docker/internal/oci"
 	"github.com/games-on-whales/LXC2Docker/internal/store"
 	"github.com/gorilla/mux"
+	archive "github.com/moby/go-archive"
 )
 
 // GET /images/{name}/get — Docker save single image.
@@ -685,13 +686,23 @@ func extractBundleTar(body io.Reader, destDir string) error {
 	}
 }
 
-// extractTarInto runs `tar -xf <src> -C <dst>` so symlinks, xattrs, and
-// device files are handled correctly — pure-Go tar would have to
-// reimplement half of GNU tar to get the same behaviour.
+// extractTarInto applies a single image-layer tar (`src`) onto the rootfs at
+// `dst` using moby's layer applier. Unlike a plain `tar -xf`, it honours the
+// OCI/aufs whiteout convention (`.wh.<name>` deletes <name>; `.wh..wh..opq`
+// clears a directory) and resolves symlink-vs-directory collisions (usr-merge:
+// `/bin` -> `usr/bin`). With bare `tar -xf`, an upper layer's whiteouts were
+// extracted as literal files (never deleting) and usr-merge writes could replace
+// a base symlink with a directory — both silently corrupting the rootfs, which
+// later fails as an un-execable entrypoint (-> LXC ABORTING). The layer stream
+// may be compressed; ApplyLayer auto-detects.
 func extractTarInto(src, dst string) error {
-	out, err := exec.Command("tar", "-xf", src, "-C", dst).CombinedOutput()
+	f, err := os.Open(src)
 	if err != nil {
-		return fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
+		return err
+	}
+	defer f.Close()
+	if _, err := archive.ApplyLayer(dst, f); err != nil {
+		return fmt.Errorf("apply layer %s: %w", filepath.Base(src), err)
 	}
 	return nil
 }
