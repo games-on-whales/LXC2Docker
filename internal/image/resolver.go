@@ -42,11 +42,18 @@ const (
 // Resolve parses a Docker image reference and returns a ResolvedImage.
 // arch should be "amd64" or "arm64".
 //
-// When preferOCI is true, the built-in app shortcut registry is skipped:
-// any reference that isn't a known distro becomes KindOCI and will be
-// pulled from a Docker registry. This is what callers running in
-// Proxmox-CT mode use, so that names like "nginx:alpine" carry standard
-// Docker semantics (real Docker image, suitable for permanent CTs)
+// Faithful-Docker semantics: a standard ref like "alpine", "alpine:3.19" or
+// "docker.io/library/alpine" pulls the real Docker image as OCI — exactly as
+// dockerd would. The LXC distro-template shortcut is NOT a silent override of
+// those names; it is opt-in via the linuxcontainers image server host, e.g.
+// "images.linuxcontainers.org/alpine[:3.19]" (the same source `lxc-create -t
+// download` uses). This keeps LXC2Docker a faithful Docker engine while still
+// exposing native LXC distro templates for callers that explicitly ask.
+//
+// When preferOCI is true, the built-in app shortcut registry is also skipped:
+// any reference becomes KindOCI and is pulled from a Docker registry. This is
+// what callers running in Proxmox-CT mode use, so names like "nginx:alpine"
+// carry standard Docker semantics (real image, suitable for permanent CTs)
 // rather than the GoW-specific app-template shortcut (always ephemeral).
 func Resolve(ref, arch string, preferOCI bool) (*ResolvedImage, error) {
 	if arch == "" {
@@ -55,9 +62,11 @@ func Resolve(ref, arch string, preferOCI bool) (*ResolvedImage, error) {
 
 	name, tag := parseRef(ref)
 
-	// 1. Try distro image. Always honored — distro names like "alpine" are
-	// the LXC native semantics, not Docker images.
-	if isKnownDistro(name) {
+	// 1. LXC distro template — OPT-IN only, requested via the linuxcontainers
+	// image server host (images.linuxcontainers.org/<distro>[:<release>]). A
+	// bare or docker.io ref ("alpine") instead pulls the real Docker image as
+	// OCI below, so the distro shortcut never silently shadows a Hub image.
+	if isLinuxcontainersHost(registryHost(ref)) && isKnownDistro(name) {
 		distro, release := resolveDistro(name, tag)
 		if distro == "" {
 			return nil, fmt.Errorf("image: unknown release %q for distro %q", tag, name)
@@ -102,6 +111,31 @@ func Resolve(ref, arch string, preferOCI bool) (*ResolvedImage, error) {
 		Arch:                  arch,
 		TemplateContainerName: ociTemplateName(ref),
 	}, nil
+}
+
+// registryHost returns the registry host of a ref (the part before the first
+// "/" when it looks like a host — contains "." or ":", or is "localhost"), or
+// "" for a bare/Docker-Hub ref. Mirrors Docker's own ref-parsing rule.
+func registryHost(ref string) string {
+	parts := strings.SplitN(ref, "/", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	prefix := parts[0]
+	if strings.Contains(prefix, ".") || strings.Contains(prefix, ":") || prefix == "localhost" {
+		return prefix
+	}
+	return ""
+}
+
+// isLinuxcontainersHost reports whether a registry host selects the LXC distro
+// image server (images.linuxcontainers.org) — the explicit opt-in for an LXC
+// distro template instead of an OCI Docker image. A port suffix is tolerated.
+func isLinuxcontainersHost(host string) bool {
+	if i := strings.IndexByte(host, ':'); i != -1 {
+		host = host[:i]
+	}
+	return host == "images.linuxcontainers.org" || strings.HasSuffix(host, ".linuxcontainers.org") || host == "linuxcontainers.org"
 }
 
 // parseRef splits "name:tag", "name" (defaults tag to "latest"),
