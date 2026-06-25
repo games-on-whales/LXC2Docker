@@ -5,7 +5,8 @@ import "testing"
 func TestResolveKnownDistro(t *testing.T) {
 	t.Parallel()
 
-	got, err := Resolve("alpine:3.19.1", "arm64", false)
+	// The LXC distro template is opt-in via the linuxcontainers image host.
+	got, err := Resolve("images.linuxcontainers.org/alpine:3.19.1", "arm64", false)
 	if err != nil {
 		t.Fatalf("Resolve() returned error: %v", err)
 	}
@@ -23,6 +24,30 @@ func TestResolveKnownDistro(t *testing.T) {
 	}
 	if got.TemplateContainerName != "__template_alpine_3.19" {
 		t.Fatalf("expected template name __template_alpine_3.19, got %q", got.TemplateContainerName)
+	}
+}
+
+// Faithful Docker: a bare or docker.io distro name pulls the real OCI image, NOT
+// the LXC distro template (which is opt-in via the linuxcontainers host).
+func TestResolveBareDistroIsOCI(t *testing.T) {
+	t.Parallel()
+
+	for _, ref := range []string{"alpine:3.19.1", "alpine", "docker.io/library/alpine:latest", "library/alpine"} {
+		got, err := Resolve(ref, "", true)
+		if err != nil {
+			t.Fatalf("Resolve(%q) returned error: %v", ref, err)
+		}
+		if got.Kind != KindOCI {
+			t.Fatalf("Resolve(%q): expected KindOCI (faithful Docker), got %d", ref, got.Kind)
+		}
+	}
+	// preferOCI=false must not re-route a bare distro name to the LXC template.
+	got, err := Resolve("alpine:3.19.1", "", false)
+	if err != nil {
+		t.Fatalf("Resolve() returned error: %v", err)
+	}
+	if got.Kind != KindOCI {
+		t.Fatalf("expected KindOCI for bare alpine even with preferOCI=false, got %d", got.Kind)
 	}
 }
 
