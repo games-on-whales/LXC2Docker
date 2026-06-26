@@ -1030,8 +1030,24 @@ func copyTree(src, dst string) error {
 				return err
 			}
 			target := filepath.Join(dst, rel)
+			// Recreate symlinks rather than following them: on a usrmerge rootfs
+			// /bin, /lib, /lib64 and /sbin are symlinks to directories, and copying
+			// "through" them runs copyFile -> io.Copy on a directory, which fails
+			// with "copy_file_range: is a directory" (e.g. during docker commit).
+			if info.Mode()&os.ModeSymlink != 0 {
+				link, lerr := os.Readlink(path)
+				if lerr != nil {
+					return lerr
+				}
+				_ = os.Remove(target)
+				return os.Symlink(link, target)
+			}
 			if info.IsDir() {
 				return os.MkdirAll(target, info.Mode())
+			}
+			// Skip sockets/fifos/devices that may exist in a rootfs snapshot.
+			if !info.Mode().IsRegular() {
+				return nil
 			}
 			return copyFile(path, target, info.Mode())
 		})
