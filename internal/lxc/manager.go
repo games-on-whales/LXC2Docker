@@ -152,12 +152,7 @@ func (m *Manager) reconcile() {
 					log.Printf("reconcile: bridge attach for %s (%s) failed: %v", rec.Name, rec.ID[:12], err)
 				}
 			}
-			for _, pb := range rec.PortBindings {
-				if err := AddPortForward(rec.IPAddress, pb.HostPort, pb.ContainerPort, pb.Proto); err != nil {
-					log.Printf("reconcile: port forward %d->%s:%d/%s failed: %v",
-						pb.HostPort, rec.IPAddress, pb.ContainerPort, pb.Proto, err)
-				}
-			}
+			m.ensurePortForwards(rec.ID)
 			log.Printf("reconcile: container %s (%s) still running, port forwards restored",
 				rec.Name, rec.ID[:12])
 		}
@@ -1636,8 +1631,38 @@ func (m *Manager) StartContainer(id string) error {
 	if err == nil {
 		// Peers learn this container's (possibly reassigned) IP.
 		m.syncHosts()
+		// (Re)publish the container's port forwards. Every start path funnels
+		// through StartContainer, but only the API /start handler and the
+		// startup reconcile (for already-running containers) used to apply
+		// DNAT — so a container brought up by the restart-policy convergence
+		// (always/unless-stopped on daemon restart) came up RUNNING with no
+		// port forwarding, leaving published ports unreachable until something
+		// re-triggered the API path. Doing it here closes that gap for all
+		// callers. AddPortForward is self-healing (replaces any existing rule
+		// for the host port), so re-publishing an already-forwarded port is safe.
+		m.ensurePortForwards(id)
 	}
 	return err
+}
+
+// ensurePortForwards (re)applies all of a container's published-port DNAT rules
+// if it is running and has an IP. Safe to call on any start path: AddPortForward
+// evicts any stale rule for the host port before inserting, so duplicate calls
+// don't stack rules.
+func (m *Manager) ensurePortForwards(id string) {
+	rec := m.store.GetContainer(id)
+	if rec == nil || rec.IPAddress == "" || len(rec.PortBindings) == 0 {
+		return
+	}
+	if st, _ := m.State(id); st != "running" {
+		return
+	}
+	for _, pb := range rec.PortBindings {
+		if err := AddPortForward(rec.IPAddress, pb.HostPort, pb.ContainerPort, pb.Proto); err != nil {
+			log.Printf("StartContainer: port forward %d->%s:%d/%s failed: %v",
+				pb.HostPort, rec.IPAddress, pb.ContainerPort, pb.Proto, err)
+		}
+	}
 }
 
 func (m *Manager) startPVEContainer(id string, vmid int) error {

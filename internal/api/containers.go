@@ -935,14 +935,8 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		h.store.AddContainer(rec)
 	}
 
-	if rec := h.store.GetContainer(id); rec != nil && rec.IPAddress != "" {
-		for _, pb := range rec.PortBindings {
-			if err := lxc.AddPortForward(rec.IPAddress, pb.HostPort, pb.ContainerPort, pb.Proto); err != nil {
-				log.Printf("warning: port forward %d->%s:%d/%s failed: %v",
-					pb.HostPort, rec.IPAddress, pb.ContainerPort, pb.Proto, err)
-			}
-		}
-	}
+	// Port forwards are (re)published by StartContainer itself, so every start
+	// path (API, reconcile, restart-policy convergence) applies them uniformly.
 
 	if rec := h.store.GetContainer(id); rec != nil && rec.OomScoreAdj != 0 {
 		if pid := containerPID(id); pid > 0 {

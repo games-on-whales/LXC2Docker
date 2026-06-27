@@ -118,9 +118,23 @@ func TeardownBridge() {
 
 // AddPortForward creates an nftables DNAT rule in the managed NAT table to forward
 // traffic from hostPort to containerIP:containerPort.
+//
+// It is self-healing: any pre-existing DNAT rule for the same hostPort/proto is
+// removed first, regardless of which container IP it targets. nft "-f" with chain
+// blocks *appends* rules, so without this a re-publish (e.g. a container restart
+// that lands on a new IP, or a daemon restart that recreates the container) would
+// stack a fresh rule *behind* the stale one — and nft matches the first rule, so
+// traffic would keep being DNAT'd to the old, now-dead container IP (the port
+// becomes unreachable). Purging by hostPort guarantees exactly one live rule
+// pointing at the current IP.
 func AddPortForward(containerIP string, hostPort, containerPort int, proto string) error {
 	if proto == "" {
 		proto = "tcp"
+	}
+	// Clear any stale rule for this hostPort before inserting the fresh one so a
+	// re-publish to a new container IP can't be shadowed by a leftover rule.
+	if err := removePortForwardsForHostPort(hostPort, proto); err != nil {
+		return fmt.Errorf("network: clear stale port forward for %s/%d: %w", proto, hostPort, err)
 	}
 	// prerouting handles traffic from external interfaces; output handles
 	// traffic originating on the host itself (e.g. curl localhost:8080).
@@ -147,24 +161,66 @@ table ip %s {
 }
 
 // RemovePortForwards removes all nftables DNAT rules in the managed NAT
-// chain that target the given container IP.
+// chain that target the given container IP. Used on container stop to release
+// that container's published-port rules.
 func RemovePortForwards(containerIP string) error {
-	target := "dnat to " + containerIP + ":"
-	// Clean rules from both prerouting and output chains.
+	return deleteMatchingNATRules(func(line string) bool {
+		return strings.Contains(line, "dnat to "+containerIP+":")
+	})
+}
+
+// removePortForwardsForHostPort removes any DNAT rule in the managed NAT chains
+// that publishes the given hostPort/proto, whatever container IP it targets.
+// Used by AddPortForward to make re-publishing a port idempotent and to evict
+// rules left behind pointing at a stale (restarted) container's old IP.
+func removePortForwardsForHostPort(hostPort int, proto string) error {
+	return deleteMatchingNATRules(func(line string) bool {
+		return natLineMatchesHostPort(line, hostPort, proto)
+	})
+}
+
+// natLineMatchesHostPort reports whether an nft rule listing line is a DNAT rule
+// publishing hostPort/proto. nft prints e.g.
+//
+//	tcp dport 47989 dnat to 10.100.0.22:47989 # handle 7
+//
+// The trailing space after the port number is significant: it stops 47989 from
+// matching 479890 (or 147989).
+func natLineMatchesHostPort(line string, hostPort int, proto string) bool {
+	needle := fmt.Sprintf("%s dport %d ", proto, hostPort)
+	return strings.Contains(line, needle) && strings.Contains(line, "dnat to ")
+}
+
+// natHandlesToDelete parses an "nft -a list chain" listing and returns the
+// handles of every rule whose line satisfies match. Pure (no exec) so the
+// match/parse logic is unit-testable without nft or root.
+func natHandlesToDelete(listing string, match func(line string) bool) []string {
+	var handles []string
+	for _, line := range strings.Split(listing, "\n") {
+		if !match(line) {
+			continue
+		}
+		parts := strings.Split(line, "# handle ")
+		if len(parts) < 2 {
+			continue
+		}
+		if h := strings.TrimSpace(parts[1]); h != "" {
+			handles = append(handles, h)
+		}
+	}
+	return handles
+}
+
+// deleteMatchingNATRules walks the prerouting and output chains of the managed
+// NAT table and deletes every rule whose listing line satisfies match, keyed by
+// the nft handle. Missing chains are skipped.
+func deleteMatchingNATRules(match func(line string) bool) error {
 	for _, chain := range []string{"prerouting", "output"} {
 		out, err := exec.Command("nft", "-a", "list", "chain", "ip", NATTableName, chain).CombinedOutput()
 		if err != nil {
 			continue // chain may not exist
 		}
-		for _, line := range strings.Split(string(out), "\n") {
-			if !strings.Contains(line, target) {
-				continue
-			}
-			parts := strings.Split(line, "# handle ")
-			if len(parts) < 2 {
-				continue
-			}
-			handle := strings.TrimSpace(parts[1])
+		for _, handle := range natHandlesToDelete(string(out), match) {
 			exec.Command("nft", "delete", "rule", "ip", NATTableName, chain, "handle", handle).Run()
 		}
 	}
