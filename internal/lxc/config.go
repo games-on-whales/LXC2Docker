@@ -717,7 +717,7 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 	// Docker, cgroup rules + MKNOD cap are sufficient because containers
 	// share the host's devtmpfs (or Docker creates device nodes). In LXC
 	// the device files must physically exist in the container's /dev.
-	items = append(items, autoMountDeviceDirs(cfg.DeviceCgroupRules)...)
+	items = append(items, autoMountDeviceDirs(cfg.DeviceCgroupRules, cfg.Mounts)...)
 
 	// NVIDIA GPU via CDI (see buildPVEItems for details). Skip when the
 	// container brings its own /usr/nvidia driver volume and self-provisions —
@@ -1217,7 +1217,17 @@ func appendSocketDirMount(items []configItem, sourceDir, destDir string, readOnl
 // cap suffice because each container gets its own private /dev; LXC containers
 // share the host /dev tree, so we mount a private tmpfs to reproduce that
 // isolation (a bind of the host dir would be the shared global devtmpfs).
-func autoMountDeviceDirs(rules []string) []configItem {
+//
+// An explicit user bind mount (-v) of the device directory (or an ancestor of
+// it, e.g. -v /dev:/dev or -v /dev/input:/dev/input) takes precedence: the
+// caller has deliberately chosen to share the host devtmpfs, so we must not
+// shadow that bind with a private tmpfs. This is required by the device
+// *producer* side — e.g. Wolf creates virtual gamepads via uinput, which land
+// on the host's global /dev/input devtmpfs, and Wolf must see those nodes to
+// stat them before re-mknod'ing them into the (private-tmpfs) app containers.
+// Without honouring the bind, Wolf's own /dev/input is an empty private tmpfs
+// and every "Unable to get stats of /dev/input/eventN" → no controller.
+func autoMountDeviceDirs(rules []string, mounts []MountSpec) []configItem {
 	// Map well-known device major numbers to the in-container directory that
 	// holds nodes of that major.
 	majorDirMap := map[string]string{
@@ -1237,6 +1247,11 @@ func autoMountDeviceDirs(rules []string) []configItem {
 		}
 		dir, ok := majorDirMap[majMin[0]]
 		if !ok || mounted[dir] {
+			continue
+		}
+		// An explicit bind of this dir (or an ancestor) wins; don't shadow it.
+		if mountCovers(mounts, dir) {
+			mounted[dir] = true
 			continue
 		}
 		mounted[dir] = true
@@ -1259,6 +1274,20 @@ func autoMountDeviceDirs(rules []string) []configItem {
 		})
 	}
 	return items
+}
+
+// mountCovers reports whether any explicit bind mount already provides dir —
+// i.e. a mount destination equal to dir or an ancestor of it (e.g. a -v /dev
+// or -v /dev/input bind both cover /dev/input).
+func mountCovers(mounts []MountSpec, dir string) bool {
+	dir = filepath.Clean(dir)
+	for _, m := range mounts {
+		dest := filepath.Clean(m.Destination)
+		if dest == "/" || dest == dir || strings.HasPrefix(dir, dest+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // deviceCgroupEntry returns a cgroup2 device allow rule for a device path.
@@ -1472,7 +1501,7 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 	for _, rule := range cfg.DeviceCgroupRules {
 		items = append(items, configItem{"lxc.cgroup2.devices.allow", rule})
 	}
-	items = append(items, autoMountDeviceDirs(cfg.DeviceCgroupRules)...)
+	items = append(items, autoMountDeviceDirs(cfg.DeviceCgroupRules, cfg.Mounts)...)
 
 	// NVIDIA GPU: inject the host driver via the CDI spec (driver libs, device
 	// nodes, symlink/ldcache hook). On failure, log and continue without GPU

@@ -342,7 +342,7 @@ func TestBuildItemsNoNvidiaHookWithoutOptIn(t *testing.T) {
 func TestAutoMountDeviceDirsUsesPrivateTmpfs(t *testing.T) {
 	t.Parallel()
 
-	items := autoMountDeviceDirs([]string{"c 13:* rwm"})
+	items := autoMountDeviceDirs([]string{"c 13:* rwm"}, nil)
 
 	// /dev/input must be a private tmpfs, NOT a bind of the host's shared
 	// devtmpfs. A bind makes Wolf's per-container mknod/rm of virtual input
@@ -369,8 +369,32 @@ func TestAutoMountDeviceDirsIgnoresNonWildcardAndUnknownMajors(t *testing.T) {
 	t.Parallel()
 
 	// A specific minor (not "*") and an unmapped major must not produce a mount.
-	if items := autoMountDeviceDirs([]string{"c 13:64 rwm", "c 99:* rwm"}); len(items) != 0 {
+	if items := autoMountDeviceDirs([]string{"c 13:64 rwm", "c 99:* rwm"}, nil); len(items) != 0 {
 		t.Fatalf("expected no mounts, got %#v", items)
+	}
+}
+
+func TestAutoMountDeviceDirsExplicitBindWins(t *testing.T) {
+	t.Parallel()
+
+	// When the caller explicitly binds the device dir (-v /dev/input:/dev/input)
+	// — or an ancestor (-v /dev:/dev) — the auto private tmpfs must be suppressed
+	// so the bind to the host's shared devtmpfs is honoured. This is what the
+	// device *producer* (Wolf via uinput) needs to see the nodes it creates.
+	for _, dest := range []string{"/dev/input", "/dev/input/", "/dev", "/"} {
+		mounts := []MountSpec{{Source: "/dev/input", Destination: dest}}
+		items := autoMountDeviceDirs([]string{"c 13:* rwm"}, mounts)
+		if len(items) != 0 {
+			t.Fatalf("explicit bind %q: expected no auto tmpfs, got %#v", dest, items)
+		}
+	}
+
+	// An unrelated bind must NOT suppress the auto tmpfs.
+	mounts := []MountSpec{{Source: "/etc/wolf", Destination: "/etc/wolf"}}
+	items := autoMountDeviceDirs([]string{"c 13:* rwm"}, mounts)
+	want := "tmpfs dev/input tmpfs rw,nosuid,relatime,mode=0755,create=dir 0 0"
+	if !hasMountEntry(items, want) {
+		t.Fatalf("unrelated bind: expected private tmpfs %q, got %#v", want, items)
 	}
 }
 
