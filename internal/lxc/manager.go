@@ -1883,12 +1883,24 @@ func (m *Manager) StopAllContainers(timeout time.Duration) error {
 }
 
 func (m *Manager) StopContainerWithSignal(id string, timeout time.Duration, signal string) error {
+	rec := m.store.GetContainer(id)
+	// Release this container's published-port DNAT rules whenever it is stopped
+	// (including an already-exited container), so a stopped container never keeps
+	// claiming host ports. Otherwise a later container that republishes the same
+	// host port is shadowed by these stale DNAT rules (nftables first-match wins),
+	// and its published ports are silently unreachable until the old container is
+	// removed. Idempotent: a no-op when there are no rules for this IP.
+	if rec != nil && rec.IPAddress != "" {
+		if err := RemovePortForwards(rec.IPAddress); err != nil {
+			log.Printf("manager: stop %s: remove port forwards: %v", id, err)
+		}
+	}
+
 	state, _ := m.State(id)
 	if state != "running" {
 		return nil
 	}
 
-	rec := m.store.GetContainer(id)
 	if rec != nil && rec.VMID > 0 {
 		vmid := fmt.Sprintf("%d", rec.VMID)
 		// Docker semantics: deliver the container's stop signal (default
