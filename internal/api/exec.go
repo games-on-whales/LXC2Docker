@@ -161,11 +161,23 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Write HTTP response preamble manually.
-	buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
-	buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
-	buf.WriteString("Connection: Upgrade\r\n")
-	buf.WriteString("Upgrade: tcp\r\n")
+	// Write HTTP response preamble manually. Match Docker's exec-start
+	// semantics: a client that asked to upgrade the protocol (Upgrade: tcp)
+	// gets 101 Switching Protocols; every other client gets the attached
+	// stream over a plain 200 OK. Returning 101 unconditionally breaks
+	// non-upgrading clients — e.g. Wolf's fake-udev exec, which expects 200
+	// and treats the 101 as an error, abandoning the hijacked stream
+	// mid-command so the `mknod && fake-udev` chain never completes and
+	// hot-plugged controllers never reach the app (SDL/Steam) container.
+	if r.Header.Get("Upgrade") != "" {
+		buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
+		buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
+		buf.WriteString("Connection: Upgrade\r\n")
+		buf.WriteString("Upgrade: tcp\r\n")
+	} else {
+		buf.WriteString("HTTP/1.1 200 OK\r\n")
+		buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
+	}
 	buf.WriteString("\r\n")
 	buf.Flush()
 
