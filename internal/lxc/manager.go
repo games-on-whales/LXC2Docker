@@ -56,7 +56,21 @@ type Manager struct {
 	// host's total RAM" (no artificial cap). Set from the --default-memory
 	// flag after construction.
 	DefaultMemoryBytes int64
+
+	// pfOrphanStrikes counts consecutive reconcile ticks for which a published
+	// host port ("proto/hostPort") has been seen in nftables with no running
+	// container claiming it. The reconciler only prunes after a key reaches
+	// pfOrphanPruneStrikes, so a single tick that observes a container as not-yet
+	// "running" (the brief starting window) or that hit a transient State() error
+	// cannot delete a still-valid rule. Touched only by the single reconcile
+	// goroutine, so it needs no lock.
+	pfOrphanStrikes map[string]int
 }
+
+// pfOrphanPruneStrikes is how many consecutive reconcile ticks a published host
+// port must look orphaned before the reconciler prunes it. >1 gives hysteresis
+// against the container "starting" window and transient State() errors.
+const pfOrphanPruneStrikes = 2
 
 // UsePVE returns true when Proxmox CT mode is active.
 func (m *Manager) UsePVE() bool { return m.pveStorage != "" }
@@ -205,9 +219,142 @@ func (m *Manager) StartNetworkReconciler(ctx context.Context) {
 				// so a peer that drifted to a new bridge IP stays
 				// resolvable by name without recreating the dependent.
 				m.syncHosts()
+				// Re-apply published-port DNAT for running containers whose rule
+				// is missing or points at a stale IP. Event-driven publishing
+				// (StartContainer/stop) plus startup reconcile cover the normal
+				// paths; this periodic pass self-heals any DRIFT between events —
+				// an external nftables flush, a rule that was never (re)applied,
+				// or a container that drifted to a new bridge IP — without waiting
+				// for a daemon restart. Mismatch-only, so a correct rule is never
+				// churned.
+				m.reconcilePortForwards()
 			}
 		}
 	}()
+}
+
+// reconcilePortForwards converges the managed NAT table's published-port DNAT
+// rules to the desired set: exactly one correct rule per (proto/hostPort) of
+// every RUNNING container that has an IP and port bindings, and NOTHING else.
+//
+// It is declarative rather than purely additive on purpose. A correct rule
+// (present and pointing at the right IP:port in both chains, no duplicates) is
+// left untouched — no delete+re-add churn that could drop new connections on an
+// active stream. But a rule that is missing, stale (wrong IP), or duplicated is
+// re-applied, AND a rule for a host port that NO running container claims is
+// pruned. Pruning is what makes this robust against the stop/reconcile race:
+// StopContainerWithSignal removes a container's forwards while the container is
+// still running, so a concurrent tick can re-add them; declaring those forwards
+// undesired (the container is gone from the store, or no longer running) means
+// the very next tick removes the orphan instead of leaving it pointing at a
+// freed — and possibly reused — IP.
+//
+// On a transient nft read error the whole tick is skipped (logged) rather than
+// blindly re-applying everything, so a momentary inability to observe state can
+// never flip the reconciler into full-churn mode. nftMu serialization inside
+// AddPortForward / RemovePortForwardForHostPort keeps each mutation atomic with
+// respect to the API lifecycle handlers.
+func (m *Manager) reconcilePortForwards() {
+	current, err := CurrentPortForwards()
+	if err != nil {
+		log.Printf("port-forward reconcile: skipping tick, cannot read nft state: %v", err)
+		return
+	}
+	present, err := PublishedHostPorts()
+	if err != nil {
+		log.Printf("port-forward reconcile: skipping tick, cannot read nft state: %v", err)
+		return
+	}
+
+	// First pass: build the desired set and heal anything missing/stale.
+	//
+	// "desired" protects a host port from pruning. A container is desired when it
+	// is running OR when we could not determine its state (a transient State()
+	// error must never let prune delete a live rule). We only HEAL (re-apply) when
+	// we positively know the container is running and the rule is wrong — so the
+	// not-yet-"running" starting window neither churns nor (via desired) prunes.
+	// A host port claimed by two records with conflicting targets is flagged and
+	// left alone (protected from prune, skipped for heal) so two misconfigured
+	// containers can't drive indefinite evict/re-add churn.
+	desired := map[string]bool{}
+	wantBy := map[string]string{}   // key -> the IP:port the first claimant wants
+	conflicted := map[string]bool{} // key -> claimed by >1 record with different targets
+	for _, rec := range m.store.ListContainers() {
+		if rec.IPAddress == "" || len(rec.PortBindings) == 0 {
+			continue
+		}
+		st, sterr := m.State(rec.ID)
+		// Assume running on a State() error: protect the rule from prune, don't
+		// heal it. The symmetric downside — a persistently unreadable record keeps
+		// its host port forever — is preferable to deleting a live forward on a
+		// transient blip; a truly dead container is normally removed from the
+		// store (so it drops out of this loop and is pruned) rather than left
+		// readable-as-erroring.
+		running := sterr != nil || st == "running"
+		if !running {
+			continue
+		}
+		for _, pb := range rec.PortBindings {
+			proto := pb.Proto
+			if proto == "" {
+				proto = "tcp"
+			}
+			key := fmt.Sprintf("%s/%d", proto, pb.HostPort)
+			want := fmt.Sprintf("%s:%d", rec.IPAddress, pb.ContainerPort)
+			desired[key] = true // protect from prune even on State() error
+			if prev, ok := wantBy[key]; ok && prev != want {
+				if !conflicted[key] {
+					log.Printf("port-forward reconcile: host port %s claimed by multiple containers (%q vs %q) — leaving as-is", key, prev, want)
+				}
+				conflicted[key] = true
+				continue
+			}
+			wantBy[key] = want
+			if conflicted[key] || sterr != nil {
+				continue // don't heal a conflicted port, or one whose state we couldn't read
+			}
+			if current[key] == want {
+				continue // already correct in both chains — do not churn it
+			}
+			if err := AddPortForward(rec.IPAddress, pb.HostPort, pb.ContainerPort, proto); err != nil {
+				log.Printf("port-forward reconcile: %s %s -> %s failed: %v", rec.Name, key, want, err)
+			} else {
+				log.Printf("port-forward reconcile: restored %s -> %s (was %q)", key, want, current[key])
+			}
+		}
+	}
+
+	// Second pass: prune orphans — a published host port no running container
+	// claims — but only after pfOrphanPruneStrikes consecutive ticks, so the
+	// starting window and transient State() errors (above) can't cause a delete.
+	if m.pfOrphanStrikes == nil {
+		m.pfOrphanStrikes = map[string]int{}
+	}
+	for key := range m.pfOrphanStrikes {
+		if desired[key] || !present[key] {
+			delete(m.pfOrphanStrikes, key) // no longer orphaned (or gone) — reset its streak
+		}
+	}
+	for key := range present {
+		if desired[key] {
+			continue
+		}
+		m.pfOrphanStrikes[key]++
+		if m.pfOrphanStrikes[key] < pfOrphanPruneStrikes {
+			continue // give it another tick to become running before pruning
+		}
+		proto, hostPort, ok := parseHostPortKey(key)
+		if !ok {
+			delete(m.pfOrphanStrikes, key) // unparseable key can never be pruned — don't retry forever
+			continue
+		}
+		if err := RemovePortForwardForHostPort(hostPort, proto); err != nil {
+			log.Printf("port-forward reconcile: prune orphan %s failed: %v", key, err)
+		} else {
+			log.Printf("port-forward reconcile: pruned orphan %s (was %q)", key, current[key])
+			delete(m.pfOrphanStrikes, key)
+		}
+	}
 }
 
 // consoleLogMax caps each container's console.log at this size. LXC opens

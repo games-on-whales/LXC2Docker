@@ -8,7 +8,18 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+// nftMu serializes every mutation of the managed NAT table's DNAT rules
+// (AddPortForward / RemovePortForwards / RemovePortForwardForHostPort). nft
+// itself serializes at the kernel, but each of these performs a multi-step
+// evict-then-add (or list-then-delete) sequence; without this lock the periodic
+// reconciler and the API lifecycle handlers could interleave their phases — e.g.
+// a stop's remove slipping between AddPortForward's evict and add — and leave the
+// table in a state neither intended. Holding one process-wide lock across each
+// full sequence makes them atomic with respect to each other.
+var nftMu sync.Mutex
 
 const (
 	DefaultNetworkName = "veth0"
@@ -128,6 +139,8 @@ func TeardownBridge() {
 // becomes unreachable). Purging by hostPort guarantees exactly one live rule
 // pointing at the current IP.
 func AddPortForward(containerIP string, hostPort, containerPort int, proto string) error {
+	nftMu.Lock()
+	defer nftMu.Unlock()
 	if proto == "" {
 		proto = "tcp"
 	}
@@ -164,9 +177,24 @@ table ip %s {
 // chain that target the given container IP. Used on container stop to release
 // that container's published-port rules.
 func RemovePortForwards(containerIP string) error {
+	nftMu.Lock()
+	defer nftMu.Unlock()
 	return deleteMatchingNATRules(func(line string) bool {
 		return strings.Contains(line, "dnat to "+containerIP+":")
 	})
+}
+
+// RemovePortForwardForHostPort removes every DNAT rule publishing the given
+// hostPort/proto, whatever container IP it targets. The periodic reconciler uses
+// it to prune ORPHAN rules — a published port that no running container claims
+// any more (e.g. left behind when a stop's remove raced a reconcile re-add, or a
+// container that vanished from the store). Distinct from the unexported
+// removePortForwardsForHostPort only in that it takes the nftMu (the unexported
+// one runs inside AddPortForward, which already holds it).
+func RemovePortForwardForHostPort(hostPort int, proto string) error {
+	nftMu.Lock()
+	defer nftMu.Unlock()
+	return removePortForwardsForHostPort(hostPort, proto)
 }
 
 // removePortForwardsForHostPort removes any DNAT rule in the managed NAT chains
@@ -209,6 +237,120 @@ func natHandlesToDelete(listing string, match func(line string) bool) []string {
 		}
 	}
 	return handles
+}
+
+// parseDNATChain extracts the published-port DNAT mappings from one nft chain
+// listing. It returns rules as map["<proto>/<hostPort>"] = "<targetIP>:<targetPort>"
+// plus the set of keys that appear MORE THAN ONCE in the chain (duplicates — e.g.
+// a stale rule left beside a fresh one for the same host port). Pure (no exec) so
+// it is unit-testable without nft or root. A rule line looks like:
+//
+//	tcp dport 8741 dnat to 10.100.0.29:8741 # handle 5
+func parseDNATChain(listing string) (rules map[string]string, dups map[string]bool) {
+	rules = map[string]string{}
+	dups = map[string]bool{}
+	for _, line := range strings.Split(listing, "\n") {
+		f := strings.Fields(line)
+		for i := 0; i+5 < len(f); i++ {
+			if f[i+1] == "dport" && f[i+3] == "dnat" && f[i+4] == "to" &&
+				(f[i] == "tcp" || f[i] == "udp") {
+				key := f[i] + "/" + f[i+2]
+				if _, seen := rules[key]; seen {
+					dups[key] = true
+				}
+				rules[key] = f[i+5]
+				break
+			}
+		}
+	}
+	return rules, dups
+}
+
+// listChainForwards runs `nft list chain ip <table> <chain>` and parses it. A
+// missing table/chain (nft prints "No such file or directory") is reported as an
+// EMPTY result with no error — that is genuine "nothing installed yet" drift the
+// caller should heal, not a transient read failure. Any other error (nft absent,
+// permission denied, malformed output) is returned so the caller can skip the
+// tick instead of churning the whole table.
+func listChainForwards(chain string) (rules map[string]string, dups map[string]bool, err error) {
+	out, err := exec.Command("nft", "list", "chain", "ip", NATTableName, chain).CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "No such file or directory") {
+			return map[string]string{}, map[string]bool{}, nil
+		}
+		return nil, nil, fmt.Errorf("nft list chain %s: %s: %w", chain, strings.TrimSpace(string(out)), err)
+	}
+	rules, dups = parseDNATChain(string(out))
+	return rules, dups, nil
+}
+
+// CurrentPortForwards returns the published-port DNAT forwards that are FULLY and
+// unambiguously installed, as map["<proto>/<hostPort>"] = "<targetIP>:<targetPort>".
+// A key is included only if it is present with the SAME target in BOTH the
+// prerouting and output chains (AddPortForward writes both) and is NOT duplicated
+// in either chain. A key that is missing from a chain, disagrees between chains,
+// or is duplicated is deliberately OMITTED so the reconciler treats it as drift
+// and re-applies (AddPortForward rewrites both chains and evicts duplicates).
+// Returns (nil, err) on a transient nft read error so the caller can skip the
+// tick rather than churn the whole table.
+func CurrentPortForwards() (map[string]string, error) {
+	pre, preDup, err := listChainForwards("prerouting")
+	if err != nil {
+		return nil, err
+	}
+	out, outDup, err := listChainForwards("output")
+	if err != nil {
+		return nil, err
+	}
+	merged := map[string]string{}
+	for k, v := range pre {
+		if preDup[k] || outDup[k] {
+			continue // ambiguous — force a re-apply
+		}
+		if ov, ok := out[k]; ok && ov == v {
+			merged[k] = v // agrees across both chains, no duplicates
+		}
+	}
+	return merged, nil
+}
+
+// parseHostPortKey splits a "proto/hostPort" reconcile key (the format produced
+// for CurrentPortForwards / PublishedHostPorts) back into its parts, so the prune
+// path can call RemovePortForwardForHostPort. Returns ok=false on a malformed key.
+func parseHostPortKey(key string) (proto string, hostPort int, ok bool) {
+	slash := strings.IndexByte(key, '/')
+	if slash <= 0 {
+		return "", 0, false
+	}
+	p, err := strconv.Atoi(key[slash+1:])
+	if err != nil {
+		return "", 0, false
+	}
+	return key[:slash], p, true
+}
+
+// PublishedHostPorts returns the set of "<proto>/<hostPort>" keys that have ANY
+// DNAT rule in either managed chain, regardless of target or duplication. The
+// reconciler uses it to find ORPHAN forwards — host ports still published in
+// nftables that no running container claims any more — so they can be pruned.
+// Returns (nil, err) on a transient read error.
+func PublishedHostPorts() (map[string]bool, error) {
+	pre, _, err := listChainForwards("prerouting")
+	if err != nil {
+		return nil, err
+	}
+	out, _, err := listChainForwards("output")
+	if err != nil {
+		return nil, err
+	}
+	keys := map[string]bool{}
+	for k := range pre {
+		keys[k] = true
+	}
+	for k := range out {
+		keys[k] = true
+	}
+	return keys, nil
 }
 
 // deleteMatchingNATRules walks the prerouting and output chains of the managed
