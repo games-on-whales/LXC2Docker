@@ -64,3 +64,57 @@ func TestNATHandlesToDelete_ByContainerIP(t *testing.T) {
 		t.Fatalf("handles for IP 10.100.0.23 = %v, want %v", got, want)
 	}
 }
+
+func TestParseDNATChain(t *testing.T) {
+	// parseDNATChain powers the periodic reconcile: it maps
+	// "<proto>/<hostPort>" -> "<targetIP>:<targetPort>" from a live chain listing
+	// and flags duplicate host ports. Covers: tcp + udp, a port whose container
+	// port differs from the host port, a non-DNAT line (accept) that must be
+	// ignored, and a duplicate (stale + fresh) that must be reported as a dup
+	// (last-wins value, but the key is marked so the reconciler forces a re-apply).
+	listing := `table ip veth_nat {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		tcp dport 47989 dnat to 10.100.0.22:47989 # handle 7
+		tcp dport 47989 dnat to 10.100.0.23:47989 # handle 12
+		tcp dport 47984 dnat to 10.100.0.23:47984 # handle 13
+		udp dport 47998 dnat to 10.100.0.23:47999 # handle 20
+		tcp dport 9999 accept # handle 9
+	}
+}`
+	rules, dups := parseDNATChain(listing)
+	wantRules := map[string]string{
+		"tcp/47989": "10.100.0.23:47989", // last-wins of the two duplicates
+		"tcp/47984": "10.100.0.23:47984",
+		"udp/47998": "10.100.0.23:47999",
+	}
+	if !reflect.DeepEqual(rules, wantRules) {
+		t.Fatalf("parseDNATChain rules = %v, want %v", rules, wantRules)
+	}
+	wantDups := map[string]bool{"tcp/47989": true}
+	if !reflect.DeepEqual(dups, wantDups) {
+		t.Fatalf("parseDNATChain dups = %v, want %v", dups, wantDups)
+	}
+}
+
+func TestParseHostPortKey(t *testing.T) {
+	cases := []struct {
+		key      string
+		proto    string
+		hostPort int
+		ok       bool
+	}{
+		{"tcp/8741", "tcp", 8741, true},
+		{"udp/53", "udp", 53, true},
+		{"tcp/", "", 0, false},
+		{"8741", "", 0, false},
+		{"tcp/notaport", "", 0, false},
+	}
+	for _, c := range cases {
+		proto, hp, ok := parseHostPortKey(c.key)
+		if proto != c.proto || hp != c.hostPort || ok != c.ok {
+			t.Errorf("parseHostPortKey(%q) = (%q,%d,%v), want (%q,%d,%v)",
+				c.key, proto, hp, ok, c.proto, c.hostPort, c.ok)
+		}
+	}
+}
