@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -199,6 +198,23 @@ func (h *Handler) routes() http.Handler {
 		sub.HandleFunc("/exec/{id}/json", h.execInspect).Methods(http.MethodGet, http.MethodHead)
 	}
 
+	// Set the version-negotiation headers Docker's server puts on EVERY
+	// response via its versionMiddleware — not just on /_ping. The docker CLI
+	// and SDKs read Api-Version off each response to select the request
+	// version, so they must be present everywhere. Handlers that hijack the
+	// connection (attach/exec/grpc) write their own raw preamble and ignore
+	// these, which is fine.
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			h := w.Header()
+			h.Set("Server", "Docker/"+serverVersion+" (linux)")
+			h.Set("Api-Version", apiVersion)
+			h.Set("Ostype", "linux")
+			h.Set("Docker-Experimental", "false")
+			next.ServeHTTP(w, req)
+		})
+	})
+
 	// Log all requests for debugging.
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -215,17 +231,4 @@ func (h *Handler) routes() http.Handler {
 	})
 
 	return r
-}
-
-func buildNotImplemented(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	msg := "image build is not supported by docker-lxc-daemon; use `docker pull` or the GoW image registry"
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"errorDetail": map[string]string{"message": msg},
-		"error":       msg,
-	})
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
 }
