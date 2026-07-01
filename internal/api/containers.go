@@ -1949,50 +1949,96 @@ func (h *Handler) putArchive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tr := tar.NewReader(r.Body)
+	// Docker query params for the extraction:
+	//   noOverwriteDirNonDir — error rather than replace an existing directory
+	//     with a non-directory (or vice versa).
+	//   copyUIDGID — preserve the archive entry's UID/GID on the extracted
+	//     files. Left opt-in: the default keeps the daemon's prior behavior
+	//     (files owned by the daemon user), because blindly chowning to the raw
+	//     tar UID/GID would be wrong for a user-namespaced container.
+	noOverwriteDirNonDir := boolValue(r, "noOverwriteDirNonDir")
+	copyUIDGID := boolValue(r, "copyUIDGID")
+
+	if e := extractArchive(dest, tar.NewReader(r.Body), noOverwriteDirNonDir, copyUIDGID); e != nil {
+		errResponse(w, e.code, e.msg)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// extractError carries the HTTP status an extraction failure should map to.
+type extractError struct {
+	code int
+	msg  string
+}
+
+// extractArchive unpacks a docker-cp tar stream under dest. Symlinks/hardlinks
+// are skipped (rootfs-escape guard). When noOverwriteDirNonDir is set, an entry
+// that would replace an existing directory with a non-directory (or vice versa)
+// is a 400 error. When copyUIDGID is set, each extracted entry is chowned to the
+// archive's UID/GID (best-effort). Returns nil on success.
+func extractArchive(dest string, tr *tar.Reader, noOverwriteDirNonDir, copyUIDGID bool) *extractError {
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
-			break
+			return nil
 		}
 		if err != nil {
-			errResponse(w, http.StatusInternalServerError, err.Error())
-			return
+			return &extractError{http.StatusInternalServerError, err.Error()}
 		}
-		// Reject symlinks — they can be used to escape the rootfs.
 		if hdr.Typeflag == tar.TypeSymlink || hdr.Typeflag == tar.TypeLink {
 			continue
 		}
 		target, err := safeJoin(dest, hdr.Name)
 		if err != nil {
-			errResponse(w, http.StatusForbidden, err.Error())
-			return
+			return &extractError{http.StatusForbidden, err.Error()}
+		}
+		if noOverwriteDirNonDir {
+			if info, statErr := os.Lstat(target); statErr == nil {
+				existingDir := info.IsDir()
+				incomingDir := hdr.Typeflag == tar.TypeDir
+				if existingDir != incomingDir {
+					return &extractError{http.StatusBadRequest, fmt.Sprintf(
+						"cannot replace existing %s with %s: %s",
+						fileKind(existingDir), fileKind(incomingDir), hdr.Name)}
+				}
+			}
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
-				errResponse(w, http.StatusInternalServerError, err.Error())
-				return
+				return &extractError{http.StatusInternalServerError, err.Error()}
 			}
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				errResponse(w, http.StatusInternalServerError, err.Error())
-				return
+				return &extractError{http.StatusInternalServerError, err.Error()}
 			}
 			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
 			if err != nil {
-				errResponse(w, http.StatusInternalServerError, err.Error())
-				return
+				return &extractError{http.StatusInternalServerError, err.Error()}
 			}
 			if _, err := io.Copy(f, tr); err != nil {
 				f.Close()
-				errResponse(w, http.StatusInternalServerError, err.Error())
-				return
+				return &extractError{http.StatusInternalServerError, err.Error()}
 			}
 			f.Close()
+		default:
+			continue
+		}
+		if copyUIDGID {
+			// Best-effort: preserve the archive entry's ownership. Ignore
+			// failures (e.g. unprivileged daemon) rather than abort the copy.
+			_ = os.Chown(target, hdr.Uid, hdr.Gid)
 		}
 	}
-	w.WriteHeader(http.StatusOK)
+}
+
+// fileKind renders "directory" or "file" for the noOverwriteDirNonDir error.
+func fileKind(isDir bool) string {
+	if isDir {
+		return "directory"
+	}
+	return "file"
 }
 
 // GET /containers/{id}/archive — docker cp FROM container
