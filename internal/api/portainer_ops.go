@@ -307,6 +307,10 @@ func (h *Handler) pruneImages(w http.ResponseWriter, r *http.Request) {
 		for _, c := range h.store.ListContainers() {
 			inUse[normalizeImageRef(c.Image)] = struct{}{}
 		}
+		// Count each removed image's size once per underlying image ID: several
+		// refs (e.g. `docker tag`) can share one template, and counting per-ref
+		// would over-report — consistent with the per-ID sizing /system/df uses.
+		countedIDs := map[string]bool{}
 		for _, img := range h.store.ListImages() {
 			if _, used := inUse[img.Ref]; used {
 				continue
@@ -314,8 +318,16 @@ func (h *Handler) pruneImages(w http.ResponseWriter, r *http.Request) {
 			if !pruneEligible(img.Created, img.OCILabels, filters, until) {
 				continue
 			}
+			var size int64
+			if !countedIDs[img.ID] {
+				size = imageSize(h.mgr.LXCPath(), img)
+			}
 			if err := h.mgr.RemoveImage(img.Ref); err != nil {
 				continue
+			}
+			if !countedIDs[img.ID] {
+				countedIDs[img.ID] = true
+				reclaimed += size
 			}
 			h.publishEvent("image", "delete", img.Ref, map[string]string{"name": img.Ref})
 			deleted = append(deleted, map[string]string{"Untagged": img.Ref})
