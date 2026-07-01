@@ -721,6 +721,7 @@ func (h *Handler) systemDF(w http.ResponseWriter, r *http.Request) {
 		containers := make([]map[string]any, 0)
 		for _, c := range h.store.ListContainers() {
 			size := rootfsSize(h.mgr.RootfsPath(c.ID))
+			state, _ := h.mgr.State(c.ID)
 			containers = append(containers, map[string]any{
 				"Id":         c.ID,
 				"Names":      []string{"/" + c.Name},
@@ -729,7 +730,7 @@ func (h *Handler) systemDF(w http.ResponseWriter, r *http.Request) {
 				"Created":    c.Created.Unix(),
 				"SizeRw":     size,
 				"SizeRootFs": size,
-				"State":      "",
+				"State":      dockerStatus(state),
 				"Labels":     c.Labels,
 			})
 		}
