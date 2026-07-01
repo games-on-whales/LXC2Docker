@@ -367,6 +367,16 @@ func (h *Handler) computeConfigDigest(rec *store.ImageRecord) (string, error) {
 		return "", err
 	}
 	defer cleanup()
+	return computeConfigDigestFromRootfs(rec, dir)
+}
+
+// computeConfigDigestFromRootfs is computeConfigDigest over an explicit rootfs
+// directory. Commit uses this: the freshly-snapshotted template rootfs is known
+// by path, but the record isn't in the store yet (so openImageRootfs can't
+// resolve it, and would otherwise fall back to the inherited source tarball —
+// yielding a digest over the BASE rootfs, not the committed one). Passing the
+// snapshot dir makes the digest match a later `docker save` of the same image.
+func computeConfigDigestFromRootfs(rec *store.ImageRecord, rootfsDir string) (string, error) {
 	tmp, err := os.CreateTemp("", "dld-diff-*.tar")
 	if err != nil {
 		return "", err
@@ -374,7 +384,7 @@ func (h *Handler) computeConfigDigest(rec *store.ImageRecord) (string, error) {
 	tmpPath := tmp.Name()
 	tmp.Close()
 	defer os.Remove(tmpPath)
-	layerSHA, err := writeLayerTar(nil, dir, tmpPath)
+	layerSHA, err := writeLayerTar(nil, rootfsDir, tmpPath)
 	if err != nil {
 		return "", err
 	}
