@@ -33,6 +33,27 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Docker's before/since image filters reference ANOTHER image and keep
+	// images created strictly before / after that image. Resolve each to its
+	// creation time (404 if the referenced image doesn't exist, like Docker).
+	var beforeT, sinceT *time.Time
+	if v := firstFilterValue(filt["before"]); v != "" {
+		t, ok := h.imageCreatedByRef(v)
+		if !ok {
+			errResponse(w, http.StatusNotFound, "No such image: "+v)
+			return
+		}
+		beforeT = &t
+	}
+	if v := firstFilterValue(filt["since"]); v != "" {
+		t, ok := h.imageCreatedByRef(v)
+		if !ok {
+			errResponse(w, http.StatusNotFound, "No such image: "+v)
+			return
+		}
+		sinceT = &t
+	}
+
 	usage := map[string]int{}
 	for _, c := range h.store.ListContainers() {
 		usage[normalizeImageRef(c.Image)]++
@@ -47,6 +68,12 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if parsedUntil != nil && rec.Created.After(*parsedUntil) {
+			continue
+		}
+		if beforeT != nil && !rec.Created.Before(*beforeT) {
+			continue
+		}
+		if sinceT != nil && !rec.Created.After(*sinceT) {
 			continue
 		}
 		if !filt.matchLabel(rec.OCILabels) {
@@ -93,6 +120,29 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 		return out[i].Created > out[j].Created
 	})
 	jsonResponse(w, http.StatusOK, out)
+}
+
+// imageCreatedByRef resolves an image reference (name:tag or ID) to its
+// creation time, for the before/since list filters. Returns false when no image
+// matches.
+func (h *Handler) imageCreatedByRef(ref string) (time.Time, bool) {
+	if rec := h.store.GetImage(normalizeImageRef(ref)); rec != nil {
+		return rec.Created, true
+	}
+	if rec := h.findImageByID(ref); rec != nil {
+		return rec.Created, true
+	}
+	return time.Time{}, false
+}
+
+// firstFilterValue returns the first non-empty value of a filter list, or "".
+func firstFilterValue(vals []string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // imageRefsForID returns every repo tag — and their "<repo>@<digest>" refs —
