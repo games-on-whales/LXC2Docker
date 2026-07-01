@@ -456,6 +456,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			rec.PortBindings = append(rec.PortBindings, store.PortBinding{
+				HostIP:        b.HostIP,
 				HostPort:      hPort,
 				ContainerPort: cPort,
 				Proto:         proto,
@@ -805,7 +806,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 	for _, pb := range rec.PortBindings {
 		key := fmt.Sprintf("%d/%s", pb.ContainerPort, pb.Proto)
 		ports[key] = append(ports[key], PortBinding{
-			HostIP:   "0.0.0.0",
+			HostIP:   orDefault(pb.HostIP, "0.0.0.0"),
 			HostPort: strconv.Itoa(pb.HostPort),
 		})
 	}
@@ -2258,7 +2259,7 @@ func buildHostConfig(rec *store.ContainerRecord) *HostConfig {
 		for _, pb := range rec.PortBindings {
 			key := fmt.Sprintf("%d/%s", pb.ContainerPort, pb.Proto)
 			hc.PortBindings[key] = append(hc.PortBindings[key], PortBinding{
-				HostIP:   "0.0.0.0",
+				HostIP:   orDefault(pb.HostIP, "0.0.0.0"),
 				HostPort: strconv.Itoa(pb.HostPort),
 			})
 		}
