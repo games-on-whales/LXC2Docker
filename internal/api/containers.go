@@ -1278,7 +1278,9 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	follow := boolValue(r, "follow")
 	timestamps := boolValue(r, "timestamps")
 	if !stdout && !stderr {
-		stdout, stderr = true, true
+		// Docker rejects a logs request that selects neither stream.
+		errResponse(w, http.StatusBadRequest, "Bad parameters: you must choose at least one stream")
+		return
 	}
 	tail := parseTail(q.Get("tail")) // -1 means "all"
 	since := parseUnixTS(q.Get("since"))

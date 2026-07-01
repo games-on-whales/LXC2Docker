@@ -39,6 +39,32 @@ func (s *execStore) get(id string) *execRecord {
 	return s.records[id]
 }
 
+// claimStart atomically marks an exec as started for the first time, returning
+// false if it was already started (running or finished). Docker rejects a
+// second start of the same exec instance with 409.
+func (s *execStore) claimStart(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.records[id]
+	if !ok || r.Running || !r.StartedAt.IsZero() {
+		return false
+	}
+	r.Running = true
+	r.StartedAt = time.Now()
+	return true
+}
+
+// releaseStart undoes a claimStart when the exec never actually ran (e.g. the
+// connection could not be hijacked), so the client can retry.
+func (s *execStore) releaseStart(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r, ok := s.records[id]; ok {
+		r.Running = false
+		r.StartedAt = time.Time{}
+	}
+}
+
 // idsForContainer returns the exec instance IDs tracked for a container, for
 // ContainerJSON.ExecIDs. Returns nil (→ JSON null, as Docker emits) when none.
 func (s *execStore) idsForContainer(cid string) []string {
@@ -151,22 +177,33 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 		execCmd = wrapCmdWithCwd(rec.Cmd, rec.WorkingDir)
 	}
 
+	// An exec instance may only be started once. Docker rejects a second start
+	// with 409. Claim it atomically so concurrent or repeat starts don't run
+	// the command twice.
+	if !h.execs.claimStart(rec.ID) {
+		errResponse(w, http.StatusConflict, fmt.Sprintf("exec instance %s is already started", execID))
+		return
+	}
+
 	if req.Detach {
-		// Fire-and-forget: run the command, don't stream output.
+		// Fire-and-forget: run the command, don't stream output. Docker returns
+		// 200 (not 204) for a detached exec start.
 		cmd := h.mgr.ExecAs(rec.ContainerID, execCmd, rec.Env, rec.User)
 		h.startDetachedExec(rec.ID, cmd)
-		w.WriteHeader(http.StatusNoContent)
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	// Hijack the connection for streaming.
 	hj, ok := w.(http.Hijacker)
 	if !ok {
+		h.execs.releaseStart(rec.ID) // never ran; let the client retry
 		errResponse(w, http.StatusInternalServerError, "streaming not supported")
 		return
 	}
 	conn, buf, err := hj.Hijack()
 	if err != nil {
+		h.execs.releaseStart(rec.ID)
 		return
 	}
 	// conn is closed by runExecTTY/runExecMux or deferred below for non-TTY.
@@ -191,8 +228,7 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 	writeHijackPreamble(buf, r.Header.Get("Upgrade") != "", streamContentType(r, rec.Tty))
 	buf.Flush()
 
-	h.execs.update(rec.ID, func(r *execRecord) { r.Running = true; r.StartedAt = time.Now() })
-
+	// Running/StartedAt were set atomically by claimStart above.
 	cmd := h.mgr.ExecAs(rec.ContainerID, execCmd, rec.Env, rec.User)
 
 	if rec.Tty {
