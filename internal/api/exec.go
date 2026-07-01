@@ -169,16 +169,10 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 	// and treats the 101 as an error, abandoning the hijacked stream
 	// mid-command so the `mknod && fake-udev` chain never completes and
 	// hot-plugged controllers never reach the app (SDL/Steam) container.
-	if r.Header.Get("Upgrade") != "" {
-		buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
-		buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
-		buf.WriteString("Connection: Upgrade\r\n")
-		buf.WriteString("Upgrade: tcp\r\n")
-	} else {
-		buf.WriteString("HTTP/1.1 200 OK\r\n")
-		buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
-	}
-	buf.WriteString("\r\n")
+	// A non-TTY exec streams stdcopy-multiplexed frames (runExecMux), so the
+	// advertised media type must reflect that just like attach/logs — raw for a
+	// TTY exec, multiplexed for non-TTY (gated on API >= 1.42).
+	writeHijackPreamble(buf, r.Header.Get("Upgrade") != "", streamContentType(r, rec.Tty))
 	buf.Flush()
 
 	h.execs.update(rec.ID, func(r *execRecord) { r.Running = true; r.StartedAt = time.Now() })

@@ -1260,7 +1260,7 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	f, err := os.Open(logPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			w.Header().Set("Content-Type", streamContentType(tty))
+			w.Header().Set("Content-Type", streamContentType(r, tty))
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -1269,7 +1269,7 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 
-	w.Header().Set("Content-Type", streamContentType(tty))
+	w.Header().Set("Content-Type", streamContentType(r, tty))
 	w.WriteHeader(http.StatusOK)
 
 	streamID := byte(1)
@@ -1685,7 +1685,7 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 	// non-upgrading clients (same rationale as the exec-start handler). The
 	// stream Content-Type reflects the framing: raw for a TTY container,
 	// multiplexed (stdcopy) for non-TTY — Docker API v1.42+.
-	writeHijackPreamble(buf, r.Header.Get("Upgrade") != "", tty)
+	writeHijackPreamble(buf, r.Header.Get("Upgrade") != "", streamContentType(r, tty))
 	buf.Flush()
 
 	logPath := h.mgr.LogPath(id)
@@ -1777,31 +1777,73 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 // attach/exec stream. A client that requested a protocol upgrade (an Upgrade
 // request header) gets "101 UPGRADED" with the Connection/Upgrade response
 // headers; every other client gets a plain "200 OK" — returning 101
-// unconditionally breaks non-upgrading clients. tty selects the stream
-// Content-Type (see streamContentType). The caller flushes.
-func writeHijackPreamble(w io.Writer, upgrade, tty bool) {
-	ctype := streamContentType(tty)
+// unconditionally breaks non-upgrading clients. contentType is the already-
+// resolved stream media type (see streamContentType). The caller flushes.
+func writeHijackPreamble(w io.Writer, upgrade bool, contentType string) {
 	if upgrade {
 		io.WriteString(w, "HTTP/1.1 101 UPGRADED\r\n")
-		io.WriteString(w, "Content-Type: "+ctype+"\r\n")
+		io.WriteString(w, "Content-Type: "+contentType+"\r\n")
 		io.WriteString(w, "Connection: Upgrade\r\n")
 		io.WriteString(w, "Upgrade: tcp\r\n")
 	} else {
 		io.WriteString(w, "HTTP/1.1 200 OK\r\n")
-		io.WriteString(w, "Content-Type: "+ctype+"\r\n")
+		io.WriteString(w, "Content-Type: "+contentType+"\r\n")
 	}
 	io.WriteString(w, "\r\n")
 }
 
 // streamContentType returns the Content-Type Docker advertises for an
-// attach/logs byte stream: raw for a TTY container, and stdcopy-multiplexed for
-// a non-TTY container (Docker API v1.42+ distinguishes the two so a client
-// knows whether to strip the 8-byte frame headers).
-func streamContentType(tty bool) string {
+// attach/logs/exec byte stream. A TTY stream is raw; a non-TTY stream is
+// stdcopy-multiplexed. The multiplexed media type was only introduced in
+// Docker API v1.42, so a client that negotiated an older version gets
+// raw-stream (it predates the type and decides demuxing from Config.Tty). This
+// matches moby's `!Tty && version >= 1.42` gate exactly.
+func streamContentType(r *http.Request, tty bool) string {
 	if tty {
 		return "application/vnd.docker.raw-stream"
 	}
-	return "application/vnd.docker.multiplexed-stream"
+	if apiVersionAtLeast(r, "1.42") {
+		return "application/vnd.docker.multiplexed-stream"
+	}
+	return "application/vnd.docker.raw-stream"
+}
+
+// apiVersionAtLeast reports whether the client's negotiated API version (the
+// /v<version>/ path prefix) is >= want. A client that omitted the version
+// prefix is treated as the current daemon version, i.e. >= any want.
+func apiVersionAtLeast(r *http.Request, want string) bool {
+	v := mux.Vars(r)["version"]
+	if v == "" {
+		return true
+	}
+	return compareDottedVersions(v, want) >= 0
+}
+
+// compareDottedVersions compares dotted numeric versions ("1.43" vs "1.42"),
+// returning -1, 0, or 1. Missing or non-numeric components compare as 0.
+func compareDottedVersions(a, b string) int {
+	as := strings.Split(a, ".")
+	bs := strings.Split(b, ".")
+	n := len(as)
+	if len(bs) > n {
+		n = len(bs)
+	}
+	for i := 0; i < n; i++ {
+		var ai, bi int
+		if i < len(as) {
+			ai, _ = strconv.Atoi(as[i])
+		}
+		if i < len(bs) {
+			bi, _ = strconv.Atoi(bs[i])
+		}
+		switch {
+		case ai < bi:
+			return -1
+		case ai > bi:
+			return 1
+		}
+	}
+	return 0
 }
 
 // writeStreamFrame writes a single chunk to an attach/exec stream. For a TTY
