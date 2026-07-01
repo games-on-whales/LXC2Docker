@@ -474,6 +474,12 @@ func (e *registryAuthError) Error() string { return e.msg }
 // *registryAuthError on a genuine auth failure, or a plain error on a
 // transport/other failure — so the caller can map to 401 vs 500.
 func probeRegistryLogin(ctx context.Context, host, user, pass string) error {
+	// A host that looks like a flag would be mis-parsed by skopeo as an option
+	// (worst case: `--help` exits 0 → a false "Login Succeeded"). Reject it, and
+	// also pass "--" before the positional as defense in depth.
+	if host == "" || strings.HasPrefix(host, "-") {
+		return fmt.Errorf("invalid registry host %q", host)
+	}
 	f, err := os.CreateTemp("", "dld-authcheck-*.json")
 	if err != nil {
 		return err
@@ -484,13 +490,17 @@ func probeRegistryLogin(ctx context.Context, host, user, pass string) error {
 
 	cmd := exec.CommandContext(ctx, "skopeo", "login",
 		"--username", user, "--password-stdin",
-		"--authfile", authfile, "--tls-verify=true", host)
+		"--authfile", authfile, "--tls-verify=true", "--", host)
 	cmd.Stdin = strings.NewReader(pass)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if runErr := cmd.Run(); runErr != nil {
+		// Only treat a genuine auth failure as 401; anything else is a transport
+		// error → 500. "unauthorized" already covers "401 Unauthorized", so we
+		// avoid a bare "401" substring (it would false-match a host/port
+		// containing 401).
 		se := strings.ToLower(stderr.String())
-		if strings.Contains(se, "unauthorized") || strings.Contains(se, "401") ||
+		if strings.Contains(se, "unauthorized") ||
 			strings.Contains(se, "invalid username or password") ||
 			strings.Contains(se, "authentication required") {
 			return &registryAuthError{msg: "invalid username/password"}
