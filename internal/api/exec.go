@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -231,39 +232,46 @@ func (h *Handler) execStart(w http.ResponseWriter, r *http.Request) {
 	// Running/StartedAt were set atomically by claimStart above.
 	cmd := h.mgr.ExecAs(rec.ContainerID, execCmd, rec.Env, rec.User)
 
+	// Resolve the detach key sequence (default ctrl-p,ctrl-q). Docker is lenient
+	// on a malformed value (the client already validated), so fall back to the
+	// default rather than failing the exec.
+	detachKeys, dkErr := parseDetachKeys(rec.DetachKeys)
+	if dkErr != nil {
+		detachKeys, _ = parseDetachKeys("")
+	}
+
+	// onExit marks the exec finished. The runner calls it synchronously when the
+	// process exits; on detach it fires later from the runner's background
+	// waiter, so the record stays Running until the process actually ends.
+	onExit := func(code int) {
+		h.execs.update(rec.ID, func(r *execRecord) {
+			r.Running = false
+			r.Pid = 0
+			r.ExitCode = code
+			r.Pty = nil
+		})
+	}
+
+	// The runners own the connection lifecycle (they close it on exit/detach).
+	closeConn = false
 	if rec.Tty {
-		closeConn = false // runExecTTY closes conn itself
-		// Register the PTY on the record as soon as it's available so a
-		// concurrent /resize request can forward the ioctl. runExecTTY
-		// clears it before returning.
-		runExecTTY(cmd, conn, func(ptmx *os.File) {
+		runExecTTY(cmd, conn, detachKeys, func(ptmx *os.File) {
 			h.execs.update(rec.ID, func(r *execRecord) {
 				r.Pty = ptmx
 				if cmd.Process != nil {
 					r.Pid = cmd.Process.Pid
 				}
 			})
-		})
-		h.execs.update(rec.ID, func(r *execRecord) { r.Pty = nil })
+		}, onExit)
 	} else {
-		runExecMux(cmd, conn, rec.AttachStdin, func() {
+		runExecMux(cmd, conn, rec.AttachStdin, detachKeys, func() {
 			h.execs.update(rec.ID, func(r *execRecord) {
 				if cmd.Process != nil {
 					r.Pid = cmd.Process.Pid
 				}
 			})
-		})
+		}, onExit)
 	}
-
-	code := 0
-	if cmd.ProcessState != nil {
-		code = cmd.ProcessState.ExitCode()
-	}
-	h.execs.update(rec.ID, func(r *execRecord) {
-		r.Running = false
-		r.Pid = 0
-		r.ExitCode = code
-	})
 }
 
 func (h *Handler) startDetachedExec(execID string, cmd *exec.Cmd) {
@@ -342,52 +350,82 @@ func (h *Handler) execInspect(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// runExecTTY runs cmd with a PTY attached and proxies raw bytes between the
-// PTY master and the hijacked connection. Used when Tty=true.
-//
-// onReady is called with the PTY master as soon as it's available so
-// callers can register it for resize-forwarding. It may be nil.
-func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter, onReady func(*os.File)) {
+// runExecTTY runs cmd with a PTY attached and proxies raw bytes between the PTY
+// master and the hijacked connection. Used when Tty=true. onReady is called with
+// the PTY master as soon as it's available (for resize forwarding); onExit is
+// called with the process's exit code when it terminates. Returns detached=true
+// if the client pressed the detach key sequence — in which case the process is
+// left running and onExit fires later from a background goroutine.
+func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter, detachKeys []byte, onReady func(*os.File), onExit func(int)) (detached bool) {
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		fmt.Fprintf(conn, "error starting pty: %s\n", err)
-		return
+		onExit(1)
+		return false
 	}
 	if onReady != nil {
 		onReady(ptmx)
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// PTY → connection
-	go func() {
-		defer wg.Done()
-		io.Copy(conn, ptmx)
-	}()
-
-	// connection → PTY (stdin)
-	go func() {
-		defer wg.Done()
-		io.Copy(ptmx, conn)
-	}()
-
-	cmd.Wait()
-	// Close the PTY master to unblock the io.Copy goroutines. If we defer
-	// this, wg.Wait below deadlocks because the copies never see EOF.
-	ptmx.Close()
-	// Close the connection's read side so the stdin copy also returns.
-	if c, ok := conn.(io.Closer); ok {
-		c.Close()
+	exitCode := func() int {
+		if cmd.ProcessState != nil {
+			return cmd.ProcessState.ExitCode()
+		}
+		return 0
 	}
-	wg.Wait()
+
+	// Output drains the PTY into a swappable writer, so on detach we can
+	// redirect it to io.Discard and keep draining (the process never blocks on
+	// a full PTY).
+	out := newSwitchableWriter(conn)
+	outDone := make(chan struct{})
+	go func() { io.Copy(out, ptmx); close(outDone) }()
+
+	// Stdin: connection → PTY, scanning for the detach key sequence.
+	stdinDone := make(chan error, 1)
+	go func() { _, e := io.Copy(ptmx, newEscapeReader(conn, detachKeys)); stdinDone <- e }()
+
+	waitDone := make(chan struct{})
+	go func() { cmd.Wait(); close(waitDone) }()
+
+	select {
+	case <-waitDone:
+		ptmx.Close() // unblocks the output drainer (EOF)
+		closeIfCloser(conn)
+		<-outDone
+		onExit(exitCode())
+		return false
+	case e := <-stdinDone:
+		if !errors.Is(e, errDetach) {
+			// Client closed stdin or the connection dropped; the process is
+			// still running — wait for it to exit, as before.
+			<-waitDone
+			ptmx.Close()
+			closeIfCloser(conn)
+			<-outDone
+			onExit(exitCode())
+			return false
+		}
+		// Detach: keep the process running. Redirect output to discard and close
+		// the client connection (this unblocks any in-flight write; the drainer
+		// swallows the error and keeps draining). Finish in the background.
+		out.set(io.Discard)
+		closeIfCloser(conn)
+		go func() {
+			<-waitDone
+			ptmx.Close()
+			<-outDone
+			onExit(exitCode())
+		}()
+		return true
+	}
 }
 
 // runExecMux runs cmd with pipes and multiplexes stdout/stderr into the
 // Docker raw-stream format. Used when Tty=false. When attachStdin is set the
 // hijacked connection is forwarded to the command's stdin (raw, not framed —
 // matching how Docker streams exec stdin), so `docker exec -i` works.
-func runExecMux(cmd *exec.Cmd, conn io.ReadWriter, attachStdin bool, onStart func()) {
+func runExecMux(cmd *exec.Cmd, conn io.ReadWriter, attachStdin bool, detachKeys []byte, onStart func(), onExit func(int)) (detached bool) {
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
 	cmd.Stdout = stdoutW
@@ -402,46 +440,52 @@ func runExecMux(cmd *exec.Cmd, conn io.ReadWriter, attachStdin bool, onStart fun
 
 	if err := cmd.Start(); err != nil {
 		writeLogFrame(conn, 2, []byte("error: "+err.Error()+"\n"))
-		return
+		onExit(1)
+		return false
 	}
 	if onStart != nil {
 		onStart()
 	}
 
-	// Forward the client's stdin to the command. The copy ends when the client
-	// half-closes (EOF) or the connection drops; closing stdinW then gives the
-	// command EOF on stdin.
+	exitCode := func() int {
+		if cmd.ProcessState != nil {
+			return cmd.ProcessState.ExitCode()
+		}
+		return 0
+	}
+
+	// Frames drain through a swappable writer so detach can redirect them to
+	// io.Discard while still draining stdout/stderr (the process never blocks).
+	out := newSwitchableWriter(conn)
+
+	// Forward the client's stdin, scanning for the detach sequence.
+	stdinDone := make(chan error, 1)
 	if stdinW != nil {
-		go func() {
-			io.Copy(stdinW, conn)
-			stdinW.Close()
-		}()
+		go func() { _, e := io.Copy(stdinW, newEscapeReader(conn, detachKeys)); stdinDone <- e }()
 	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-
 	go func() {
 		defer wg.Done()
 		b := make([]byte, 32*1024)
 		for {
 			n, err := stdoutR.Read(b)
 			if n > 0 {
-				writeLogFrame(conn, 1, b[:n])
+				writeLogFrame(out, 1, b[:n])
 			}
 			if err != nil {
 				return
 			}
 		}
 	}()
-
 	go func() {
 		defer wg.Done()
 		b := make([]byte, 32*1024)
 		for {
 			n, err := stderrR.Read(b)
 			if n > 0 {
-				writeLogFrame(conn, 2, b[:n])
+				writeLogFrame(out, 2, b[:n])
 			}
 			if err != nil {
 				return
@@ -449,11 +493,60 @@ func runExecMux(cmd *exec.Cmd, conn io.ReadWriter, attachStdin bool, onStart fun
 		}
 	}()
 
-	cmd.Wait()
-	// Close pipe writers to unblock the reader goroutines.
-	stdoutW.Close()
-	stderrW.Close()
-	wg.Wait()
+	waitDone := make(chan struct{})
+	go func() { cmd.Wait(); close(waitDone) }()
+
+	// With no attached stdin there is no stream to scan, so detach is
+	// impossible — just wait for the process.
+	if stdinW == nil {
+		<-waitDone
+		stdoutW.Close()
+		stderrW.Close()
+		closeIfCloser(conn)
+		wg.Wait()
+		onExit(exitCode())
+		return false
+	}
+
+	select {
+	case <-waitDone:
+		stdoutW.Close()
+		stderrW.Close()
+		stdinW.Close()
+		closeIfCloser(conn)
+		wg.Wait()
+		onExit(exitCode())
+		return false
+	case e := <-stdinDone:
+		if !errors.Is(e, errDetach) {
+			// Client closed stdin (EOF) → give the process EOF and wait.
+			stdinW.Close()
+			<-waitDone
+			stdoutW.Close()
+			stderrW.Close()
+			closeIfCloser(conn)
+			wg.Wait()
+			onExit(exitCode())
+			return false
+		}
+		// Detach: keep the process running. Redirect frames to discard and close
+		// the client connection. Close stdinW so os/exec's stdin-copy goroutine
+		// ends and cmd.Wait can complete — the client's input stream is gone, so
+		// the process sees EOF on stdin (Docker's non-TTY detach behaves the
+		// same); a process that ignores stdin keeps running. Finish in the
+		// background when the process exits.
+		out.set(io.Discard)
+		closeIfCloser(conn)
+		stdinW.Close()
+		go func() {
+			<-waitDone
+			stdoutW.Close()
+			stderrW.Close()
+			wg.Wait()
+			onExit(exitCode())
+		}()
+		return true
+	}
 }
 
 // wrapCmdWithCwd turns argv into `sh -c "cd <dir> && exec <argv>"` so the
