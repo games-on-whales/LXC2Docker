@@ -40,8 +40,12 @@ func TestTagBuiltImage(t *testing.T) {
 	}
 	h := &Handler{store: st, events: newEventBroker()}
 
-	if err := h.tagBuiltImage("app:1", "app:latest"); err != nil {
+	norm, err := h.tagBuiltImage("app:1", "app:latest")
+	if err != nil {
 		t.Fatalf("tagBuiltImage: %v", err)
+	}
+	if norm != "app:latest" {
+		t.Errorf("returned ref = %q, want app:latest", norm)
 	}
 	tagged := st.GetImage("app:latest")
 	if tagged == nil {
@@ -51,8 +55,23 @@ func TestTagBuiltImage(t *testing.T) {
 	if tagged.ID != "build_app" || tagged.TemplateName != "tmpl-app" {
 		t.Errorf("tagged = %+v, want same ID/backing as source", tagged)
 	}
+
+	// An UNTAGGED extra ref (docker build -t app-alias) must be normalized to
+	// :latest, so it's resolvable by a later GetImage — otherwise the tag is
+	// unreachable and the daemon would try to pull it.
+	norm2, err := h.tagBuiltImage("app:1", "app-alias")
+	if err != nil {
+		t.Fatalf("tagBuiltImage(untagged): %v", err)
+	}
+	if norm2 != "app-alias:latest" {
+		t.Errorf("untagged extra ref = %q, want app-alias:latest", norm2)
+	}
+	if st.GetImage(normalizeImageRef("app-alias")) == nil {
+		t.Error("app-alias:latest not resolvable after tagging an untagged ref")
+	}
+
 	// Tagging a missing image errors.
-	if err := h.tagBuiltImage("ghost:1", "x:1"); err == nil {
+	if _, err := h.tagBuiltImage("ghost:1", "x:1"); err == nil {
 		t.Error("tagging a nonexistent built image should error")
 	}
 }

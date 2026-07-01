@@ -115,15 +115,22 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 		fail(err.Error())
 		return
 	}
-	// Apply any additional -t tags to the freshly built image.
+	// Apply any additional -t tags to the freshly built image. Collect the
+	// normalized refs (the primary first) so we can emit Docker's output order:
+	// one "Successfully built" line, then a "Successfully tagged" line per tag.
+	tagged := []string{ref}
 	for _, extra := range allTags[1:] {
-		if err := h.tagBuiltImage(ref, extra); err != nil {
+		norm, err := h.tagBuiltImage(ref, extra)
+		if err != nil {
 			fail(fmt.Sprintf("tag %s: %s", extra, err.Error()))
 			return
 		}
-		send(map[string]string{"stream": fmt.Sprintf("Successfully tagged %s\n", extra)})
+		tagged = append(tagged, norm)
 	}
 	send(map[string]string{"stream": fmt.Sprintf("Successfully built %s\n", ref)})
+	for _, t := range tagged {
+		send(map[string]string{"stream": fmt.Sprintf("Successfully tagged %s\n", t)})
+	}
 	send(map[string]any{"aux": map[string]string{"ID": ref}})
 }
 
@@ -146,20 +153,22 @@ func collectBuildTags(vals []string) []string {
 }
 
 // tagBuiltImage points newRef at the just-built image by copying its store
-// record under the new ref (sharing the same backing template), the same way
-// `docker tag` does.
-func (h *Handler) tagBuiltImage(builtRef, newRef string) error {
+// record under the new (normalized) ref — sharing the same backing template,
+// the same way `docker tag` does — and returns the normalized ref. newRef is
+// normalized (a bare "repo" becomes "repo:latest") so the tag is resolvable by
+// later GetImage lookups, matching how the primary build tag is stored.
+func (h *Handler) tagBuiltImage(builtRef, newRef string) (string, error) {
 	src := h.store.GetImage(builtRef)
 	if src == nil {
-		return fmt.Errorf("built image %q not found", builtRef)
+		return "", fmt.Errorf("built image %q not found", builtRef)
 	}
 	cp := *src
-	cp.Ref = newRef
+	cp.Ref = normalizeImageRef(newRef)
 	if err := h.store.AddImage(&cp); err != nil {
-		return err
+		return "", err
 	}
-	h.emitImage("tag", newRef)
-	return nil
+	h.emitImage("tag", cp.Ref)
+	return cp.Ref, nil
 }
 
 // buildFromContext executes a Dockerfile build against an already-extracted
