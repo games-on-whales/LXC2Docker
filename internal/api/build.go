@@ -52,11 +52,14 @@ type dockerfileStage struct {
 // It is intentionally narrow but functional enough for basic Portainer flows:
 // FROM, ARG, WORKDIR, ENV, COPY, ADD, RUN, CMD, ENTRYPOINT, EXPOSE, LABEL.
 func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
-	tag := firstCSV(r.URL.Query().Get("t"))
-	if tag == "" {
+	// Docker accepts multiple -t tags (repeated t params, and/or comma-joined).
+	// Build under the first and apply the rest to the same image afterwards.
+	allTags := collectBuildTags(r.URL.Query()["t"])
+	if len(allTags) == 0 {
 		errResponse(w, http.StatusBadRequest, "build tag is required via query param t")
 		return
 	}
+	tag := allTags[0]
 	targetStage := strings.TrimSpace(r.URL.Query().Get("target"))
 
 	dockerfilePath := r.URL.Query().Get("dockerfile")
@@ -112,8 +115,60 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 		fail(err.Error())
 		return
 	}
+	// Apply any additional -t tags to the freshly built image. Collect the
+	// normalized refs (the primary first) so we can emit Docker's output order:
+	// one "Successfully built" line, then a "Successfully tagged" line per tag.
+	tagged := []string{ref}
+	for _, extra := range allTags[1:] {
+		norm, err := h.tagBuiltImage(ref, extra)
+		if err != nil {
+			fail(fmt.Sprintf("tag %s: %s", extra, err.Error()))
+			return
+		}
+		tagged = append(tagged, norm)
+	}
 	send(map[string]string{"stream": fmt.Sprintf("Successfully built %s\n", ref)})
+	for _, t := range tagged {
+		send(map[string]string{"stream": fmt.Sprintf("Successfully tagged %s\n", t)})
+	}
 	send(map[string]any{"aux": map[string]string{"ID": ref}})
+}
+
+// collectBuildTags flattens the -t query values (repeated params and/or
+// comma-joined) into an ordered, de-duplicated, non-empty tag list.
+func collectBuildTags(vals []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, v := range vals {
+		for _, t := range strings.Split(v, ",") {
+			t = strings.TrimSpace(t)
+			if t == "" || seen[t] {
+				continue
+			}
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// tagBuiltImage points newRef at the just-built image by copying its store
+// record under the new (normalized) ref — sharing the same backing template,
+// the same way `docker tag` does — and returns the normalized ref. newRef is
+// normalized (a bare "repo" becomes "repo:latest") so the tag is resolvable by
+// later GetImage lookups, matching how the primary build tag is stored.
+func (h *Handler) tagBuiltImage(builtRef, newRef string) (string, error) {
+	src := h.store.GetImage(builtRef)
+	if src == nil {
+		return "", fmt.Errorf("built image %q not found", builtRef)
+	}
+	cp := *src
+	cp.Ref = normalizeImageRef(newRef)
+	if err := h.store.AddImage(&cp); err != nil {
+		return "", err
+	}
+	h.emitImage("tag", cp.Ref)
+	return cp.Ref, nil
 }
 
 // buildFromContext executes a Dockerfile build against an already-extracted
