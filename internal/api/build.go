@@ -115,6 +115,19 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 		fail(err.Error())
 		return
 	}
+	// Compute Docker's real image ID (sha256 of the OCI config over the built
+	// rootfs) and store it on the built record so aux.ID / inspect are a real
+	// digest, not the image ref. Best-effort: fall back to the ref on error.
+	// Done BEFORE applying extra tags so their copied records inherit it.
+	auxID := ref
+	if rec := h.store.GetImage(ref); rec != nil {
+		if digest, derr := h.computeConfigDigest(rec); derr == nil && digest != "" {
+			rec.ConfigDigest = digest
+			if err := h.store.AddImage(rec); err == nil {
+				auxID = "sha256:" + digest
+			}
+		}
+	}
 	// Apply any additional -t tags to the freshly built image. Collect the
 	// normalized refs (the primary first) so we can emit Docker's output order:
 	// one "Successfully built" line, then a "Successfully tagged" line per tag.
@@ -131,7 +144,7 @@ func (h *Handler) buildImage(w http.ResponseWriter, r *http.Request) {
 	for _, t := range tagged {
 		send(map[string]string{"stream": fmt.Sprintf("Successfully tagged %s\n", t)})
 	}
-	send(map[string]any{"aux": map[string]string{"ID": ref}})
+	send(map[string]any{"aux": map[string]string{"ID": auxID}})
 }
 
 // collectBuildTags flattens the -t query values (repeated params and/or
