@@ -360,6 +360,7 @@ func runExecTTY(cmd *exec.Cmd, conn io.ReadWriter, detachKeys []byte, onReady fu
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		fmt.Fprintf(conn, "error starting pty: %s\n", err)
+		closeIfCloser(conn) // execStart set closeConn=false; the runner owns the conn now
 		onExit(1)
 		return false
 	}
@@ -440,6 +441,7 @@ func runExecMux(cmd *exec.Cmd, conn io.ReadWriter, attachStdin bool, detachKeys 
 
 	if err := cmd.Start(); err != nil {
 		writeLogFrame(conn, 2, []byte("error: "+err.Error()+"\n"))
+		closeIfCloser(conn) // execStart set closeConn=false; the runner owns the conn now
 		onExit(1)
 		return false
 	}
