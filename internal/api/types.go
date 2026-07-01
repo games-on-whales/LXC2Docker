@@ -198,10 +198,15 @@ type ContainerJSON struct {
 	Image           string           `json:"Image"`
 	ResolvConfPath  string           `json:"ResolvConfPath"`
 	HostnamePath    string           `json:"HostnamePath"`
+	HostsPath       string           `json:"HostsPath"`
 	LogPath         string           `json:"LogPath"`
 	RestartCount    int              `json:"RestartCount"`
 	Driver          string           `json:"Driver"`
 	Platform        string           `json:"Platform"`
+	MountLabel      string           `json:"MountLabel"`
+	ProcessLabel    string           `json:"ProcessLabel"`
+	AppArmorProfile string           `json:"AppArmorProfile"`
+	ExecIDs         []string         `json:"ExecIDs"`
 	GraphDriver     GraphDriver      `json:"GraphDriver"`
 	SizeRw          int64            `json:"SizeRw,omitempty"`
 	SizeRootFs      int64            `json:"SizeRootFs,omitempty"`
@@ -275,31 +280,31 @@ type ContainerHealthEntry struct {
 // but Portainer reads them to populate the "Console" form on container
 // recreate — omitting them produces a blank form.
 type ContainerConfig struct {
-	Hostname     string              `json:"Hostname"`
-	Domainname   string              `json:"Domainname"`
-	MacAddress   string              `json:"MacAddress"`
-	User         string              `json:"User"`
-	AttachStdin  bool                `json:"AttachStdin"`
-	AttachStdout bool                `json:"AttachStdout"`
-	AttachStderr bool                `json:"AttachStderr"`
-	ExposedPorts map[string]struct{} `json:"ExposedPorts"`
-	Tty          bool                `json:"Tty"`
-	OpenStdin    bool                `json:"OpenStdin"`
-	StdinOnce    bool                `json:"StdinOnce"`
-	NetworkDisabled bool             `json:"NetworkDisabled"`
-	ArgsEscaped  bool                `json:"ArgsEscaped"`
-	Image        string              `json:"Image"`
-	Volumes      map[string]struct{} `json:"Volumes"`
-	Cmd          []string            `json:"Cmd"`
-	Entrypoint   []string            `json:"Entrypoint"`
-	Env          []string            `json:"Env"`
-	Labels       map[string]string   `json:"Labels"`
-	WorkingDir   string              `json:"WorkingDir"`
-	OnBuild      []string            `json:"OnBuild"`
-	Shell        []string            `json:"Shell"`
-	StopSignal   string              `json:"StopSignal,omitempty"`
-	StopTimeout  *int                `json:"StopTimeout,omitempty"`
-	Healthcheck  *Healthcheck        `json:"Healthcheck,omitempty"`
+	Hostname        string              `json:"Hostname"`
+	Domainname      string              `json:"Domainname"`
+	MacAddress      string              `json:"MacAddress"`
+	User            string              `json:"User"`
+	AttachStdin     bool                `json:"AttachStdin"`
+	AttachStdout    bool                `json:"AttachStdout"`
+	AttachStderr    bool                `json:"AttachStderr"`
+	ExposedPorts    map[string]struct{} `json:"ExposedPorts"`
+	Tty             bool                `json:"Tty"`
+	OpenStdin       bool                `json:"OpenStdin"`
+	StdinOnce       bool                `json:"StdinOnce"`
+	NetworkDisabled bool                `json:"NetworkDisabled"`
+	ArgsEscaped     bool                `json:"ArgsEscaped"`
+	Image           string              `json:"Image"`
+	Volumes         map[string]struct{} `json:"Volumes"`
+	Cmd             []string            `json:"Cmd"`
+	Entrypoint      []string            `json:"Entrypoint"`
+	Env             []string            `json:"Env"`
+	Labels          map[string]string   `json:"Labels"`
+	WorkingDir      string              `json:"WorkingDir"`
+	OnBuild         []string            `json:"OnBuild"`
+	Shell           []string            `json:"Shell"`
+	StopSignal      string              `json:"StopSignal,omitempty"`
+	StopTimeout     *int                `json:"StopTimeout,omitempty"`
+	Healthcheck     *Healthcheck        `json:"Healthcheck,omitempty"`
 }
 
 // EndpointIPAMConfig is the API model for per-endpoint IPAM data.
@@ -378,18 +383,18 @@ type NetworkSettings struct {
 // keep them populated so the "View network" link on a container works.
 type EndpointSettings struct {
 	IPAMConfig          *EndpointIPAMConfig `json:"IPAMConfig"`
-	Links               []string `json:"Links"`
-	Aliases             []string `json:"Aliases"`
-	NetworkID           string   `json:"NetworkID"`
-	EndpointID          string   `json:"EndpointID"`
-	Gateway             string   `json:"Gateway"`
-	IPAddress           string   `json:"IPAddress"`
-	IPPrefixLen         int      `json:"IPPrefixLen"`
-	IPv6Gateway         string   `json:"IPv6Gateway"`
-	GlobalIPv6Address   string   `json:"GlobalIPv6Address"`
-	GlobalIPv6PrefixLen int      `json:"GlobalIPv6PrefixLen"`
-	MacAddress          string            `json:"MacAddress"`
-	DriverOpts          map[string]string `json:"DriverOpts"`
+	Links               []string            `json:"Links"`
+	Aliases             []string            `json:"Aliases"`
+	NetworkID           string              `json:"NetworkID"`
+	EndpointID          string              `json:"EndpointID"`
+	Gateway             string              `json:"Gateway"`
+	IPAddress           string              `json:"IPAddress"`
+	IPPrefixLen         int                 `json:"IPPrefixLen"`
+	IPv6Gateway         string              `json:"IPv6Gateway"`
+	GlobalIPv6Address   string              `json:"GlobalIPv6Address"`
+	GlobalIPv6PrefixLen int                 `json:"GlobalIPv6PrefixLen"`
+	MacAddress          string              `json:"MacAddress"`
+	DriverOpts          map[string]string   `json:"DriverOpts"`
 }
 
 // --- Container List ---
@@ -678,21 +683,21 @@ type ErrorResponse struct {
 // Pty is set for Tty=true execs while the stream is active so resize
 // requests can forward TIOCSWINSZ to the live terminal.
 type execRecord struct {
-	ID          string
-	ContainerID string
-	Cmd         []string
-	Tty         bool
-	DetachKeys  string
-	AttachStdin bool
+	ID           string
+	ContainerID  string
+	Cmd          []string
+	Tty          bool
+	DetachKeys   string
+	AttachStdin  bool
 	AttachStdout bool
 	AttachStderr bool
-	Env         []string
-	WorkingDir  string
-	User        string
-	Privileged  bool
-	Pid         int
-	ExitCode    int
-	Running     bool
-	StartedAt   time.Time
-	Pty         *os.File
+	Env          []string
+	WorkingDir   string
+	User         string
+	Privileged   bool
+	Pid          int
+	ExitCode     int
+	Running      bool
+	StartedAt    time.Time
+	Pty          *os.File
 }

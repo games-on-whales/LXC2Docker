@@ -830,10 +830,18 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 		Name:           "/" + rec.Name,
 		ResolvConfPath: filepath.Join(rootfs, "etc", "resolv.conf"),
 		HostnamePath:   filepath.Join(rootfs, "etc", "hostname"),
+		HostsPath:      filepath.Join(rootfs, "etc", "hosts"),
 		LogPath:        h.mgr.LogPath(id),
 		RestartCount:   rec.RestartCount,
 		Driver:         "lxc",
 		Platform:       "linux",
+		// MountLabel/ProcessLabel (SELinux) and AppArmorProfile are empty on
+		// this backend, but Docker always returns the keys. ExecIDs lists the
+		// container's tracked exec instances (nil → null, as Docker emits).
+		MountLabel:      "",
+		ProcessLabel:    "",
+		AppArmorProfile: "",
+		ExecIDs:         h.execs.idsForContainer(id),
 		GraphDriver: GraphDriver{
 			Name: "lxc",
 			Data: map[string]string{
