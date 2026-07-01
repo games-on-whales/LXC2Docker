@@ -1939,6 +1939,56 @@ func safeJoin(base, untrusted string) (string, error) {
 	return target, nil
 }
 
+// resolveArchivePath maps a container-internal path (the docker cp target) to
+// the host filesystem path that actually backs it, honoring the container's
+// bind mounts and volumes. A bind/volume is mounted OVER its destination in the
+// container's mount namespace at runtime, so docker cp must read/write the
+// mount's host Source: writing to the static rootfs underneath would be silently
+// shadowed by the mount — invisible both inside the container and in the volume.
+// The longest matching mount destination wins (nested-mount correctness).
+// Returns the resolved host path and the matched mount (nil when the path falls
+// in the plain rootfs).
+func (h *Handler) resolveArchivePath(id, containerPath string) (string, *store.MountSpec, error) {
+	clean := filepath.Clean("/" + containerPath)
+	if rec := h.store.GetContainer(id); rec != nil {
+		var best *store.MountSpec
+		bestLen := -1
+		for i := range rec.Mounts {
+			m := &rec.Mounts[i]
+			if m.Destination == "" {
+				continue
+			}
+			dest := filepath.Clean("/" + m.Destination)
+			// The path is covered by this mount if it IS the mount point or
+			// sits underneath it.
+			if clean == dest || strings.HasPrefix(clean, dest+"/") {
+				if len(dest) > bestLen {
+					best, bestLen = m, len(dest)
+				}
+			}
+		}
+		if best != nil {
+			if best.Source == "" {
+				// tmpfs (or otherwise host-invisible) mount: its contents live
+				// only in the container's mount namespace, unreachable from the
+				// host. Fail loudly rather than silently write to the shadowed
+				// rootfs.
+				kind := best.Type
+				if kind == "" {
+					kind = "tmpfs"
+				}
+				return "", best, fmt.Errorf("docker cp is not supported for %s mount %q", kind, best.Destination)
+			}
+			dest := filepath.Clean("/" + best.Destination)
+			rel := strings.TrimPrefix(strings.TrimPrefix(clean, dest), "/")
+			p, err := safeJoin(best.Source, rel)
+			return p, best, err
+		}
+	}
+	p, err := safeJoin(h.mgr.RootfsPath(id), containerPath)
+	return p, nil, err
+}
+
 // PUT /containers/{id}/archive — docker cp TO container
 func (h *Handler) putArchive(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
@@ -1951,10 +2001,13 @@ func (h *Handler) putArchive(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, "path is required")
 		return
 	}
-	rootfs := h.mgr.RootfsPath(id)
-	dest, err := safeJoin(rootfs, destPath)
+	dest, mnt, err := h.resolveArchivePath(id, destPath)
 	if err != nil {
 		errResponse(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if mnt != nil && mnt.ReadOnly {
+		errResponse(w, http.StatusForbidden, fmt.Sprintf("mount destination %q is read-only", mnt.Destination))
 		return
 	}
 
@@ -2062,8 +2115,7 @@ func (h *Handler) getArchive(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, "path is required")
 		return
 	}
-	rootfs := h.mgr.RootfsPath(id)
-	src, err := safeJoin(rootfs, srcPath)
+	src, _, err := h.resolveArchivePath(id, srcPath)
 	if err != nil {
 		errResponse(w, http.StatusForbidden, err.Error())
 		return
