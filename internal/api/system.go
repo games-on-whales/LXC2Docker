@@ -690,7 +690,7 @@ func (h *Handler) systemDF(w http.ResponseWriter, r *http.Request) {
 		for _, img := range h.store.ListImages() {
 			a := byID[img.ID]
 			if a == nil {
-				a = &imgAgg{id: img.ID, created: img.Created.Unix(), size: imageSize(lxcPath, img)}
+				a = &imgAgg{id: img.ID, created: img.Created.Unix(), size: imageSize(lxcPath, h.mgr.PVEStorage(), img)}
 				byID[img.ID] = a
 				order = append(order, img.ID)
 				layersSize += a.size

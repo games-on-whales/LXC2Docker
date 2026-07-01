@@ -73,8 +73,8 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 			RepoTags:    []string{rec.Ref},
 			RepoDigests: digestRefs(rec),
 			Created:     rec.Created.Unix(),
-			Size:        imageSize(h.mgr.LXCPath(), rec),
-			VirtualSize: imageSize(h.mgr.LXCPath(), rec),
+			Size:        imageSize(h.mgr.LXCPath(), h.mgr.PVEStorage(), rec),
+			VirtualSize: imageSize(h.mgr.LXCPath(), h.mgr.PVEStorage(), rec),
 			Labels:      labels,
 			Containers:  usage[rec.Ref],
 		}
@@ -160,14 +160,13 @@ func digestRefs(rec *store.ImageRecord) []string {
 // legacy LXC templates it walks the rootfs; for Proxmox CT templates it
 // asks ZFS for the dataset's `used` property so the /images/json response
 // stays fast even on large ZFS pools.
-func imageSize(lxcPath string, rec *store.ImageRecord) int64 {
+func imageSize(lxcPath, pveStorage string, rec *store.ImageRecord) int64 {
 	if rec.TemplateVMID > 0 {
-		// PVE template — ask ZFS. Form: <pool>/basevol-<vmid>-disk-0.
-		// We infer the pool from the rec's template vs the daemon's
-		// configured storage; callers pass lxcPath but not storage. A
-		// storage-name lookup would require threading the Manager through,
-		// so we fall back to 0 when we can't determine the dataset.
-		return zfsDatasetSize(rec)
+		// PVE template — ask ZFS for the template dataset's `used` size. The
+		// daemon forms CT datasets as <pveStorage>/basevol-<vmid>-disk-0
+		// (see Manager.RootfsPath), so the configured storage name is the ZFS
+		// pool. Fall back to 0 when ZFS/the dataset can't be found.
+		return zfsDatasetSize(pveStorage, rec)
 	}
 	if rec.TemplateName == "" {
 		return 0
@@ -175,15 +174,28 @@ func imageSize(lxcPath string, rec *store.ImageRecord) int64 {
 	return rootfsSize(filepath.Join(lxcPath, rec.TemplateName, "rootfs"))
 }
 
-// zfsDatasetSize runs `zfs list -H -p -o used` to pull the template dataset
-// size. The caller provides the image record; we derive the dataset name
-// using the VMID and a small whitelist of common PVE storage names. If ZFS
-// isn't present or the dataset can't be found, returns 0.
-func zfsDatasetSize(rec *store.ImageRecord) int64 {
-	// Without a direct reference to the daemon's pveStorage string we'd
-	// have to grep for matching datasets; that's costly and unnecessary.
-	// Try a simple `zfs get` against each known pool name.
-	for _, pool := range []string{"large", "rpool", "tank"} {
+// zfsCandidatePools returns the ZFS pool names to probe for a template dataset,
+// putting the daemon's configured storage first (the daemon uses the storage
+// name as the pool name when forming datasets) and then a few common fallbacks
+// for robustness. The configured pool is never duplicated.
+func zfsCandidatePools(pveStorage string) []string {
+	pools := make([]string, 0, 4)
+	if pveStorage != "" {
+		pools = append(pools, pveStorage)
+	}
+	for _, p := range []string{"large", "rpool", "tank"} {
+		if p != pveStorage {
+			pools = append(pools, p)
+		}
+	}
+	return pools
+}
+
+// zfsDatasetSize runs `zfs get used` on the template dataset to pull its size.
+// It probes the daemon's configured storage pool first (see zfsCandidatePools).
+// If ZFS isn't present or the dataset can't be found, returns 0.
+func zfsDatasetSize(pveStorage string, rec *store.ImageRecord) int64 {
+	for _, pool := range zfsCandidatePools(pveStorage) {
 		dataset := fmt.Sprintf("%s/basevol-%d-disk-0", pool, rec.TemplateVMID)
 		out, err := exec.Command("zfs", "get", "-H", "-p", "-o", "value", "used", dataset).Output()
 		if err == nil {
@@ -464,8 +476,8 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 		Variant:         rec.OCIVariant,
 		Os:              "linux",
 		OsVersion:       rec.Release,
-		Size:            imageSize(h.mgr.LXCPath(), rec),
-		VirtualSize:     imageSize(h.mgr.LXCPath(), rec),
+		Size:            imageSize(h.mgr.LXCPath(), h.mgr.PVEStorage(), rec),
+		VirtualSize:     imageSize(h.mgr.LXCPath(), h.mgr.PVEStorage(), rec),
 		Config:          cfg,
 		ContainerConfig: cfg,
 		GraphDriver: GraphDriver{
