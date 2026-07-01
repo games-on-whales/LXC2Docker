@@ -50,3 +50,50 @@ func TestImageRefsForID(t *testing.T) {
 		t.Errorf("unknown ID = (%v,%v), want empty non-nil slices", noneTags, noneDigests)
 	}
 }
+
+// TestImageRefsForIDDedupesDigests: `docker tag nginx:latest nginx:stable`
+// copies the record (same repo + same RepoDigest), which would otherwise emit
+// the identical repo@digest twice. Docker reports RepoDigests as a set.
+func TestImageRefsForIDDedupesDigests(t *testing.T) {
+	t.Parallel()
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	for _, ref := range []string{"nginx:latest", "nginx:stable"} {
+		if err := st.AddImage(&store.ImageRecord{ID: "oci_nginx", Ref: ref, RepoDigest: "sha256:cafe"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := &Handler{store: st}
+	tags, digests := h.imageRefsForID("oci_nginx")
+	if !reflect.DeepEqual(tags, []string{"nginx:latest", "nginx:stable"}) {
+		t.Errorf("RepoTags = %v", tags)
+	}
+	// Both refs are repo "nginx" @ same digest → one entry, not two.
+	if !reflect.DeepEqual(digests, []string{"nginx@sha256:cafe"}) {
+		t.Errorf("RepoDigests = %v, want single deduped entry", digests)
+	}
+}
+
+func TestSortedUnique(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   []string
+		want []string
+	}{
+		{nil, []string{}},
+		{[]string{}, []string{}},
+		{[]string{"b", "a", "b", "c", "a"}, []string{"a", "b", "c"}},
+		{[]string{"x"}, []string{"x"}},
+	}
+	for _, tc := range cases {
+		got := sortedUnique(tc.in)
+		if got == nil {
+			t.Errorf("sortedUnique(%v) returned nil, want non-nil", tc.in)
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("sortedUnique(%v) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
