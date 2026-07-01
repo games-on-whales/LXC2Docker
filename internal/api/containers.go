@@ -1246,7 +1246,8 @@ func (h *Handler) removeAnonVolumesOf(id string) {
 // GET /containers/{id}/logs
 //
 // Query params honored (matching Docker Engine):
-//   - stdout=1 / stderr=1  — which streams to return (default both)
+//   - stdout=1 / stderr=1  — which streams to return (at least one required;
+//     selecting neither is a 400, matching Docker)
 //   - tail=N | tail=all    — last N lines of the pre-existing log
 //   - since=<unix-ts>      — drop lines older than the timestamp
 //   - until=<unix-ts>      — drop lines newer than the timestamp

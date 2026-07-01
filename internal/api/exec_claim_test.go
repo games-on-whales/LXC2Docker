@@ -1,6 +1,35 @@
 package api
 
-import "testing"
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+)
+
+// TestExecClaimStartConcurrent: under a race of N simultaneous starts of the
+// same exec, exactly one must win (the whole point of the atomic guard). Run
+// with -race for the strongest signal.
+func TestExecClaimStartConcurrent(t *testing.T) {
+	t.Parallel()
+	s := newExecStore()
+	s.add(&execRecord{ID: "race"})
+	const n = 64
+	var wins int64
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			if s.claimStart("race") {
+				atomic.AddInt64(&wins, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	if wins != 1 {
+		t.Fatalf("concurrent claimStart winners = %d, want exactly 1", wins)
+	}
+}
 
 // TestExecClaimStart: an exec instance may be started only once (Docker 409s a
 // second start). claimStart is the atomic guard.
