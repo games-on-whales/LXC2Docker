@@ -99,9 +99,9 @@ func (h *Handler) containerStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stream := r.URL.Query().Get("stream") != "0" && r.URL.Query().Get("stream") != "false"
+	stream := boolValueDefault(r, "stream", true)
 	// `docker stats --no-stream` sends one-shot=1 on API >= 1.41.
-	if r.URL.Query().Get("one-shot") == "1" || r.URL.Query().Get("one-shot") == "true" {
+	if boolValue(r, "one-shot") {
 		stream = false
 	}
 

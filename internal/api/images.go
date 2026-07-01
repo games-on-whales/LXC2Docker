@@ -517,7 +517,7 @@ func healthcheckFromImage(rec *store.ImageRecord) *Healthcheck {
 func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 	ref := normalizeImageRef(name)
-	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
+	force := boolValue(r, "force")
 	if h.store.GetImage(ref) == nil {
 		if byID := h.findImageByID(name); byID != nil {
 			ref = byID.Ref

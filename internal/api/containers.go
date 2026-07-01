@@ -558,8 +558,8 @@ func (h *Handler) reusableContainer(old *store.ContainerRecord, imageRef string)
 
 // GET /containers/json
 func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
-	all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
-	withSize := r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true"
+	all := boolValue(r, "all")
+	withSize := boolValue(r, "size")
 	limit := 0
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -886,7 +886,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Networks:    networkSettingsFor(rec),
 		},
 	}
-	if r.URL.Query().Get("size") == "1" || r.URL.Query().Get("size") == "true" {
+	if boolValue(r, "size") {
 		sz := rootfsSize(h.mgr.RootfsPath(id))
 		resp.SizeRw = sz
 		resp.SizeRootFs = sz
@@ -1159,11 +1159,11 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	if r.URL.Query().Get("link") == "1" || r.URL.Query().Get("link") == "true" {
+	if boolValue(r, "link") {
 		errResponse(w, http.StatusBadRequest, "container links are not supported by docker-lxc-daemon")
 		return
 	}
-	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
+	force := boolValue(r, "force")
 
 	if force {
 		state, _ := h.mgr.State(id)
@@ -1198,7 +1198,7 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	os.Remove(h.mgr.LogPath(id))
 	os.Remove(h.mgr.LogPath(id) + ".1")
-	if r.URL.Query().Get("v") == "1" || r.URL.Query().Get("v") == "true" {
+	if boolValue(r, "v") {
 		h.removeAnonVolumesOf(id)
 	}
 	h.emitContainer("destroy", rec)
@@ -1245,10 +1245,10 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	tty := rec != nil && rec.Tty
 
 	q := r.URL.Query()
-	stdout := q.Get("stdout") == "1" || q.Get("stdout") == "true"
-	stderr := q.Get("stderr") == "1" || q.Get("stderr") == "true"
-	follow := q.Get("follow") == "1" || q.Get("follow") == "true"
-	timestamps := q.Get("timestamps") == "1" || q.Get("timestamps") == "true"
+	stdout := boolValue(r, "stdout")
+	stderr := boolValue(r, "stderr")
+	follow := boolValue(r, "follow")
+	timestamps := boolValue(r, "timestamps")
 	if !stdout && !stderr {
 		stdout, stderr = true, true
 	}
@@ -1654,9 +1654,8 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	q := r.URL.Query()
-	logsFlag := q.Get("logs") == "1" || q.Get("logs") == "true"
-	streamFlag := q.Get("stream") != "0" && q.Get("stream") != "false"
+	logsFlag := boolValue(r, "logs")
+	streamFlag := boolValueDefault(r, "stream", true)
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
