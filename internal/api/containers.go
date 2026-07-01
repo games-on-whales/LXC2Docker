@@ -2592,11 +2592,13 @@ func (h *Handler) ensureVolumeOwned(name, owner string, anonymous bool) (string,
 	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
 		return "", err
 	}
+	now := time.Now().UTC()
 	rec := &store.VolumeRecord{
 		Name:       name,
 		Driver:     "local",
 		Mountpoint: mountpoint,
-		Created:    time.Now(),
+		Created:    now,
+		CreatedAt:  now,
 		OwnerID:    owner,
 		Anonymous:  anonymous,
 	}

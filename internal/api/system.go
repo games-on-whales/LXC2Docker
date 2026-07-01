@@ -622,6 +622,7 @@ func userNetworkSnapshot(n *store.NetworkRecord, containers map[string]any) map[
 	return map[string]any{
 		"Name":       n.Name,
 		"Id":         n.ID,
+		"Created":    n.CreatedAt.UTC().Format(time.RFC3339Nano),
 		"Driver":     orDefault(n.Driver, "bridge"),
 		"Scope":      orDefault(n.Scope, "local"),
 		"EnableIPv6": n.EnableIPv6,
@@ -742,7 +743,7 @@ func (h *Handler) systemDF(w http.ResponseWriter, r *http.Request) {
 				"Name":       v.Name,
 				"Driver":     v.Driver,
 				"Mountpoint": v.Mountpoint,
-				"CreatedAt":  v.Created.Format(time.RFC3339Nano),
+				"CreatedAt":  volumeCreatedAt(v).UTC().Format(time.RFC3339Nano),
 				"Scope":      "local",
 				"Labels":     v.Labels,
 				"UsageData": map[string]int64{
@@ -824,6 +825,12 @@ func (h *Handler) volumeInUse(name string) bool {
 
 const apiVersion = "1.43"
 
+// daemonEpoch is a stable creation timestamp reported for the built-in networks
+// (bridge/host/none), which have no real creation time. Docker returns a
+// Created timestamp for every network; using the process start time keeps it
+// stable across a daemon run and in valid RFC3339Nano form.
+var daemonEpoch = time.Now().UTC().Format(time.RFC3339Nano)
+
 // defaultNetworks returns the static network snapshot reported to Docker
 // clients. The daemon's real bridge is managed by internal/lxc/network.go;
 // host/none are synthetic entries that match Docker's built-ins so
@@ -833,6 +840,7 @@ func defaultNetworks() []map[string]any {
 		{
 			"Name":       lxc.DefaultNetworkName,
 			"Id":         lxc.DefaultNetworkName,
+			"Created":    daemonEpoch,
 			"Driver":     "bridge",
 			"Scope":      "local",
 			"EnableIPv6": false,
@@ -850,18 +858,20 @@ func defaultNetworks() []map[string]any {
 			"Containers": map[string]any{},
 		},
 		{
-			"Name":   "host",
-			"Id":     "host",
-			"Driver": "host",
-			"Scope":  "local",
-			"IPAM":   map[string]any{"Driver": "default", "Config": []any{}},
+			"Name":    "host",
+			"Id":      "host",
+			"Created": daemonEpoch,
+			"Driver":  "host",
+			"Scope":   "local",
+			"IPAM":    map[string]any{"Driver": "default", "Config": []any{}},
 		},
 		{
-			"Name":   "none",
-			"Id":     "none",
-			"Driver": "null",
-			"Scope":  "local",
-			"IPAM":   map[string]any{"Driver": "default", "Config": []any{}},
+			"Name":    "none",
+			"Id":      "none",
+			"Created": daemonEpoch,
+			"Driver":  "null",
+			"Scope":   "local",
+			"IPAM":    map[string]any{"Driver": "default", "Config": []any{}},
 		},
 	}
 }
