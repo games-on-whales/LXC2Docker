@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -404,13 +407,97 @@ func (h *Handler) pruneBuildCache(w http.ResponseWriter, r *http.Request) {
 // don't authenticate against registries ourselves — pulls go through whatever
 // the host has set up — so accept any payload and return the shape Docker's
 // "login succeeded" response uses.
+// authConfig mirrors the credentials POST /auth carries in its BODY (an
+// AuthConfig JSON object) — NOT the X-Registry-Auth header the pull path uses.
+type authConfig struct {
+	Username      string `json:"username"`
+	Password      string `json:"password"`
+	Serveraddress string `json:"serveraddress"`
+	IdentityToken string `json:"identitytoken"`
+}
+
 func (h *Handler) auth(w http.ResponseWriter, r *http.Request) {
-	var body map[string]any
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	jsonResponse(w, http.StatusOK, map[string]string{
-		"Status":        "Login Succeeded",
-		"IdentityToken": "",
-	})
+	var body authConfig
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		errResponse(w, http.StatusBadRequest, "invalid auth body: "+err.Error())
+		return
+	}
+	// Clients (Portainer) probe with empty credentials or an identity token;
+	// don't reject those — acknowledge, matching the prior stub.
+	if body.Username == "" || body.Password == "" {
+		jsonResponse(w, http.StatusOK, map[string]string{"Status": "Login Succeeded", "IdentityToken": ""})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	host := registryHostFromAuth(body.Serveraddress)
+	if err := probeRegistryLogin(ctx, host, body.Username, body.Password); err != nil {
+		var authErr *registryAuthError
+		if errors.As(err, &authErr) {
+			// Genuine bad credentials → 401, like Docker.
+			errResponse(w, http.StatusUnauthorized, "unauthorized: incorrect username or password")
+			return
+		}
+		// Transport/registry-unreachable error → 500 (not a credential verdict).
+		errResponse(w, http.StatusInternalServerError, "auth check failed: "+err.Error())
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]string{"Status": "Login Succeeded", "IdentityToken": ""})
+}
+
+// registryHostFromAuth resolves the registry host for a login probe. Empty or
+// the legacy Docker Hub index URL/host map to docker.io. A scheme and any path
+// are stripped so "https://index.docker.io/v1/" → "docker.io".
+func registryHostFromAuth(serveraddress string) string {
+	s := strings.TrimSpace(serveraddress)
+	s = strings.TrimPrefix(s, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	switch s {
+	case "", "index.docker.io", "registry-1.docker.io", "docker.io":
+		return "docker.io"
+	}
+	return s
+}
+
+// registryAuthError marks a genuine authentication failure (bad credentials),
+// as opposed to a transport/unreachable error.
+type registryAuthError struct{ msg string }
+
+func (e *registryAuthError) Error() string { return e.msg }
+
+// probeRegistryLogin runs `skopeo login` as a stateless credential check
+// (password over stdin, throwaway authfile). Returns nil on success, a
+// *registryAuthError on a genuine auth failure, or a plain error on a
+// transport/other failure — so the caller can map to 401 vs 500.
+func probeRegistryLogin(ctx context.Context, host, user, pass string) error {
+	f, err := os.CreateTemp("", "dld-authcheck-*.json")
+	if err != nil {
+		return err
+	}
+	authfile := f.Name()
+	f.Close()
+	defer os.Remove(authfile)
+
+	cmd := exec.CommandContext(ctx, "skopeo", "login",
+		"--username", user, "--password-stdin",
+		"--authfile", authfile, "--tls-verify=true", host)
+	cmd.Stdin = strings.NewReader(pass)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if runErr := cmd.Run(); runErr != nil {
+		se := strings.ToLower(stderr.String())
+		if strings.Contains(se, "unauthorized") || strings.Contains(se, "401") ||
+			strings.Contains(se, "invalid username or password") ||
+			strings.Contains(se, "authentication required") {
+			return &registryAuthError{msg: "invalid username/password"}
+		}
+		return fmt.Errorf("skopeo login: %s: %w", strings.TrimSpace(stderr.String()), runErr)
+	}
+	return nil
 }
 
 // GET /plugins
