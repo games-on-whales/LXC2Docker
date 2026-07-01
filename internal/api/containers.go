@@ -1260,7 +1260,7 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	f, err := os.Open(logPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
+			w.Header().Set("Content-Type", streamContentType(tty))
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -1269,7 +1269,7 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 
-	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
+	w.Header().Set("Content-Type", streamContentType(tty))
 	w.WriteHeader(http.StatusOK)
 
 	streamID := byte(1)
@@ -1660,6 +1660,14 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 	// defaults to true, so only that one uses boolValueDefault.
 	streamFlag := boolValue(r, "stream")
 
+	// Load the record up front: its Tty flag decides the stream framing for
+	// BOTH the replayed history and the live loop, and the response
+	// Content-Type. Docker frames the replayed logs identically to the live
+	// stream — raw for TTY, 8-byte stdcopy headers for non-TTY — so a demuxing
+	// client never desyncs.
+	rec := h.store.GetContainer(id)
+	tty := rec != nil && rec.Tty
+
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		errResponse(w, http.StatusInternalServerError, "streaming not supported")
@@ -1671,19 +1679,14 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
-	buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
-	buf.WriteString("Connection: Upgrade\r\n")
-	buf.WriteString("Upgrade: tcp\r\n")
-	buf.WriteString("\r\n")
+	// Match Docker's attach semantics: a client that requested a protocol
+	// upgrade (Upgrade: tcp) gets 101 UPGRADED; every other client gets the
+	// stream over a plain 200 OK. Returning 101 unconditionally breaks
+	// non-upgrading clients (same rationale as the exec-start handler). The
+	// stream Content-Type reflects the framing: raw for a TTY container,
+	// multiplexed (stdcopy) for non-TTY — Docker API v1.42+.
+	writeHijackPreamble(buf, r.Header.Get("Upgrade") != "", tty)
 	buf.Flush()
-
-	// Load the record up front: its Tty flag decides the stream framing for
-	// BOTH the replayed history (below) and the live loop. Docker frames the
-	// replayed logs identically to the live stream — raw for TTY, 8-byte
-	// stdcopy headers for non-TTY — so a demuxing client never desyncs.
-	rec := h.store.GetContainer(id)
-	tty := rec != nil && rec.Tty
 
 	logPath := h.mgr.LogPath(id)
 	if logsFlag {
@@ -1768,6 +1771,37 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 			time.Sleep(150 * time.Millisecond)
 		}
 	}
+}
+
+// writeHijackPreamble writes the manual HTTP response preamble for a hijacked
+// attach/exec stream. A client that requested a protocol upgrade (an Upgrade
+// request header) gets "101 UPGRADED" with the Connection/Upgrade response
+// headers; every other client gets a plain "200 OK" — returning 101
+// unconditionally breaks non-upgrading clients. tty selects the stream
+// Content-Type (see streamContentType). The caller flushes.
+func writeHijackPreamble(w io.Writer, upgrade, tty bool) {
+	ctype := streamContentType(tty)
+	if upgrade {
+		io.WriteString(w, "HTTP/1.1 101 UPGRADED\r\n")
+		io.WriteString(w, "Content-Type: "+ctype+"\r\n")
+		io.WriteString(w, "Connection: Upgrade\r\n")
+		io.WriteString(w, "Upgrade: tcp\r\n")
+	} else {
+		io.WriteString(w, "HTTP/1.1 200 OK\r\n")
+		io.WriteString(w, "Content-Type: "+ctype+"\r\n")
+	}
+	io.WriteString(w, "\r\n")
+}
+
+// streamContentType returns the Content-Type Docker advertises for an
+// attach/logs byte stream: raw for a TTY container, and stdcopy-multiplexed for
+// a non-TTY container (Docker API v1.42+ distinguishes the two so a client
+// knows whether to strip the 8-byte frame headers).
+func streamContentType(tty bool) string {
+	if tty {
+		return "application/vnd.docker.raw-stream"
+	}
+	return "application/vnd.docker.multiplexed-stream"
 }
 
 // writeStreamFrame writes a single chunk to an attach/exec stream. For a TTY
