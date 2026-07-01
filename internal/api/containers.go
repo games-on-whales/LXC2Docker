@@ -1676,10 +1676,17 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 	buf.WriteString("\r\n")
 	buf.Flush()
 
+	// Load the record up front: its Tty flag decides the stream framing for
+	// BOTH the replayed history (below) and the live loop. Docker frames the
+	// replayed logs identically to the live stream — raw for TTY, 8-byte
+	// stdcopy headers for non-TTY — so a demuxing client never desyncs.
+	rec := h.store.GetContainer(id)
+	tty := rec != nil && rec.Tty
+
 	logPath := h.mgr.LogPath(id)
 	if logsFlag {
 		if f, err := os.Open(logPath); err == nil {
-			io.Copy(conn, f)
+			writeFramedStream(conn, f, tty)
 			f.Close()
 		}
 	}
@@ -1692,7 +1699,6 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 	// Stream its console from the beginning and wait for the run flow to start
 	// it (so even an instantly-exiting `echo` is captured). An already-started
 	// container (`docker attach`) streams only output produced after the attach.
-	rec := h.store.GetContainer(id)
 	freshRun := rec != nil && rec.StartedAt == nil
 
 	f, err := os.OpenFile(logPath, os.O_RDONLY|os.O_CREATE, 0o644)
@@ -1732,20 +1738,10 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 			// Non-TTY attach uses Docker's multiplexed stream framing (an
 			// 8-byte stdout/stderr header per chunk); TTY attach is raw. The
 			// console log mixes stdout+stderr, so frame everything as stdout.
-			if rec != nil && rec.Tty {
-				if _, err := conn.Write(buffer[:n]); err != nil {
-					return
-				}
-			} else {
-				var hdr [8]byte
-				hdr[0] = 1 // stdout
-				binary.BigEndian.PutUint32(hdr[4:], uint32(n))
-				if _, err := conn.Write(hdr[:]); err != nil {
-					return
-				}
-				if _, err := conn.Write(buffer[:n]); err != nil {
-					return
-				}
+			// This matches the framing of the replayed history above so a
+			// stdcopy-demuxing client sees one consistent stream.
+			if err := writeStreamFrame(conn, buffer[:n], tty); err != nil {
+				return
 			}
 		}
 		if readErr != nil && readErr != io.EOF {
@@ -1768,6 +1764,53 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		if n == 0 {
 			time.Sleep(150 * time.Millisecond)
+		}
+	}
+}
+
+// writeStreamFrame writes a single chunk to an attach/exec stream. For a TTY
+// stream the bytes are raw; for a non-TTY stream they are wrapped in Docker's
+// stdcopy header (1 byte stream id + 3 bytes padding + 4 bytes big-endian
+// length). The console log multiplexes stdout+stderr onto one fd, so every
+// chunk is framed as stdout (stream id 1).
+func writeStreamFrame(w io.Writer, p []byte, tty bool) error {
+	if tty {
+		_, err := w.Write(p)
+		return err
+	}
+	var hdr [8]byte
+	hdr[0] = 1 // stdout
+	binary.BigEndian.PutUint32(hdr[4:], uint32(len(p)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(p)
+	return err
+}
+
+// writeFramedStream copies src to w applying the same framing as
+// writeStreamFrame. Non-TTY data is split into stdcopy frames (one header per
+// read); TTY data is copied raw. Used to replay a container's historical log
+// on attach with logs=1 using the identical framing as the live stream, so a
+// stdcopy-demuxing client does not desync on the boundary.
+func writeFramedStream(w io.Writer, src io.Reader, tty bool) error {
+	if tty {
+		_, err := io.Copy(w, src)
+		return err
+	}
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if werr := writeStreamFrame(w, buf[:n], false); werr != nil {
+				return werr
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
 		}
 	}
 }
