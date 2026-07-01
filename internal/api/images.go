@@ -609,7 +609,7 @@ func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 	// several refs is an UNTAG: drop just this ref's record and leave the
 	// backing for the other tags. Manager.RemoveImage always destroys the
 	// shared backing, so it must only run for the LAST ref.
-	if img != nil {
+	if img != nil && img.ID != "" {
 		if refs, _ := h.imageRefsForID(img.ID); len(refs) > 1 {
 			if err := h.store.RemoveImage(ref); err != nil {
 				errResponse(w, http.StatusInternalServerError, err.Error())
