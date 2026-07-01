@@ -82,7 +82,12 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]ImageSummary, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, *grouped[id])
+		s := grouped[id]
+		// Docker reports RepoTags/RepoDigests as sorted sets; dedupe so a
+		// same-repo `docker tag` doesn't surface a repo@digest twice.
+		s.RepoTags = sortedUnique(s.RepoTags)
+		s.RepoDigests = sortedUnique(s.RepoDigests)
+		out = append(out, *s)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Created > out[j].Created
@@ -107,9 +112,27 @@ func (h *Handler) imageRefsForID(id string) (tags, digests []string) {
 		tags = append(tags, rec.Ref)
 		digests = append(digests, digestRefs(rec)...)
 	}
-	sort.Strings(tags)
-	sort.Strings(digests)
-	return tags, digests
+	return sortedUnique(tags), sortedUnique(digests)
+}
+
+// sortedUnique returns a new slice with the input sorted and de-duplicated.
+// Docker reports RepoTags/RepoDigests as sets: aggregating across records that
+// share an image ID (e.g. `docker tag nginx:latest nginx:stable` yields two
+// records with the same repo@digest) must not emit a value twice. Always
+// returns a non-nil slice so it marshals to [] rather than null.
+func sortedUnique(in []string) []string {
+	out := []string{}
+	if len(in) == 0 {
+		return out
+	}
+	cp := append([]string(nil), in...)
+	sort.Strings(cp)
+	for i, s := range cp {
+		if i == 0 || s != cp[i-1] {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // digestRefs returns RepoDigests in Docker's "<repo>@<digest>" shape. If
@@ -123,6 +146,12 @@ func digestRefs(rec *store.ImageRecord) []string {
 	bare := rec.Ref
 	if i := strings.Index(bare, ":"); i != -1 {
 		bare = bare[:i]
+	}
+	// A digest ref needs a repo; a dangling/untagged record (empty ref) would
+	// otherwise yield a malformed "@sha256:...". Docker only lists repo@digest
+	// for images that actually have a repository.
+	if bare == "" {
+		return []string{}
 	}
 	return []string{bare + "@" + rec.RepoDigest}
 }

@@ -675,17 +675,39 @@ func (h *Handler) systemDF(w http.ResponseWriter, r *http.Request) {
 
 	if all || wanted["image"] {
 		var layersSize int64
-		images := make([]map[string]any, 0)
+		// Group by image ID so a tagged image (several refs sharing one ID)
+		// is one row carrying all its RepoTags/RepoDigests — matching
+		// `docker system df` — and its size counts once toward LayersSize.
+		type imgAgg struct {
+			id      string
+			created int64
+			size    int64
+			tags    []string
+			digests []string
+		}
+		order := []string{}
+		byID := map[string]*imgAgg{}
 		for _, img := range h.store.ListImages() {
-			size := imageSize(lxcPath, img)
-			layersSize += size
+			a := byID[img.ID]
+			if a == nil {
+				a = &imgAgg{id: img.ID, created: img.Created.Unix(), size: imageSize(lxcPath, img)}
+				byID[img.ID] = a
+				order = append(order, img.ID)
+				layersSize += a.size
+			}
+			a.tags = append(a.tags, img.Ref)
+			a.digests = append(a.digests, digestRefs(img)...)
+		}
+		images := make([]map[string]any, 0, len(order))
+		for _, id := range order {
+			a := byID[id]
 			images = append(images, map[string]any{
-				"Id":          "sha256:" + img.ID,
-				"RepoTags":    []string{img.Ref},
-				"RepoDigests": []string{},
-				"Created":     img.Created.Unix(),
-				"Size":        size,
-				"VirtualSize": size,
+				"Id":          "sha256:" + a.id,
+				"RepoTags":    sortedUnique(a.tags),
+				"RepoDigests": sortedUnique(a.digests),
+				"Created":     a.created,
+				"Size":        a.size,
+				"VirtualSize": a.size,
 				"SharedSize":  0,
 				"Containers":  -1,
 			})

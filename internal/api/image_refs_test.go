@@ -50,3 +50,65 @@ func TestImageRefsForID(t *testing.T) {
 		t.Errorf("unknown ID = (%v,%v), want empty non-nil slices", noneTags, noneDigests)
 	}
 }
+
+// TestImageRefsForIDDedupesDigests: `docker tag nginx:latest nginx:stable`
+// copies the record (same repo + same RepoDigest), which would otherwise emit
+// the identical repo@digest twice. Docker reports RepoDigests as a set.
+func TestImageRefsForIDDedupesDigests(t *testing.T) {
+	t.Parallel()
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	for _, ref := range []string{"nginx:latest", "nginx:stable"} {
+		if err := st.AddImage(&store.ImageRecord{ID: "oci_nginx", Ref: ref, RepoDigest: "sha256:cafe"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := &Handler{store: st}
+	tags, digests := h.imageRefsForID("oci_nginx")
+	if !reflect.DeepEqual(tags, []string{"nginx:latest", "nginx:stable"}) {
+		t.Errorf("RepoTags = %v", tags)
+	}
+	// Both refs are repo "nginx" @ same digest → one entry, not two.
+	if !reflect.DeepEqual(digests, []string{"nginx@sha256:cafe"}) {
+		t.Errorf("RepoDigests = %v, want single deduped entry", digests)
+	}
+}
+
+// TestDigestRefsEmptyRepo: a dangling/untagged record (empty ref) with a
+// RepoDigest must not produce a malformed "@sha256:..." entry.
+func TestDigestRefsEmptyRepo(t *testing.T) {
+	t.Parallel()
+	got := digestRefs(&store.ImageRecord{Ref: "", RepoDigest: "sha256:cafe"})
+	if got == nil || len(got) != 0 {
+		t.Errorf("digestRefs(empty ref) = %v, want empty non-nil slice", got)
+	}
+	// A real repo still produces the normal shape.
+	got = digestRefs(&store.ImageRecord{Ref: "nginx:latest", RepoDigest: "sha256:cafe"})
+	if len(got) != 1 || got[0] != "nginx@sha256:cafe" {
+		t.Errorf("digestRefs(nginx) = %v, want [nginx@sha256:cafe]", got)
+	}
+}
+
+func TestSortedUnique(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   []string
+		want []string
+	}{
+		{nil, []string{}},
+		{[]string{}, []string{}},
+		{[]string{"b", "a", "b", "c", "a"}, []string{"a", "b", "c"}},
+		{[]string{"x"}, []string{"x"}},
+	}
+	for _, tc := range cases {
+		got := sortedUnique(tc.in)
+		if got == nil {
+			t.Errorf("sortedUnique(%v) returned nil, want non-nil", tc.in)
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("sortedUnique(%v) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
