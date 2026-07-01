@@ -1246,7 +1246,8 @@ func (h *Handler) removeAnonVolumesOf(id string) {
 // GET /containers/{id}/logs
 //
 // Query params honored (matching Docker Engine):
-//   - stdout=1 / stderr=1  — which streams to return (default both)
+//   - stdout=1 / stderr=1  — which streams to return (at least one required;
+//     selecting neither is a 400, matching Docker)
 //   - tail=N | tail=all    — last N lines of the pre-existing log
 //   - since=<unix-ts>      — drop lines older than the timestamp
 //   - until=<unix-ts>      — drop lines newer than the timestamp
@@ -1278,7 +1279,9 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) {
 	follow := boolValue(r, "follow")
 	timestamps := boolValue(r, "timestamps")
 	if !stdout && !stderr {
-		stdout, stderr = true, true
+		// Docker rejects a logs request that selects neither stream.
+		errResponse(w, http.StatusBadRequest, "Bad parameters: you must choose at least one stream")
+		return
 	}
 	tail := parseTail(q.Get("tail")) // -1 means "all"
 	since := parseUnixTS(q.Get("since"))
