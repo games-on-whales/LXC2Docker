@@ -643,7 +643,7 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 			ImageID: rec.ImageID,
 			Command: cmd,
 			Created: rec.Created.Unix(),
-			State:   state,
+			State:   dockerStatus(state),
 			Status:  stateToStatusFull(state, rec.Created, rec.HealthStatus, rec.ExitCode, rec.FinishedAt),
 			Ports:   ports,
 			Labels:  rec.Labels,
@@ -850,7 +850,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 		State: ContainerState{
-			Status:     state,
+			Status:     dockerStatus(state),
 			Running:    running,
 			Paused:     paused,
 			Pid:        pid,
@@ -2116,6 +2116,26 @@ func writeLogFrame(w io.Writer, streamType byte, data []byte) {
 }
 
 // stateToStatus returns a human-readable status string like Docker's "Up 2 hours".
+// dockerStatus maps a container state to one of Docker's inspect State.Status
+// values: created, running, paused, restarting, removing, exited, dead. The
+// manager already maps the common LXC states (running/frozen/stopped), but its
+// default case passes transient LXC states through verbatim — "starting",
+// "stopping", "aborting", "freezing", "thawed" — which are not valid Docker
+// statuses and break clients that switch on the fixed set. Normalize them here
+// (API layer only, so internal state comparisons are unaffected).
+func dockerStatus(state string) string {
+	switch state {
+	case "created", "running", "paused", "restarting", "removing", "exited", "dead":
+		return state
+	case "frozen", "freezing":
+		return "paused"
+	case "thawed", "starting", "stopping":
+		return "running"
+	default:
+		return "exited"
+	}
+}
+
 func stateToStatus(state string, created time.Time) string {
 	return stateToStatusFull(state, created, "", 0, nil)
 }
