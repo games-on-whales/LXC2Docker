@@ -54,7 +54,7 @@ func (h *Handler) version(w http.ResponseWriter, r *http.Request) {
 	var uname unix.Utsname
 	unix.Uname(&uname)
 
-	engineVersion := "24.0.0-lxc"
+	engineVersion := serverVersion
 	components := []VersionComponent{
 		{
 			Name:    "Engine",
@@ -153,7 +153,7 @@ func (h *Handler) info(w http.ResponseWriter, r *http.Request) {
 		NCPU:               runtime.NumCPU(),
 		MemTotal:           int64(si.Totalram) * int64(si.Unit),
 		DockerRootDir:      h.mgr.LXCPath(),
-		ServerVersion:      "24.0.0-lxc",
+		ServerVersion:      serverVersion,
 		Name:               hostname(),
 		IndexServerAddress: "https://index.docker.io/v1/",
 		RegistryConfig: RegistryConfig{
@@ -825,6 +825,9 @@ func (h *Handler) volumeInUse(name string) bool {
 // --- helpers ---
 
 const apiVersion = "1.43"
+
+// serverVersion is the engine version the daemon reports (Docker drop-in).
+const serverVersion = "24.0.0-lxc"
 
 // daemonEpoch is a stable creation timestamp reported for the built-in networks
 // (bridge/host/none), which have no real creation time. Docker returns a
