@@ -603,12 +603,44 @@ func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	img := h.store.GetImage(ref)
+
+	// `docker tag` copies the store record (sharing the same backing tarball/
+	// dataset/template), so an image ID can have several refs. Removing one of
+	// several refs is an UNTAG: drop just this ref's record and leave the
+	// backing for the other tags. Manager.RemoveImage always destroys the
+	// shared backing, so it must only run for the LAST ref.
+	if img != nil && img.ID != "" {
+		if refs, _ := h.imageRefsForID(img.ID); len(refs) > 1 {
+			if err := h.store.RemoveImage(ref); err != nil {
+				errResponse(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			h.emitImage("untag", ref)
+			jsonResponse(w, http.StatusOK, []map[string]string{{"Untagged": ref}})
+			return
+		}
+	}
+
+	// Last ref → the image itself is being deleted. Docker refuses (409) when a
+	// container still references it, unless forced.
+	if !force {
+		if cid := h.imageInUse(img); cid != "" {
+			errResponse(w, http.StatusConflict, fmt.Sprintf(
+				"conflict: unable to remove repository reference %q (must force) - container %s is using its referenced image %s",
+				name, shortID(cid), shortID(imageIDOf(img))))
+			return
+		}
+	}
+
 	if err := h.mgr.RemoveImage(ref); err != nil {
 		if force {
 			jsonResponse(w, http.StatusOK, []map[string]string{})
 			return
 		}
-		errResponse(w, http.StatusConflict, err.Error())
+		// The in-use conflict was handled above with a 409; a RemoveImage
+		// failure here is an unexpected backend error, which Docker reports as
+		// 500 (409 is reserved for the conflict case).
+		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	h.emitImage("delete", ref)
@@ -617,6 +649,45 @@ func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]string{"Deleted": "sha256:" + img.ID})
 	}
 	jsonResponse(w, http.StatusOK, out)
+}
+
+// imageInUse returns the ID of a container that references the given image (by
+// any of the image's refs or its recorded image ID), or "" if none. Used to
+// gate `docker rmi` of the last ref with a 409, matching Docker.
+func (h *Handler) imageInUse(img *store.ImageRecord) string {
+	if img == nil {
+		return ""
+	}
+	refs, _ := h.imageRefsForID(img.ID)
+	want := map[string]bool{}
+	for _, rr := range refs {
+		want[normalizeImageRef(rr)] = true
+	}
+	for _, c := range h.store.ListContainers() {
+		if want[normalizeImageRef(c.Image)] {
+			return c.ID
+		}
+		if c.ImageID != "" && want[normalizeImageRef(c.ImageID)] {
+			return c.ID
+		}
+	}
+	return ""
+}
+
+// imageIDOf returns the store ID of img, or "" if nil.
+func imageIDOf(img *store.ImageRecord) string {
+	if img == nil {
+		return ""
+	}
+	return img.ID
+}
+
+// shortID truncates an identifier to Docker's 12-character short form.
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 func danglingWant(vals []string) *bool {
