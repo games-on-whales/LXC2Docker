@@ -76,6 +76,21 @@ func TestImageRefsForIDDedupesDigests(t *testing.T) {
 	}
 }
 
+// TestDigestRefsEmptyRepo: a dangling/untagged record (empty ref) with a
+// RepoDigest must not produce a malformed "@sha256:..." entry.
+func TestDigestRefsEmptyRepo(t *testing.T) {
+	t.Parallel()
+	got := digestRefs(&store.ImageRecord{Ref: "", RepoDigest: "sha256:cafe"})
+	if got == nil || len(got) != 0 {
+		t.Errorf("digestRefs(empty ref) = %v, want empty non-nil slice", got)
+	}
+	// A real repo still produces the normal shape.
+	got = digestRefs(&store.ImageRecord{Ref: "nginx:latest", RepoDigest: "sha256:cafe"})
+	if len(got) != 1 || got[0] != "nginx@sha256:cafe" {
+		t.Errorf("digestRefs(nginx) = %v, want [nginx@sha256:cafe]", got)
+	}
+}
+
 func TestSortedUnique(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

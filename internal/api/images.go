@@ -147,6 +147,12 @@ func digestRefs(rec *store.ImageRecord) []string {
 	if i := strings.Index(bare, ":"); i != -1 {
 		bare = bare[:i]
 	}
+	// A digest ref needs a repo; a dangling/untagged record (empty ref) would
+	// otherwise yield a malformed "@sha256:...". Docker only lists repo@digest
+	// for images that actually have a repository.
+	if bare == "" {
+		return []string{}
+	}
 	return []string{bare + "@" + rec.RepoDigest}
 }
 
