@@ -11,8 +11,6 @@ import (
 	"github.com/gorilla/mux"
 )
 
- 
-
 // GET /images/{name}/history
 //
 // LXC templates are a single flattened rootfs, so "history" is one virtual
@@ -26,7 +24,7 @@ func (h *Handler) imageHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonResponse(w, http.StatusOK, []map[string]any{
 		{
-			"Id":        "sha256:" + rec.ID,
+			"Id":        "sha256:" + imageDisplayID(rec),
 			"Created":   rec.Created.Unix(),
 			"CreatedBy": "lxc-template " + rec.TemplateName,
 			"Tags":      []string{rec.Ref},

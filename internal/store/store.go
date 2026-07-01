@@ -220,6 +220,10 @@ type ImageRecord struct {
 	// known. Populated by skopeo inspect after pull. Used to surface a
 	// canonical reference on the image detail page.
 	RepoDigest string `json:"repo_digest,omitempty"`
+	// ConfigDigest is the sha256 of the image's OCI config JSON — Docker's
+	// image ID (the 64-hex value; callers prefix "sha256:"). Computed at
+	// build/commit time. Empty for legacy records, which fall back to ID.
+	ConfigDigest string `json:"config_digest,omitempty"`
 }
 
 // VolumeRecord is a Docker-style named volume backed by a plain directory on
