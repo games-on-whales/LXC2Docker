@@ -1655,7 +1655,10 @@ func (h *Handler) attachContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logsFlag := boolValue(r, "logs")
-	streamFlag := boolValueDefault(r, "stream", true)
+	// Docker's attach `stream` defaults to false — the client must opt in
+	// (the endpoint requires either stream or logs to be true). stats' stream
+	// defaults to true, so only that one uses boolValueDefault.
+	streamFlag := boolValue(r, "stream")
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
