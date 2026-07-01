@@ -69,6 +69,13 @@ func (h *Handler) buildLLBResult(ctx context.Context, ctxDir, dockerfilePath, ta
 // the import path (PVE zfs template vs. dir template) is identical to the
 // classic builder.
 func (h *Handler) importLLBResult(resultDir, ref string, img *dockerspec.DockerOCIImage) error {
+	// Normalize the tag ("X" -> "X:latest") so the built image is stored under
+	// the same ref `docker run`/`create` looks up (normalizeImageRef(req.Image)).
+	// The buildViaLLB caller already normalizes; the BuildKit gateway path
+	// (solveGateway, which `docker build -t X` actually uses) passes the raw
+	// buildx name, so without this a bare `-t X` was stored as "X" and a later
+	// `docker run X` missed the store lookup and fell through to a registry pull.
+	ref = normalizeImageRef(ref)
 	if existing := h.store.GetImage(ref); existing != nil {
 		if err := h.mgr.RemoveImage(ref); err != nil {
 			return fmt.Errorf("remove existing image %s: %w", ref, err)
