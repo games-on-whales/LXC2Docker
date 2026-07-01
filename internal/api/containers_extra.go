@@ -381,11 +381,13 @@ func (h *Handler) ensureVolume(name string) (*store.VolumeRecord, error) {
 	if err := os.MkdirAll(mp, 0o755); err != nil {
 		return nil, err
 	}
+	now := time.Now().UTC()
 	v := &store.VolumeRecord{
 		Name:       name,
 		Driver:     "local",
 		Mountpoint: mp,
-		CreatedAt:  time.Now().UTC(),
+		Created:    now,
+		CreatedAt:  now,
 		Labels:     map[string]string{},
 		Options:    map[string]string{},
 	}

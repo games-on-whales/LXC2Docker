@@ -151,12 +151,23 @@ func (h *Handler) pruneVolumes(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// volumeCreatedAt returns the volume's creation time, tolerating the store's
+// two historical fields: named volumes recorded CreatedAt, anonymous volumes
+// recorded Created. Prefer whichever is set so every endpoint reports the same
+// (non-zero) timestamp.
+func volumeCreatedAt(v *store.VolumeRecord) time.Time {
+	if !v.CreatedAt.IsZero() {
+		return v.CreatedAt
+	}
+	return v.Created
+}
+
 func volumeCreateResponse(v *store.VolumeRecord) VolumeCreateResponse {
 	return VolumeCreateResponse{
 		Name:       v.Name,
 		Driver:     orDefault(v.Driver, "local"),
 		Mountpoint: v.Mountpoint,
-		CreatedAt:  v.CreatedAt.Format(time.RFC3339),
+		CreatedAt:  volumeCreatedAt(v).UTC().Format(time.RFC3339Nano),
 		Labels:     normalizeStringMap(v.Labels),
 		Options:    normalizeStringMap(v.Options),
 		Status:     map[string]string{},
@@ -178,7 +189,7 @@ func volumeUsage(st *store.Store, v *store.VolumeRecord, size int64) VolumeUsage
 		Name:       v.Name,
 		Driver:     orDefault(v.Driver, "local"),
 		Mountpoint: v.Mountpoint,
-		CreatedAt:  v.CreatedAt.Format(time.RFC3339),
+		CreatedAt:  volumeCreatedAt(v).UTC().Format(time.RFC3339Nano),
 		Labels:     normalizeStringMap(v.Labels),
 		Options:    normalizeStringMap(v.Options),
 		Status:     map[string]string{},
