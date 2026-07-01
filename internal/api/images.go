@@ -610,7 +610,7 @@ func imageConfigFromRecord(rec *store.ImageRecord) *ContainerConfig {
 		Volumes:         volumes,
 		Cmd:             rec.OCICmd,
 		Entrypoint:      rec.OCIEntrypoint,
-		Env:             rec.OCIEnv,
+		Env:             ensureDefaultPath(rec.OCIEnv),
 		Labels:          ensureMap(rec.OCILabels),
 		WorkingDir:      rec.OCIWorkingDir,
 		OnBuild:         append([]string{}, rec.OCIOnBuild...),

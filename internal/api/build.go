@@ -580,7 +580,7 @@ func evaluateBuildStage(stage dockerfileStage, baseEnv []string) (buildState, er
 	// base that declares no environment of its own.
 	initEnv := baseEnv
 	if len(initEnv) == 0 {
-		initEnv = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+		initEnv = []string{ociDefaultPath}
 	}
 	state := buildState{
 		workdir: "/",
