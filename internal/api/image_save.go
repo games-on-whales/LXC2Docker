@@ -137,21 +137,41 @@ func (h *Handler) writeSaveBundle(w http.ResponseWriter, recs []*store.ImageReco
 	tw := tar.NewWriter(w)
 	defer tw.Close()
 
+	// Group by image ID so several tags of one image collapse into a single
+	// manifest entry that lists all its RepoTags and shares one config + layer
+	// — exactly as `docker save foo:a foo:b` (same image) does — rather than
+	// emitting a duplicate entry/layer per tag.
+	type saveGroup struct {
+		rep  perImage
+		refs []string
+	}
+	imgByRef := make(map[string]perImage, len(images))
+	for _, img := range images {
+		imgByRef[img.rec.Ref] = img
+	}
+	groups := make([]*saveGroup, 0, len(images))
+	for _, refs := range groupSaveRefs(recs) {
+		// The first ref of each group is its representative (config + layer).
+		groups = append(groups, &saveGroup{rep: imgByRef[refs[0]], refs: refs})
+	}
+
 	// manifest.json — one entry per image; layer paths prefixed by per-
 	// image dir so bundles with duplicate layer.tar filenames don't clash.
-	manifest := make([]map[string]any, 0, len(images))
+	manifest := make([]map[string]any, 0, len(groups))
 	repositories := map[string]map[string]string{}
-	for _, img := range images {
+	for _, g := range groups {
 		manifest = append(manifest, map[string]any{
-			"Config":   img.cfgSHA + ".json",
-			"RepoTags": []string{img.rec.Ref},
-			"Layers":   []string{img.layerDir + "/layer.tar"},
+			"Config":   g.rep.cfgSHA + ".json",
+			"RepoTags": sortedUnique(g.refs),
+			"Layers":   []string{g.rep.layerDir + "/layer.tar"},
 		})
-		repo, tag := splitImageRef(img.rec.Ref)
-		if repositories[repo] == nil {
-			repositories[repo] = map[string]string{}
+		for _, ref := range g.refs {
+			repo, tag := splitImageRef(ref)
+			if repositories[repo] == nil {
+				repositories[repo] = map[string]string{}
+			}
+			repositories[repo][tag] = g.rep.cfgSHA
 		}
-		repositories[repo][tag] = img.cfgSHA
 	}
 	manifestJSON, _ := json.Marshal(manifest)
 	if err := writeTarFile(tw, "manifest.json", manifestJSON, 0o644); err != nil {
@@ -161,7 +181,10 @@ func (h *Handler) writeSaveBundle(w http.ResponseWriter, recs []*store.ImageReco
 	if err := writeTarFile(tw, "repositories", repositoriesJSON, 0o644); err != nil {
 		return
 	}
-	for _, img := range images {
+	// Write one config + layer per group (the representative). Non-
+	// representative tags of the same image share these via the manifest.
+	for _, g := range groups {
+		img := g.rep
 		if err := writeTarFile(tw, img.cfgSHA+".json", img.cfgBytes, 0o644); err != nil {
 			return
 		}
@@ -196,6 +219,30 @@ func (h *Handler) writeSaveBundle(w http.ResponseWriter, recs []*store.ImageReco
 		_, _ = io.Copy(tw, f)
 		f.Close()
 	}
+}
+
+// groupSaveRefs groups the refs of the given image records by image ID
+// (falling back to the ref itself for id-less records), preserving first-seen
+// order. `docker save` emits one manifest entry per image that lists all of the
+// image's tags, so several tags of one image collapse into a single group.
+func groupSaveRefs(recs []*store.ImageRecord) [][]string {
+	order := []string{}
+	byKey := map[string][]string{}
+	for _, rec := range recs {
+		key := rec.ID
+		if key == "" {
+			key = rec.Ref
+		}
+		if _, ok := byKey[key]; !ok {
+			order = append(order, key)
+		}
+		byKey[key] = append(byKey[key], rec.Ref)
+	}
+	out := make([][]string, 0, len(order))
+	for _, key := range order {
+		out = append(out, byKey[key])
+	}
+	return out
 }
 
 // openImageRootfs resolves an image's rootfs to a directory path and
