@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +37,21 @@ func (s *execStore) get(id string) *execRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.records[id]
+}
+
+// idsForContainer returns the exec instance IDs tracked for a container, for
+// ContainerJSON.ExecIDs. Returns nil (→ JSON null, as Docker emits) when none.
+func (s *execStore) idsForContainer(cid string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var ids []string
+	for id, r := range s.records {
+		if r.ContainerID == cid {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 func (s *execStore) update(id string, fn func(*execRecord)) {
