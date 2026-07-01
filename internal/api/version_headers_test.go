@@ -32,4 +32,15 @@ func TestVersionHeadersOnEveryResponse(t *testing.T) {
 	if s := rr.Header().Get("Server"); !strings.HasPrefix(s, "Docker/") {
 		t.Errorf("Server header = %q, want a Docker/... value", s)
 	}
+
+	// Docker sets the headers even on unmatched-route 404s. Wrapping the whole
+	// router (not r.Use, which skips NotFoundHandler) must cover this.
+	rr404 := httptest.NewRecorder()
+	srv.ServeHTTP(rr404, httptest.NewRequest("GET", "/no/such/route", nil))
+	if rr404.Code != 404 {
+		t.Fatalf("unknown route status = %d, want 404", rr404.Code)
+	}
+	if got := rr404.Header().Get("Api-Version"); got != "1.43" {
+		t.Errorf("404 Api-Version = %q, want 1.43 (headers must cover unmatched routes)", got)
+	}
 }
