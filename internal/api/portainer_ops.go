@@ -792,6 +792,17 @@ func (h *Handler) commitContainer(w http.ResponseWriter, r *http.Request) {
 		dup.TemplateName = templateName
 		dup.TemplateVMID = 0
 		dup.TemplateDataset = ""
+		// Compute Docker's real image ID (sha256 of the OCI config) over the
+		// freshly-committed snapshot rootfs — the same rootfs a later
+		// `docker save` reads — so the response Id, inspect, and save all agree.
+		// Best-effort: fall back to the internal ID if the rootfs can't be
+		// tarred.
+		committedRootfs := filepath.Join(h.mgr.LXCPath(), templateName, "rootfs")
+		if digest, derr := computeConfigDigestFromRootfs(&dup, committedRootfs); derr == nil && digest != "" {
+			dup.ConfigDigest = digest
+		} else if derr != nil {
+			log.Printf("commit: config-digest for %s failed (%v); using internal id", ref, derr)
+		}
 	}
 	if err := h.store.AddImage(&dup); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
@@ -799,7 +810,7 @@ func (h *Handler) commitContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	h.publishEvent("image", "create", ref, map[string]string{"name": ref})
 	jsonResponse(w, http.StatusCreated, map[string]string{
-		"Id": "sha256:" + dup.ID,
+		"Id": "sha256:" + imageDisplayID(&dup),
 	})
 }
 

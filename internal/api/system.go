@@ -680,18 +680,19 @@ func (h *Handler) systemDF(w http.ResponseWriter, r *http.Request) {
 		// is one row carrying all its RepoTags/RepoDigests — matching
 		// `docker system df` — and its size counts once toward LayersSize.
 		type imgAgg struct {
-			id      string
-			created int64
-			size    int64
-			tags    []string
-			digests []string
+			id        string
+			displayID string
+			created   int64
+			size      int64
+			tags      []string
+			digests   []string
 		}
 		order := []string{}
 		byID := map[string]*imgAgg{}
 		for _, img := range h.store.ListImages() {
 			a := byID[img.ID]
 			if a == nil {
-				a = &imgAgg{id: img.ID, created: img.Created.Unix(), size: imageSize(lxcPath, h.mgr.PVEStorage(), img)}
+				a = &imgAgg{id: img.ID, displayID: imageDisplayID(img), created: img.Created.Unix(), size: imageSize(lxcPath, h.mgr.PVEStorage(), img)}
 				byID[img.ID] = a
 				order = append(order, img.ID)
 				layersSize += a.size
@@ -703,7 +704,7 @@ func (h *Handler) systemDF(w http.ResponseWriter, r *http.Request) {
 		for _, id := range order {
 			a := byID[id]
 			images = append(images, map[string]any{
-				"Id":          "sha256:" + a.id,
+				"Id":          "sha256:" + a.displayID,
 				"RepoTags":    sortedUnique(a.tags),
 				"RepoDigests": sortedUnique(a.digests),
 				"Created":     a.created,

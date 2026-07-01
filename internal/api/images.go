@@ -96,7 +96,7 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 			labels = map[string]string{}
 		}
 		grouped[key] = &ImageSummary{
-			ID:          "sha256:" + rec.ID,
+			ID:          "sha256:" + imageDisplayID(rec),
 			RepoTags:    []string{rec.Ref},
 			RepoDigests: digestRefs(rec),
 			Created:     rec.Created.Unix(),
@@ -516,7 +516,7 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 	repoTags, repoDigests := h.imageRefsForID(rec.ID)
 
 	resp := ImageInspect{
-		ID:              "sha256:" + rec.ID,
+		ID:              "sha256:" + imageDisplayID(rec),
 		RepoTags:        repoTags,
 		RepoDigests:     repoDigests,
 		Comment:         rec.OCIComment,
@@ -696,7 +696,7 @@ func (h *Handler) removeImage(w http.ResponseWriter, r *http.Request) {
 	h.emitImage("delete", ref)
 	out := []map[string]string{{"Untagged": ref}}
 	if img != nil {
-		out = append(out, map[string]string{"Deleted": "sha256:" + img.ID})
+		out = append(out, map[string]string{"Deleted": "sha256:" + imageDisplayID(img)})
 	}
 	jsonResponse(w, http.StatusOK, out)
 }
@@ -764,14 +764,25 @@ func (h *Handler) findImageByID(id string) *store.ImageRecord {
 		return nil
 	}
 	for _, rec := range h.store.ListImages() {
-		if rec.ID == id {
+		if rec.ID == id || rec.ConfigDigest == id {
 			return rec
 		}
-		if len(id) >= 4 && strings.HasPrefix(rec.ID, id) {
+		if len(id) >= 4 && (strings.HasPrefix(rec.ID, id) ||
+			(rec.ConfigDigest != "" && strings.HasPrefix(rec.ConfigDigest, id))) {
 			return rec
 		}
 	}
 	return nil
+}
+
+// imageDisplayID returns the value the API exposes as the image ID (Docker's
+// image ID): the real config digest when known, else the internal record ID
+// (legacy records). Callers prefix "sha256:".
+func imageDisplayID(rec *store.ImageRecord) string {
+	if rec.ConfigDigest != "" {
+		return rec.ConfigDigest
+	}
+	return rec.ID
 }
 
 func normalizeImageRef(name string) string {

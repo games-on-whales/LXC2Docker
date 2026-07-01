@@ -356,6 +356,42 @@ func writeLayerTar(ctx any, root, outPath string) (string, error) {
 // from the OCI metadata stored on the image record plus the layer digest
 // computed by writeLayerTar. Returns the JSON bytes and its sha256 (used as
 // the filename in the outer tar).
+// computeConfigDigest resolves rec's rootfs, tars it to get the layer diff_id,
+// synthesises the image's OCI config, and returns the sha256 of that config
+// (Docker's image ID, as 64-hex, no "sha256:" prefix). This is the same value
+// `docker save` writes as the <config>.json name, so a stored digest and a
+// later save agree.
+func (h *Handler) computeConfigDigest(rec *store.ImageRecord) (string, error) {
+	dir, cleanup, err := h.openImageRootfs(rec)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	return computeConfigDigestFromRootfs(rec, dir)
+}
+
+// computeConfigDigestFromRootfs is computeConfigDigest over an explicit rootfs
+// directory. Commit uses this: the freshly-snapshotted template rootfs is known
+// by path, but the record isn't in the store yet (so openImageRootfs can't
+// resolve it, and would otherwise fall back to the inherited source tarball —
+// yielding a digest over the BASE rootfs, not the committed one). Passing the
+// snapshot dir makes the digest match a later `docker save` of the same image.
+func computeConfigDigestFromRootfs(rec *store.ImageRecord, rootfsDir string) (string, error) {
+	tmp, err := os.CreateTemp("", "dld-diff-*.tar")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+	layerSHA, err := writeLayerTar(nil, rootfsDir, tmpPath)
+	if err != nil {
+		return "", err
+	}
+	_, cfgSHA, err := synthesiseImageConfig(rec, layerSHA)
+	return cfgSHA, err
+}
+
 func synthesiseImageConfig(rec *store.ImageRecord, layerSHA string) ([]byte, string, error) {
 	volumes := map[string]struct{}{}
 	for _, v := range rec.OCIVolumes {
