@@ -1029,6 +1029,16 @@ func stopTimeoutPtr(v int) *int {
 	return &v
 }
 
+// validWaitCondition reports whether c is a wait condition the Docker Engine
+// API accepts: not-running (default), next-exit, or removed.
+func validWaitCondition(c string) bool {
+	switch c {
+	case "not-running", "next-exit", "removed":
+		return true
+	}
+	return false
+}
+
 // POST /containers/{id}/wait
 func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
@@ -1039,6 +1049,12 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 	condition := r.URL.Query().Get("condition")
 	if condition == "" {
 		condition = "not-running"
+	}
+	// Docker rejects an unrecognized condition with 400 rather than silently
+	// treating it as not-running. Validate before the 200 header is flushed.
+	if !validWaitCondition(condition) {
+		errResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid condition: %q", condition))
+		return
 	}
 	wasRunning := false
 	if state, _ := h.mgr.State(id); state == "running" {
