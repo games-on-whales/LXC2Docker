@@ -253,9 +253,15 @@ func (h *Handler) pruneContainers(w http.ResponseWriter, r *http.Request) {
 		if !pruneEligible(rec.Created, rec.Labels, filters, until) {
 			continue
 		}
+		// Measure the writable rootfs before destroying it so SpaceReclaimed
+		// reports the freed bytes, consistent with the SizeRw the daemon
+		// reports for containers in /system/df. Docker returns 0 only when
+		// nothing was pruned.
+		size := rootfsSize(h.mgr.RootfsPath(rec.ID))
 		if err := h.mgr.RemoveContainer(rec.ID); err != nil {
 			continue
 		}
+		reclaimed += size
 		h.publishEvent("container", "destroy", rec.ID, map[string]string{
 			"name":  rec.Name,
 			"image": normalizeImageRef(rec.Image),

@@ -1193,7 +1193,10 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.mgr.RemoveContainer(id); err != nil {
-		errResponse(w, http.StatusConflict, err.Error())
+		// The running-container conflict was already handled above with a 409.
+		// Any remaining RemoveContainer failure is an unexpected daemon error,
+		// which Docker reports as 500 (409 is reserved for the conflict case).
+		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	os.Remove(h.mgr.LogPath(id))
