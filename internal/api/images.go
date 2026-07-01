@@ -90,6 +90,28 @@ func (h *Handler) listImages(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, out)
 }
 
+// imageRefsForID returns every repo tag — and their "<repo>@<digest>" refs —
+// that resolve to the same image ID. The store keys images by ref, but
+// `docker tag` copies the record under a new ref keeping the ID, and distro
+// refs like ubuntu:22.04 / ubuntu:jammy share an ID, so several refs can point
+// at one image. Docker's inspect reports every tag/digest pointing at the
+// image (matching the aggregation /images/json already does), not just the
+// queried ref. Results are sorted for deterministic output.
+func (h *Handler) imageRefsForID(id string) (tags, digests []string) {
+	tags = []string{}
+	digests = []string{}
+	for _, rec := range h.store.ListImages() {
+		if rec.ID != id {
+			continue
+		}
+		tags = append(tags, rec.Ref)
+		digests = append(digests, digestRefs(rec)...)
+	}
+	sort.Strings(tags)
+	sort.Strings(digests)
+	return tags, digests
+}
+
 // digestRefs returns RepoDigests in Docker's "<repo>@<digest>" shape. If
 // we captured a manifest digest at pull time (OCI pulls only), we emit one
 // entry; otherwise the array is empty. Portainer's image detail page shows
@@ -221,6 +243,13 @@ func (h *Handler) pullImage(w http.ResponseWriter, r *http.Request) {
 		})
 		flush()
 		return
+	}
+
+	// Docker emits a "Digest: sha256:..." line before the final status so the
+	// client (and `docker pull` output) can report the content digest it
+	// resolved. We record the registry manifest digest at pull time.
+	if rec := h.store.GetImage(ref); rec != nil && rec.RepoDigest != "" {
+		sendStatus("Digest: " + rec.RepoDigest)
 	}
 
 	if alreadyPresent {
@@ -393,10 +422,12 @@ func (h *Handler) inspectImage(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := imageConfigFromRecord(rec)
 
+	repoTags, repoDigests := h.imageRefsForID(rec.ID)
+
 	resp := ImageInspect{
 		ID:              "sha256:" + rec.ID,
-		RepoTags:        []string{rec.Ref},
-		RepoDigests:     digestRefs(rec),
+		RepoTags:        repoTags,
+		RepoDigests:     repoDigests,
 		Comment:         rec.OCIComment,
 		Created:         rec.Created.Format(time.RFC3339),
 		Container:       rec.OCIContainer,
