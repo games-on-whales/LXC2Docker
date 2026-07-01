@@ -320,7 +320,7 @@ func (h *Handler) pruneImages(w http.ResponseWriter, r *http.Request) {
 			}
 			var size int64
 			if !countedIDs[img.ID] {
-				size = imageSize(h.mgr.LXCPath(), img)
+				size = imageSize(h.mgr.LXCPath(), h.mgr.PVEStorage(), img)
 			}
 			if err := h.mgr.RemoveImage(img.Ref); err != nil {
 				continue
