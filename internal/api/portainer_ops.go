@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -670,6 +671,21 @@ func (h *Handler) commitContainer(w http.ResponseWriter, r *http.Request) {
 		if _, err := os.Stat(rootfs); err != nil {
 			errResponse(w, http.StatusNotFound, "container rootfs not found")
 			return
+		}
+		// Docker pauses the container during commit (default true) for a
+		// consistent snapshot. Best-effort: the freezer cgroup is often
+		// unavailable for unprivileged CTs, so on failure we log and snapshot
+		// live rather than failing the commit. This uses the manager's freeze
+		// primitive directly; the public pause/unpause endpoints keep their
+		// deliberate 409 policy.
+		if boolValueDefault(r, "pause", true) {
+			if state, _ := h.mgr.State(id); state == "running" {
+				if err := h.mgr.PauseContainer(id); err == nil {
+					defer h.mgr.UnpauseContainer(id)
+				} else {
+					log.Printf("commit: pause %s failed (%v); snapshotting live", id, err)
+				}
+			}
 		}
 		templateName, err := snapshotCommittedImageRootfs(h.mgr.LXCPath(), ref, rootfs)
 		if err != nil {
