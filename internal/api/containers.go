@@ -158,6 +158,11 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Guarantee a PATH on the container's process environment. OCI images
+	// supply one; LXC distro/app templates don't, and lxc.environment would
+	// otherwise leave PID 1 with an empty PATH.
+	env = ensureDefaultPath(env)
+
 	// Working directory: request overrides image default.
 	workingDir := req.WorkingDir
 	if workingDir == "" {
@@ -2800,6 +2805,25 @@ func mergeEnv(imageEnv, requestEnv []string) []string {
 		result = append(result, m[key])
 	}
 	return result
+}
+
+// ociDefaultPath is the standard search PATH an OCI runtime provides. OCI
+// images bake PATH into their config; LXC distro templates have no image
+// config, so without this a container's PID 1 (and its children) start with no
+// PATH set via lxc.environment — breaking tools that execvp directly, e.g. GNU
+// make's no-metachar recipe optimization (`mkdir ...` → ENOENT → exit 127).
+const ociDefaultPath = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+// ensureDefaultPath returns env with the OCI default PATH prepended when env
+// declares no PATH entry. A PATH already set — from the image config or a -e
+// override, even an explicitly empty one — is left untouched.
+func ensureDefaultPath(env []string) []string {
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			return env
+		}
+	}
+	return append([]string{ociDefaultPath}, env...)
 }
 
 // envValue returns the value of key in a KEY=VALUE environment slice, or ""
