@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/games-on-whales/LXC2Docker/internal/image"
 	"github.com/games-on-whales/LXC2Docker/internal/oci"
 	"github.com/games-on-whales/LXC2Docker/internal/store"
@@ -44,6 +46,19 @@ type Manager struct {
 	// materialize in parallel instead of queueing behind one global lock.
 	tmplMu    sync.Mutex
 	tmplLocks map[string]*sync.Mutex
+	// pullGroup coalesces concurrent pulls of the SAME image ref into a single
+	// skopeo+umoci run. Without it, two callers racing to pull one ref — a
+	// `docker pull` and a container-create auto-pull, or an orchestrator that
+	// re-issues the pull on a reconcile tick before the first finishes — each
+	// run skopeo into the same OCI store path, corrupt each other near the end,
+	// and the wreckage is cleaned up and retried forever (a large image never
+	// lands). Keyed by ref: same ref shares one pull, different refs run in
+	// parallel. Zero value is ready to use.
+	pullGroup singleflight.Group
+	// pullImpl is the per-ref pull work run under pullGroup. nil in production
+	// (pullOCIInner is used); tests inject a stub to exercise the coalescing
+	// wrapper without a real registry.
+	pullImpl func(r *image.ResolvedImage, opts PullOpts) error
 	// minFreeBytes is the low-space threshold for the create pre-flight and the
 	// disk-pressure watcher. Zero disables both. Set via SetMinFreeBytes.
 	minFreeBytes uint64
@@ -1063,7 +1078,22 @@ func (m *Manager) pullApp(r *image.ResolvedImage, progress func(string)) error {
 // pullOCI pulls an arbitrary OCI/Docker image via skopeo + umoci, unpacks it
 // to a rootfs, and creates a template from it. In PVE mode the template is a
 // Proxmox CT on the configured storage; otherwise a direct LXC template.
+//
+// Concurrent pulls of the same ref are coalesced: the first caller runs the pull
+// while any others block and share its result, so racing callers never spawn
+// duplicate skopeo copies into the same OCI store path. See pullGroup.
 func (m *Manager) pullOCI(r *image.ResolvedImage, opts PullOpts) error {
+	_, err, _ := m.pullGroup.Do(r.Ref, func() (any, error) {
+		inner := m.pullOCIInner
+		if m.pullImpl != nil {
+			inner = m.pullImpl
+		}
+		return nil, inner(r, opts)
+	})
+	return err
+}
+
+func (m *Manager) pullOCIInner(r *image.ResolvedImage, opts PullOpts) error {
 	ociStoreDir := filepath.Join(m.CacheDir(), "oci")
 
 	progress := opts.OnStatus
