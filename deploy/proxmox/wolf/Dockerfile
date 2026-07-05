@@ -32,13 +32,16 @@ COPY --chmod=755 startup-app.sh /opt/gow/startup-app.sh
 COPY --from=wolfden /app /opt/wolf-den
 COPY --from=wolfden /usr/share/dotnet /usr/share/dotnet
 # socat (Wolf Den local API proxy) + .NET native deps (libicu). wolf:stable is
-# Debian (apt); wolf:vulkan is Fedora (dnf) — install with whichever is present.
+# apt-based (Debian/Ubuntu), wolf:vulkan is Fedora (dnf) — install with whichever
+# is present. The libicu soname package version tracks the base (libicu72 on
+# Debian bookworm, libicu76 on Ubuntu plucky, ...), so resolve it dynamically
+# rather than hardcoding.
 RUN set -e; \
     ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet; \
     if command -v apt-get >/dev/null 2>&1; then \
         apt-get update; \
-        apt-get install -y --no-install-recommends socat libicu72 || \
-            apt-get install -y --no-install-recommends socat libicu; \
+        icu_pkg="$(apt-cache pkgnames libicu 2>/dev/null | grep -E '^libicu[0-9]+$' | sort -V | tail -n1)"; \
+        apt-get install -y --no-install-recommends socat "${icu_pkg:-libicu-dev}"; \
         rm -rf /var/lib/apt/lists/*; \
     elif command -v dnf >/dev/null 2>&1; then \
         dnf install -y socat libicu findutils; dnf clean all; \
