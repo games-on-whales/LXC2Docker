@@ -122,6 +122,9 @@ func TestWriteNvidiaMountHookContent(t *testing.T) {
 		`R="$LXC_ROOTFS_MOUNT"`,
 		`ln -sf "libcuda.so.1" "$R/usr/lib/x86_64-linux-gnu/libcuda.so"`,
 		`ln -sf "../libnvidia-allocator.so.1" "$R/usr/lib/x86_64-linux-gnu/gbm/nvidia-drm_gbm.so"`,
+		// The lib dir is registered with the container's ldcache so it resolves on
+		// non-Debian images (Fedora/Arch) that don't search the multiarch path.
+		`echo "/usr/lib/x86_64-linux-gnu" >> "$R/etc/ld.so.conf.d/00-docker-lxc-daemon-nvidia.conf"`,
 		`ldconfig`,
 		"exit 0",
 	} {

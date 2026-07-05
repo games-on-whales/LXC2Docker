@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -246,6 +247,7 @@ func writeNvidiaMountHookTo(path string, links []string) error {
 	b.WriteString("R=\"$LXC_ROOTFS_MOUNT\"\n")
 	b.WriteString("[ -n \"$R\" ] || exit 0\n")
 	seen := map[string]bool{}
+	libDirs := map[string]bool{}
 	for _, l := range links {
 		parts := strings.SplitN(l, "::", 2)
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -257,9 +259,33 @@ func writeNvidiaMountHookTo(path string, links []string) error {
 			continue
 		}
 		seen[link] = true
+		dir := filepath.Dir(link)
+		if strings.HasPrefix(dir, "/usr/lib") || strings.HasPrefix(dir, "/lib") {
+			libDirs[dir] = true
+		}
 		// nvidia driver paths contain no spaces/shell metacharacters.
-		b.WriteString(fmt.Sprintf("mkdir -p \"$R%s\" 2>/dev/null || true\n", filepath.Dir(link)))
+		b.WriteString(fmt.Sprintf("mkdir -p \"$R%s\" 2>/dev/null || true\n", dir))
 		b.WriteString(fmt.Sprintf("ln -sf \"%s\" \"$R%s\" 2>/dev/null || true\n", target, link))
+	}
+	// Register the driver-lib directories with the container's ldcache. The libs
+	// are bind-mounted into the host's multiarch dir (/usr/lib/x86_64-linux-gnu);
+	// Debian/Ubuntu images already search it, but Fedora/Arch images (e.g. GOW's
+	// steam:fedora) only search /usr/lib64 — so without a search-path entry the
+	// libs resolve on the host's distro yet are invisible to the linker in a
+	// foreign one, and EGL/Vulkan silently fall back to mesa and crash the
+	// session. An ld.so.conf.d drop-in makes `ldconfig` pick them up anywhere.
+	if len(libDirs) > 0 {
+		dirs := make([]string, 0, len(libDirs))
+		for d := range libDirs {
+			dirs = append(dirs, d)
+		}
+		sort.Strings(dirs)
+		conf := "/etc/ld.so.conf.d/00-docker-lxc-daemon-nvidia.conf"
+		b.WriteString(fmt.Sprintf("mkdir -p \"$R%s\" 2>/dev/null || true\n", filepath.Dir(conf)))
+		b.WriteString(fmt.Sprintf(": > \"$R%s\" 2>/dev/null || true\n", conf))
+		for _, d := range dirs {
+			b.WriteString(fmt.Sprintf("echo \"%s\" >> \"$R%s\" 2>/dev/null || true\n", d, conf))
+		}
 	}
 	// Refresh the ld cache so freshly bind-mounted libs resolve by SONAME.
 	b.WriteString("chroot \"$R\" /sbin/ldconfig 2>/dev/null || ldconfig -r \"$R\" 2>/dev/null || true\n")
