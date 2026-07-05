@@ -44,11 +44,16 @@ sudo make install # dev convenience: -> /usr/local/bin + systemd unit
 
 ### Releasing (maintainers)
 
-Tag a commit and CI builds the `.deb` and publishes the GitHub release (with
-generated notes) automatically:
+`make release` auto-increments the version from the latest tag (patch by
+default), pushes the tag, and CI builds the `.deb` + tarball and publishes the
+GitHub release (with generated notes) automatically — no manual version
+bookkeeping:
 
 ```sh
-make release VERSION=0.2.0   # or: ./scripts/release.sh 0.2.0
+make release              # patch bump: v0.1.4 -> v0.1.5
+make release BUMP=minor   # or BUMP=major
+make release VER=1.4.0    # pin an explicit version
+# equivalently: ./scripts/release.sh [--minor|--major|X.Y.Z]
 ```
 
 ## Testing

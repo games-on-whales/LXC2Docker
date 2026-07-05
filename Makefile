@@ -86,12 +86,14 @@ tarball: build
 	tar -czf $(TARBALL) -C $(BUILD_DIR)/tar .
 	@echo ">> built $(TARBALL)"
 
-## Cut a release: tag vX.Y.Z on the current commit and push it. CI builds the
-## .deb and publishes the GitHub release with generated notes.
-##   make release VERSION=0.2.0
+## Cut a release: auto-increments the version from the latest tag and pushes it;
+## CI builds the .deb + tarball and publishes the GitHub release. Default bumps
+## the patch; override the bump or pin a version:
+##   make release              # patch bump (v0.1.4 -> v0.1.5)
+##   make release BUMP=minor   # or BUMP=major
+##   make release VER=1.4.0    # explicit version
 release:
-	@test -n "$(VERSION)" || { echo "usage: make release VERSION=0.2.0" >&2; exit 1; }
-	./scripts/release.sh "$(VERSION)"
+	./scripts/release.sh $(if $(VER),$(VER),$(if $(BUMP),--$(BUMP)))
 
 ## Remove binary and systemd unit.
 uninstall:
