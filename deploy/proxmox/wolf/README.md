@@ -90,6 +90,23 @@ Wolf UI, desktops, Steam, RetroArch, …), pins the GOW app images to
 `WOLF_IMAGE_TAG`, and installs `fake-udev`. Edit `/etc/wolf/config.toml`
 afterwards (or use Wolf Den) to customise apps; it is preserved across restarts.
 
+## Controllers
+
+Wolf builds virtual gamepads on the host via `uinput` and injects them into each
+session, so controllers work in the Wolf UI, Steam Big Picture, and games.
+
+**Known caveat — Steam Input:** for games launched through Steam with *Steam
+Input* enabled, the controller may not register in-game. Steam Input grabs the
+physical pad and builds its own virtual gamepad via `/dev/uinput` *inside the
+session container*, which isn't passed through to sessions yet (only Wolf itself
+gets `uinput`). Until that lands, **disable Steam Input** so the game reads
+Wolf's pad directly:
+
+- Per game: *game → ⚙ → Controller → Override for … → Disable Steam Input*, or
+- Globally: *Steam → Settings → Controller → turn off the desktop/BPM toggles*.
+
+Menus (Wolf UI, Big Picture) are unaffected — they read the pad over evdev.
+
 ## Status
 
 Draft mirroring the production SmoothNAS plugin — pending verification on a live
