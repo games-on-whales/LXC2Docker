@@ -121,6 +121,10 @@ func loadNvidiaCDI() (*cdiSpec, error) {
 // nvidiaGPUConfigItems returns the lxc.* config items that inject the host
 // NVIDIA driver into a GPU container. It loads the CDI spec, translates it, and
 // writes the symlink/ldcache mount hook.
+//
+// It stat()s each device node for its live major:minor (see the nvidia-uvm note
+// below); when a node is absent it falls back to the spec's stored numbers, so
+// it stays deterministic under unit tests with synthetic paths.
 func nvidiaGPUConfigItems() ([]configItem, error) {
 	spec, err := loadNvidiaCDI()
 	if err != nil {
@@ -173,10 +177,24 @@ func nvidiaItemsFromSpec(spec *cdiSpec) (items []configItem, links []string) {
 				continue
 			}
 			seenDev[dn.Path] = true
-			if dn.Major > 0 {
+			// Prefer the live device node's major:minor over the numbers stored
+			// in the CDI spec. nvidia-uvm (and nvidia-uvm-tools) get a DYNAMIC
+			// major that can change across reboots, so a spec generated on an
+			// earlier boot carries a stale major (e.g. 507 vs the live 508). The
+			// bind below mounts the real node regardless, so a stale cgroup major
+			// authorises the wrong device and leaves CUDA's real /dev/nvidia-uvm
+			// blocked — CUDA_ERROR_NO_DEVICE, and hardware NVENC silently drops to
+			// software. Fall back to the spec value when the node can't be
+			// stat()'d (unit tests with synthetic paths, or a device not present).
+			major, minor := dn.Major, dn.Minor
+			var st syscallStat
+			if err := syscallStatDevice(dn.Path, &st); err == nil {
+				major, minor = int(st.major), int(st.minor)
+			}
+			if major > 0 {
 				items = append(items, configItem{
 					"lxc.cgroup2.devices.allow",
-					fmt.Sprintf("c %d:%d rwm", dn.Major, dn.Minor),
+					fmt.Sprintf("c %d:%d rwm", major, minor),
 				})
 			}
 			dest := strings.ReplaceAll(strings.TrimPrefix(dn.Path, "/"), " ", `\040`)
