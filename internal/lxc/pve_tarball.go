@@ -381,7 +381,7 @@ func (m *Manager) createPVEFromTarball(id string, imgRec *store.ImageRecord, cfg
 
 	// Fill in LAN config (and convert --network=host to a LAN NIC) before the
 	// IP allocation below keys off cfg.NetworkMode.
-	applyLANNetworking(&cfg, m.lan, vmid, m.lanMACForContainer(id))
+	applyLANNetworking(&cfg, m.lan, vmid, m.lanMACForContainer(id, cfg))
 
 	hostname := id[:12]
 	if storeRec := m.store.GetContainer(id); storeRec != nil {
@@ -497,7 +497,7 @@ func (m *Manager) reconfigureReusedPVECT(id string, cfg ContainerConfig) error {
 	hostname = sanitizeHostname(hostname)
 
 	// Fill LAN config (may convert --network=host to a LAN NIC) before writing.
-	applyLANNetworking(&cfg, m.lan, vmid, m.lanMACForContainer(id))
+	applyLANNetworking(&cfg, m.lan, vmid, m.lanMACForContainer(id, cfg))
 
 	cfg.LogFile = LogFilePath(m.lxcPath, id)
 	if err := os.MkdirAll(filepath.Dir(cfg.LogFile), 0o755); err != nil {
@@ -754,7 +754,7 @@ func (m *Manager) createPVELinkedCloneFromTarball(id string, imgRec *store.Image
 
 	// Fill in LAN config before the IP allocation in finalizePVECT keys off
 	// cfg.NetworkMode (may convert --network=host to a LAN NIC).
-	applyLANNetworking(&cfg, m.lan, vmid, m.lanMACForContainer(id))
+	applyLANNetworking(&cfg, m.lan, vmid, m.lanMACForContainer(id, cfg))
 
 	hostname := id[:12]
 	if storeRec := m.store.GetContainer(id); storeRec != nil {

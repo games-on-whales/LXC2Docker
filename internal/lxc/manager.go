@@ -1333,8 +1333,18 @@ func (m *Manager) writeContainerIDHostname(id, hostname string) (string, error) 
 	return p, nil
 }
 
-func (m *Manager) lanMACForContainer(id string) string {
-	mac := stableLANMac(id)
+func (m *Manager) lanMACForContainer(id string, cfg ContainerConfig) string {
+	// Key the MAC on a requested static LAN IP so it stays stable across CT
+	// recreation. The container ID is regenerated every recreate, so hashing it
+	// (as we used to) hands out a fresh veth MAC each time while the IP is reused
+	// — leaving LAN peers with stale ARP for that IP, so Moonlight can't re-reach
+	// Wolf until the cache ages out. With no static IP the address itself changes
+	// per recreate, so the id-derived MAC is fine there.
+	macKey := id
+	if req := strings.TrimSpace(cfg.LANIPRequest); req != "" && !strings.EqualFold(req, "dhcp") {
+		macKey = "lanip:" + req
+	}
+	mac := stableLANMac(macKey)
 	rec := m.store.GetContainer(id)
 	if rec == nil {
 		return mac
@@ -1359,7 +1369,7 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	// This may also convert a --network=host container into LAN mode (a CT
 	// can't share the host netns), so it must run before the IP allocation
 	// below keys off cfg.NetworkMode.
-	applyLANNetworking(&cfg, m.lan, vmid, m.lanMACForContainer(id))
+	applyLANNetworking(&cfg, m.lan, vmid, m.lanMACForContainer(id, cfg))
 
 	log.Printf("CreateContainer[PVE]: pct clone %d → VMID %d for %s", imgRec.TemplateVMID, vmid, id[:12])
 	out, err := exec.Command("pct", "clone",
