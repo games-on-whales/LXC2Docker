@@ -39,6 +39,8 @@ services:
       XDG_RUNTIME_DIR: ${WOLF_RUNTIME_DIR:-/run/wolf}
       WOLF_RENDER_NODE: ${WOLF_RENDER_NODE:-/dev/dri/renderD128}
       WOLF_ENCODER_NODE: ${WOLF_ENCODER_NODE:-}
+      # Tag for the GOW app images seeded into config.toml (firefox, steam, ...).
+      WOLF_IMAGE_TAG: ${WOLF_IMAGE_TAG:-fedora-43}
       WOLF_LOG_LEVEL: ${WOLF_LOG_LEVEL:-INFO}
       WOLF_STOP_CONTAINER_ON_EXIT: "${WOLF_STOP_CONTAINER_ON_EXIT:-TRUE}"
 

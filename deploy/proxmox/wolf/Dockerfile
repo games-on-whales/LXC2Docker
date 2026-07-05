@@ -13,7 +13,15 @@ FROM ${WOLF_BASE}
 
 ENV HOST_APPS_STATE_FOLDER=/etc/wolf \
     XDG_RUNTIME_DIR=/run/wolf \
-    WOLF_DOCKER_SOCKET=/var/run/docker.sock
+    WOLF_DOCKER_SOCKET=/var/run/docker.sock \
+    WOLF_IMAGE_TAG=fedora-43
+
+# Startup bootstrap: the GOW base entrypoint runs /opt/gow/startup-app.sh, which
+# seeds /etc/wolf/config.toml (uuid + the default profile set), resolves the
+# render/encoder nodes, installs fake-udev, then execs Wolf. Without this Wolf
+# has no config and exits immediately.
+COPY config/default-config.toml /opt/gow/default-config.toml
+COPY --chmod=755 startup-app.sh /opt/gow/startup-app.sh
 
 # --- Wolf Den (management UI on :8080) ------------------------------------
 # Upstream Wolf runs /wolf/wolf as PID 1 via /entrypoint.sh and ships no s6

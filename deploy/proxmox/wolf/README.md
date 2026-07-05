@@ -75,6 +75,14 @@ discovery.
 `.github/workflows/wolf-proxmox-image.yml` workflow (manual dispatch), then set
 `WOLF_IMAGE` to the pinned tag/digest.
 
+## Configuration
+
+On first start the bundled `startup-app.sh` seeds `/etc/wolf/config.toml` with a
+fresh host uuid and the default app profile set (`config/default-config.toml` —
+Wolf UI, desktops, Steam, RetroArch, …), pins the GOW app images to
+`WOLF_IMAGE_TAG`, and installs `fake-udev`. Edit `/etc/wolf/config.toml`
+afterwards (or use Wolf Den) to customise apps; it is preserved across restarts.
+
 ## Status
 
 Draft mirroring the production SmoothNAS plugin — pending verification on a live
