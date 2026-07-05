@@ -1,0 +1,71 @@
+# Wolf on Proxmox, backed by LXC2Docker (docker-lxc-daemon).
+#
+# This is the Proxmox equivalent of the SmoothNAS Wolf plugin: Wolf runs as a
+# container against the host docker-lxc-daemon socket, and every session it
+# launches becomes a sibling Proxmox CT (gow.pve=true) instead of a Docker
+# container. Bring it up against the host daemon:
+#
+#   docker compose build                                   # build the Wolf + Wolf Den image
+#   docker compose up -d                                   # Intel / AMD
+#   docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d   # NVIDIA
+#
+# Prereqs (see README.md): docker-lxc-daemon installed on the PVE host, the host
+# GPU drivers loaded, and the Wolf virtual-input udev rules installed.
+
+services:
+  wolf:
+    # Wolf + Wolf Den (:8080). Build locally, or pull a published tag.
+    image: ${WOLF_IMAGE:-ghcr.io/games-on-whales/wolf-proxmox:latest}
+    build:
+      context: .
+    container_name: wolf
+    restart: unless-stopped
+
+    # Proxmox CT mode: Wolf and every session it spawns become first-class
+    # Proxmox CTs on ${DLD_STORAGE}. A static LAN IP keeps Moonlight/mDNS
+    # discovery working (matches the production deploy).
+    labels:
+      gow.pve: "true"
+      gow.lan: "true"
+      gow.lan.ip: "${WOLF_LAN_IP}"
+      dld.storage: "${DLD_STORAGE:-local-lvm}"
+
+    environment:
+      # Wolf state + the socket it drives (the host LXC2Docker socket).
+      HOST_APPS_STATE_FOLDER: /etc/wolf
+      WOLF_DOCKER_SOCKET: /var/run/docker.sock
+      # Identity-mapped runtime dir: sockets Wolf bind-mounts into sibling
+      # session CTs must resolve at the same path on the host.
+      XDG_RUNTIME_DIR: ${WOLF_RUNTIME_DIR:-/run/wolf}
+      WOLF_RENDER_NODE: ${WOLF_RENDER_NODE:-/dev/dri/renderD128}
+      WOLF_ENCODER_NODE: ${WOLF_ENCODER_NODE:-}
+      # Tag for the GOW app images seeded into config.toml (firefox, steam, ...).
+      WOLF_IMAGE_TAG: ${WOLF_IMAGE_TAG:-fedora-43}
+      WOLF_LOG_LEVEL: ${WOLF_LOG_LEVEL:-INFO}
+      WOLF_STOP_CONTAINER_ON_EXIT: "${WOLF_STOP_CONTAINER_ON_EXIT:-TRUE}"
+
+    volumes:
+      - /etc/wolf:/etc/wolf
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/udev:/run/udev:ro
+      - ${WOLF_RUNTIME_DIR:-/run/wolf}:${WOLF_RUNTIME_DIR:-/run/wolf}
+
+    devices:
+      - /dev/dri
+      - /dev/uinput
+      - /dev/uhid
+
+    # Virtual input (uinput 10:223, uhid 10:239, /dev/input 13:*) + hidraw 244.
+    device_cgroup_rules:
+      - "c 10:223 rwm"
+      - "c 10:239 rwm"
+      - "c 13:* rmw"
+      - "c 244:* rmw"
+
+    # Capabilities Wolf needs for virtual input and to manage session CTs.
+    cap_add:
+      - NET_RAW
+      - MKNOD
+      - NET_ADMIN
+      - SYS_ADMIN
+      - SYS_NICE
