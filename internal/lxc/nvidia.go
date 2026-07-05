@@ -288,7 +288,12 @@ func writeNvidiaMountHookTo(path string, links []string) error {
 		}
 	}
 	// Refresh the ld cache so freshly bind-mounted libs resolve by SONAME.
-	b.WriteString("chroot \"$R\" /sbin/ldconfig 2>/dev/null || ldconfig -r \"$R\" 2>/dev/null || true\n")
+	// Run the container's own ldconfig via a PATH that covers every distro:
+	// Fedora ships it at /usr/bin/ldconfig, Debian/Ubuntu at /sbin/ldconfig. The
+	// old hardcoded /sbin/ldconfig silently no-op'd on Fedora (GOW steam:fedora),
+	// leaving the driver libs uncached. Fall back to the host ldconfig against the
+	// rootfs only if the chroot can't run one.
+	b.WriteString("chroot \"$R\" /bin/sh -c 'PATH=/usr/sbin:/usr/bin:/sbin:/bin exec ldconfig' 2>/dev/null || ldconfig -r \"$R\" 2>/dev/null || true\n")
 	b.WriteString("exit 0\n")
 	return os.WriteFile(path, []byte(b.String()), 0o755)
 }
