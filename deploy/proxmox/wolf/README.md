@@ -47,12 +47,19 @@ The Compose file reproduces the SmoothNAS `wolf-runtime` + `gpu-*` profiles:
    ```
 4. **A free static LAN IP** for the Wolf CT (Moonlight discovery relies on
    mDNS/multicast reaching the LAN).
+5. **Bind-mount source dirs on the host** — Wolf's `/etc/wolf` (state) and
+   `/run/wolf` (runtime) are bind-mounted from the host, so they must exist
+   before it starts (`/run` is tmpfs, so recreate `/run/wolf` on boot):
+   ```sh
+   install -m 0644 tmpfiles.d/wolf-proxmox.conf /etc/tmpfiles.d/
+   systemd-tmpfiles --create /etc/tmpfiles.d/wolf-proxmox.conf
+   ```
 
 ## Bring up
 
 ```sh
 cp .env.example .env      # set WOLF_LAN_IP, DLD_STORAGE, WOLF_RENDER_NODE, ...
-docker compose build      # build the Wolf + Wolf Den image (or pull WOLF_IMAGE)
+# The image is published by the CI workflow; pull it (or `docker compose build`).
 docker compose up -d                                             # Intel / AMD
 docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d   # NVIDIA
 ```
