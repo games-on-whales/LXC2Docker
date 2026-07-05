@@ -16,8 +16,9 @@ GO_TEST    := go test
 VERSION  ?= $(shell v=$$(git describe --tags --exact-match 2>/dev/null | sed -e 's/^v//'); [ -n "$$v" ] || v=$$(git describe --tags --dirty 2>/dev/null | sed -e 's/^v//' -e 's/-/./g'); [ -n "$$v" ] || v="0.0.0+git$$(git rev-parse --short HEAD 2>/dev/null || echo 0)"; echo "$$v")
 DEB_ARCH := $(shell dpkg --print-architecture 2>/dev/null || echo amd64)
 DEB_PKG  := $(BUILD_DIR)/$(BINARY)_$(VERSION)_$(DEB_ARCH).deb
+TARBALL  := $(BUILD_DIR)/$(BINARY)_$(VERSION)_linux_$(DEB_ARCH).tar.gz
 
-.PHONY: all build install uninstall deps clean test test-unit test-build test-integration deb release
+.PHONY: all build install uninstall deps clean test test-unit test-build test-integration deb tarball release
 
 all: build
 
@@ -70,6 +71,20 @@ deb: build
 	dpkg-deb --root-owner-group --build $(BUILD_DIR)/deb $(DEB_PKG)
 	@echo ">> built $(DEB_PKG)"
 	@dpkg-deb -I $(DEB_PKG) | sed -n '/Package:/,/Description:/p'
+
+## Build a distributable binary tarball: the daemon binary plus the systemd
+## unit and nvidia hook, self-contained. Published on releases alongside the
+## .deb for consumers that don't want apt/dpkg.
+tarball: build
+	@echo ">> packaging $(TARBALL)"
+	rm -rf $(BUILD_DIR)/tar
+	install -D -m 0755 $(BUILD_DIR)/$(BINARY) $(BUILD_DIR)/tar/$(BINARY)
+	install -D -m 0644 systemd/$(BINARY).service $(BUILD_DIR)/tar/$(BINARY).service
+	# Tarball binary lives at the root, not the source /usr/local/bin.
+	sed -i 's#/usr/local/bin/$(BINARY)#/usr/bin/$(BINARY)#' $(BUILD_DIR)/tar/$(BINARY).service
+	install -D -m 0755 packaging/nvidia-hook.sh $(BUILD_DIR)/tar/nvidia-hook.sh
+	tar -czf $(TARBALL) -C $(BUILD_DIR)/tar .
+	@echo ">> built $(TARBALL)"
 
 ## Cut a release: tag vX.Y.Z on the current commit and push it. CI builds the
 ## .deb and publishes the GitHub release with generated notes.

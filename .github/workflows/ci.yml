@@ -105,23 +105,30 @@ jobs:
       - name: Install modules
         run: make deps
 
-      - name: Build .deb
-        run: make deb
+      - name: Build .deb and tarball
+        run: |
+          make deb
+          make tarball
 
-      # Every build publishes a downloadable .deb so installing never needs the
-      # build toolchain — `apt install ./docker-lxc-daemon_*.deb`.
-      - name: Upload .deb artifact
+      # Every build publishes downloadable artifacts so installing never needs
+      # the build toolchain — the .deb (`apt install ./docker-lxc-daemon_*.deb`)
+      # and a self-contained binary tarball.
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: docker-lxc-daemon-deb
-          path: bin/*.deb
+          name: docker-lxc-daemon-dist
+          path: |
+            bin/*.deb
+            bin/*.tar.gz
 
       # On a v* tag, publish (or update) the GitHub release: generate notes from
-      # the commit history and attach the .deb. `scripts/release.sh` just pushes
-      # the tag; this step does the rest.
+      # the commit history and attach the .deb + tarball. `scripts/release.sh`
+      # just pushes the tag; this step does the rest.
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: bin/*.deb
+          files: |
+            bin/*.deb
+            bin/*.tar.gz
           generate_release_notes: true

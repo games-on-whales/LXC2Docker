@@ -38,6 +38,7 @@ containers are driven through the LXC command-line tools at runtime:
 ```sh
 make build        # -> bin/docker-lxc-daemon
 make deb          # -> bin/docker-lxc-daemon_<ver>_<arch>.deb  (what users install)
+make tarball      # -> bin/docker-lxc-daemon_<ver>_linux_<arch>.tar.gz (binary + unit + hook)
 sudo make install # dev convenience: -> /usr/local/bin + systemd unit
 ```
 
