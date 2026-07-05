@@ -8,10 +8,18 @@ or any Docker SDK without modification.
 
 The supported install is the prebuilt **`.deb`** — it depends only on the
 *runtime* LXC command-line tools (`lxc-pve | lxc`, `nftables`), never a build
-toolchain, so a host already running LXC/Proxmox has everything it needs:
+toolchain, so a host already running LXC/Proxmox has everything it needs.
+
+**On a Proxmox VE host** (one-liner — downloads the latest release `.deb` and
+installs it):
 
 ```sh
-# grab the .deb from the latest CI run / release, then:
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/games-on-whales/LXC2Docker/main/scripts/install-on-pve.sh)"
+```
+
+**Manually**, grab the `.deb` from the [latest release][releases]:
+
+```sh
 sudo apt install ./docker-lxc-daemon_*.deb
 sudo systemctl enable --now docker-lxc-daemon
 ```
@@ -19,6 +27,8 @@ sudo systemctl enable --now docker-lxc-daemon
 The package installs the binary to `/usr/bin`, ships the systemd unit, creates
 the `docker` group, and `Conflicts:` the real Docker packages — so it cleanly
 replaces `docker.io` / `docker-ce` on the same socket.
+
+[releases]: https://github.com/games-on-whales/LXC2Docker/releases/latest
 
 ### Build from source (maintainers / CI only)
 
@@ -28,7 +38,17 @@ containers are driven through the LXC command-line tools at runtime:
 ```sh
 make build        # -> bin/docker-lxc-daemon
 make deb          # -> bin/docker-lxc-daemon_<ver>_<arch>.deb  (what users install)
+make tarball      # -> bin/docker-lxc-daemon_<ver>_linux_<arch>.tar.gz (binary + unit + hook)
 sudo make install # dev convenience: -> /usr/local/bin + systemd unit
+```
+
+### Releasing (maintainers)
+
+Tag a commit and CI builds the `.deb` and publishes the GitHub release (with
+generated notes) automatically:
+
+```sh
+make release VERSION=0.2.0   # or: ./scripts/release.sh 0.2.0
 ```
 
 ## Testing
