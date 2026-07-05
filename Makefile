@@ -66,7 +66,7 @@ deb: build
 	install -D -m 0755 packaging/nvidia-hook.sh $(BUILD_DIR)/deb/usr/libexec/$(BINARY)/nvidia-hook.sh
 	install -D -m 0755 packaging/postinst $(BUILD_DIR)/deb/DEBIAN/postinst
 	install -D -m 0755 packaging/prerm $(BUILD_DIR)/deb/DEBIAN/prerm
-	printf 'Package: %s\nVersion: %s\nArchitecture: %s\nMaintainer: Games on Whales <noreply@games-on-whales.github.io>\nSection: admin\nPriority: optional\nDepends: nftables, lxc-pve | lxc\nRecommends: skopeo, umoci, pve-container\nConflicts: docker.io, docker-ce\nHomepage: https://github.com/games-on-whales/LXC2Docker\nDescription: Docker-compatible API daemon backed by LXC\n Speaks the Docker Engine API on top of LXC / Proxmox CTs, so docker,\n docker compose, and Docker SDKs work unmodified while containers run as\n first-class LXC containers. A drop-in replacement for the Docker daemon\n socket that needs only the runtime liblxc — no build toolchain.\n' \
+	printf 'Package: %s\nVersion: %s\nArchitecture: %s\nMaintainer: Games on Whales <noreply@games-on-whales.github.io>\nSection: admin\nPriority: optional\nDepends: nftables, lxc-pve | lxc\nRecommends: skopeo, umoci, pve-container, iputils-arping\nConflicts: docker.io, docker-ce\nHomepage: https://github.com/games-on-whales/LXC2Docker\nDescription: Docker-compatible API daemon backed by LXC\n Speaks the Docker Engine API on top of LXC / Proxmox CTs, so docker,\n docker compose, and Docker SDKs work unmodified while containers run as\n first-class LXC containers. A drop-in replacement for the Docker daemon\n socket that needs only the runtime liblxc — no build toolchain.\n' \
 		"$(BINARY)" "$(VERSION)" "$(DEB_ARCH)" > $(BUILD_DIR)/deb/DEBIAN/control
 	dpkg-deb --root-owner-group --build $(BUILD_DIR)/deb $(DEB_PKG)
 	@echo ">> built $(DEB_PKG)"

@@ -1871,6 +1871,7 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 			// leases when the CT is really up and no-ops otherwise.
 			log.Printf("StartContainer[PVE]: VMID %d (%s) started and exited immediately", vmid, id[:12])
 			m.maybeLeaseLANDHCP(id)
+			m.announceLANMac(id, vmid)
 			return nil
 		}
 		// Dump config for debugging a real failure.
@@ -1890,6 +1891,7 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 		if state == "running" {
 			log.Printf("StartContainer[PVE]: VMID %d (%s) is running", vmid, id[:12])
 			m.maybeLeaseLANDHCP(id)
+			m.announceLANMac(id, vmid)
 			return nil
 		}
 		if state == "exited" {
@@ -1942,6 +1944,72 @@ func (m *Manager) maybeLeaseLANDHCP(id string) {
 		return
 	}
 	log.Printf("LAN DHCP: leased LAN address for %s", id[:12])
+}
+
+// announceLANMac broadcasts a gratuitous ARP for a LAN-attached container's NIC
+// once it (re)starts, so the switch and LAN peers refresh their ARP cache
+// immediately. The MAC is stable across recreates (see stableLANMac), but it
+// still *changes* the first time that fix lands or whenever the derived key
+// changes — and until peers relearn it, a recreate leaves them holding stale ARP
+// for the reused static IP, so Moonlight can't reach Wolf until the entry ages
+// out. Only fires for gow.lan / gow.lan.ip containers. Best-effort, async.
+func (m *Manager) announceLANMac(id string, vmid int) {
+	rec := m.store.GetContainer(id)
+	if rec == nil {
+		return
+	}
+	if rec.Labels["gow.lan"] != "true" && strings.TrimSpace(rec.Labels["gow.lan.ip"]) == "" {
+		return
+	}
+	go m.sendGratuitousARP(id, vmid)
+}
+
+// sendGratuitousARP runs the host arping inside the container's netns (so the
+// frame's source MAC is the CT's veth MAC) for eth0's IPv4. eth0 is lxc.net.0 —
+// the physical-LAN NIC for gow.lan/host-mode CTs.
+func (m *Manager) sendGratuitousARP(id string, vmid int) {
+	// Poll for the netns PID: privileged/nested CTs (Wolf) don't expose it right
+	// away. Same ramp as maybeLeaseLANDHCP.
+	var pid int
+	deadline := time.Now().Add(9 * time.Second)
+	interval := 20 * time.Millisecond
+	for time.Now().Before(deadline) {
+		if pid = m.InitPID(id); pid > 0 {
+			break
+		}
+		time.Sleep(interval)
+		if interval < 300*time.Millisecond {
+			interval *= 2
+		}
+	}
+	if pid <= 0 {
+		return
+	}
+	ip := ethIPv4InNetns(pid, "eth0")
+	if ip == "" {
+		return // no LAN NIC / not up yet — nothing to announce
+	}
+	if out, err := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-n",
+		"arping", "-U", "-c", "3", "-I", "eth0", ip).CombinedOutput(); err != nil {
+		log.Printf("gratuitous ARP for %s (vmid %d): %v: %s", ip, vmid, err, strings.TrimSpace(string(out)))
+		return
+	}
+	log.Printf("StartContainer[PVE]: gratuitous ARP announced %s on the LAN", ip)
+}
+
+// ethIPv4InNetns returns the first IPv4 (no mask) on iface inside pid's netns.
+func ethIPv4InNetns(pid int, iface string) string {
+	out, err := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-n",
+		"ip", "-4", "-o", "addr", "show", "dev", iface).Output()
+	if err != nil {
+		return ""
+	}
+	for _, f := range strings.Fields(string(out)) {
+		if strings.Contains(f, ".") && strings.Contains(f, "/") {
+			return strings.SplitN(f, "/", 2)[0]
+		}
+	}
+	return ""
 }
 
 func (m *Manager) startLXCContainer(id string) error {
