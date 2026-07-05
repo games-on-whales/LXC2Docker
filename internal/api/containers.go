@@ -218,6 +218,15 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	// NVIDIA GPU". When requested, the daemon injects the host driver via CDI
 	// (see lxc/nvidia.go) instead of relying on a hand-populated driver volume.
 	cfg.GPU = wantsNvidiaGPU(req.HostConfig.DeviceRequests, env)
+	// The CDI injects the driver libraries into the host's multiarch dir
+	// (/usr/lib/x86_64-linux-gnu). Debian/Ubuntu images search it by default, but
+	// Fedora/Arch images (e.g. GOW steam:fedora) only search /usr/lib64, and the
+	// mount-hook ldcache update runs before the lib binds and races the app — so
+	// libnvidia-ml/libEGL_nvidia go unresolved and EGL/Vulkan crash the session.
+	// LD_LIBRARY_PATH is checked ahead of the cache and works on any distro.
+	if cfg.GPU {
+		cfg.Env = withNvidiaLibraryPath(cfg.Env)
+	}
 	cfg.ReuseVMID = reuseVMID
 
 	// Rootfs disk size: the "dld.disksize" label takes precedence over
@@ -2835,6 +2844,31 @@ func wantsNvidiaGPU(reqs []DeviceRequest, env []string) bool {
 		}
 	}
 	return false
+}
+
+// nvidiaCDILibDirs are the directories the CDI injects driver libraries into on
+// a Debian/Ubuntu host (the nvidia-ctk NVIDIA_CTK_LIBCUDA_DIR convention).
+const nvidiaCDILibDirs = "/usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu/vdpau"
+
+// withNvidiaLibraryPath ensures the driver-lib dirs are on LD_LIBRARY_PATH so
+// they resolve regardless of the container distro's default search paths. It
+// prepends to any existing LD_LIBRARY_PATH (adding one if absent) and is a no-op
+// when the dir is already present.
+func withNvidiaLibraryPath(env []string) []string {
+	for i, e := range env {
+		if v, ok := strings.CutPrefix(e, "LD_LIBRARY_PATH="); ok {
+			if strings.Contains(v, "/usr/lib/x86_64-linux-gnu") {
+				return env
+			}
+			if v == "" {
+				env[i] = "LD_LIBRARY_PATH=" + nvidiaCDILibDirs
+			} else {
+				env[i] = "LD_LIBRARY_PATH=" + nvidiaCDILibDirs + ":" + v
+			}
+			return env
+		}
+	}
+	return append(env, "LD_LIBRARY_PATH="+nvidiaCDILibDirs)
 }
 
 func mergeEnv(imageEnv, requestEnv []string) []string {
