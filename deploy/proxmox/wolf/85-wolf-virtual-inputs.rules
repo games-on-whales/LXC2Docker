@@ -1,0 +1,14 @@
+# Install on the Proxmox HOST as /etc/udev/rules.d/85-wolf-virtual-inputs.rules
+# so /dev/uinput + /dev/uhid exist with the right perms for Wolf's virtual pads.
+#   udevadm control --reload-rules && udevadm trigger
+
+# /dev/uinput (virtual joypads)
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput", TAG+="uaccess"
+# /dev/uhid (DualSense emulation)
+KERNEL=="uhid", GROUP="input", MODE="0660", TAG+="uaccess"
+# Virtual pads
+KERNEL=="hidraw*",   ATTRS{name}=="Wolf PS5 (virtual) pad", GROUP="root", MODE="0660", ENV{ID_SEAT}="seat9"
+SUBSYSTEMS=="input", ATTRS{name}=="Wolf X-Box One (virtual) pad", GROUP="root", MODE="0660", ENV{ID_SEAT}="seat9"
+SUBSYSTEMS=="input", ATTRS{name}=="Wolf PS5 (virtual) pad", GROUP="root", MODE="0660", ENV{ID_SEAT}="seat9"
+SUBSYSTEMS=="input", ATTRS{name}=="Wolf gamepad (virtual) motion sensors", GROUP="root", MODE="0660", ENV{ID_SEAT}="seat9"
+SUBSYSTEMS=="input", ATTRS{name}=="Wolf Nintendo (virtual) pad", GROUP="root", MODE="0660", ENV{ID_SEAT}="seat9"
