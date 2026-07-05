@@ -49,6 +49,13 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /run/udev:/run/udev:ro
       - ${WOLF_RUNTIME_DIR:-/run/wolf}:${WOLF_RUNTIME_DIR:-/run/wolf}
+      # Wolf (the control plane) needs the host's real /dev/input devtmpfs so it
+      # can stat the virtual pads it creates and report their true major:minor to
+      # sibling session containers — otherwise controllers arrive as 0:0 and
+      # don't work. An explicit bind here also tells docker-lxc-daemon NOT to
+      # shadow /dev/input with a private tmpfs (that isolation is for sessions,
+      # which don't bind it).
+      - /dev/input:/dev/input
 
     devices:
       - /dev/dri
