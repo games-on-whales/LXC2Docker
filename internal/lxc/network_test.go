@@ -108,3 +108,45 @@ func TestStableLANMac(t *testing.T) {
 		t.Fatalf("stableLANMac = %q, want MAC format", got)
 	}
 }
+
+// TestNetworkModeNoneIsolatesNetns verifies Docker --network none produces an
+// isolated netns (lxc.net.0.type = empty, loopback only) and NOT a routable veth
+// on the managed bridge — the isolation sandboxed workloads depend on.
+func TestNetworkModeNoneIsolatesNetns(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(*ContainerConfig, string) []configItem
+	}{
+		{"buildItems", buildItems},
+		{"buildPVEItems", buildPVEItems},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			items := tc.build(&ContainerConfig{NetworkMode: "none"}, "10.100.0.7")
+			var netType string
+			var hasVethLink, hasIP, hasGateway, hasNSClone bool
+			for _, it := range items {
+				switch it.key {
+				case "lxc.net.0.type":
+					netType = it.value
+				case "lxc.net.0.link":
+					hasVethLink = true
+				case "lxc.net.0.ipv4.address":
+					hasIP = true
+				case "lxc.net.0.ipv4.gateway":
+					hasGateway = true
+				case "lxc.namespace.clone":
+					hasNSClone = true
+				}
+			}
+			if netType != "empty" {
+				t.Errorf("lxc.net.0.type = %q, want \"empty\" (isolated netns for --network none)", netType)
+			}
+			if hasVethLink || hasIP || hasGateway {
+				t.Errorf("--network none must not get a bridge NIC: link=%v ip=%v gw=%v", hasVethLink, hasIP, hasGateway)
+			}
+			if hasNSClone {
+				t.Error("--network none is not host mode; must not emit lxc.namespace.clone")
+			}
+		})
+	}
+}
