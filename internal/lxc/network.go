@@ -439,6 +439,20 @@ func NetworkConfig(ip string) []configItem {
 	}
 }
 
+// NoNetworkConfig returns the lxc.conf lines for Docker's `--network none`: a
+// fresh, isolated network namespace containing only loopback — no veth, no IP,
+// no route out. `lxc.net.0.type = empty` is LXC's isolated-netns primitive; it is
+// NOT `= none`, which shares the HOST netns (the opposite). Without this a
+// none-mode container falls through to NetworkConfig and gets a routable veth on
+// the managed bridge, so callers that rely on `--network none` for isolation
+// (e.g. sandboxed workloads whose only intended egress is a proxy) would silently
+// get full network access.
+func NoNetworkConfig() []configItem {
+	return []configItem{
+		{"lxc.net.0.type", "empty"},
+	}
+}
+
 // DualNICConfig returns lxc.conf lines for a dual-NIC container: the LAN
 // bridge as net.0 (primary — so mDNS and other services advertise the LAN IP)
 // and the internal managed bridge as net.1 (for inter-container traffic).

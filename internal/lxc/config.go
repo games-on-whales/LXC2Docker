@@ -559,6 +559,11 @@ func buildItems(cfg *ContainerConfig, ip string) []configItem {
 		items = append(items, DualNICConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway, cfg.LANMacAddress, ip)...)
 	} else if cfg.NetworkMode == "host" {
 		// Handled below via lxc.namespace.clone.
+	} else if cfg.NetworkMode == "none" {
+		// Docker --network none: an isolated netns with only loopback — no veth,
+		// no IP, no egress. Otherwise a none-mode container would fall through to
+		// NetworkConfig below and get a routable NIC on the managed bridge.
+		items = append(items, NoNetworkConfig()...)
 	} else {
 		items = append(items, NetworkConfig(ip)...)
 	}
@@ -1389,6 +1394,11 @@ func buildPVEItems(cfg *ContainerConfig, ip string) []configItem {
 		items = append(items, DualNICConfig(cfg.LANBridge, cfg.LANIP, cfg.LANGateway, cfg.LANMacAddress, ip)...)
 	} else if cfg.NetworkMode == "host" {
 		// Handled below via lxc.namespace.clone.
+	} else if cfg.NetworkMode == "none" {
+		// Docker --network none: an isolated netns with only loopback — no veth,
+		// no IP, no egress. Otherwise a none-mode container would fall through to
+		// NetworkConfig below and get a routable NIC on the managed bridge.
+		items = append(items, NoNetworkConfig()...)
 	} else {
 		items = append(items, NetworkConfig(ip)...)
 	}
