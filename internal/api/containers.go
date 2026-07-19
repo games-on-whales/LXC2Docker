@@ -3021,44 +3021,60 @@ func (h *Handler) translateSiblingBindSource(source string) string {
 // managed container's bind-mount destination (case 1 above). Returns "" when
 // no destination matches or the translated path does not exist on the host.
 func (h *Handler) translateViaBindDest(source string) string {
-	var bestDst, bestSrc string
+	// Collect every managed container's bind mount whose destination contains
+	// `source`. Several containers can legitimately share a destination — aimee's
+	// server and kb both mount their OWN host home at /var/lib/aimee — so a single
+	// longest-destination winner is not enough: it may name the wrong container's
+	// host path (e.g. translate the server's socket to kb's home, which has no
+	// such file). Gather all candidates and disambiguate by what is really on disk.
+	type cand struct {
+		dstLen     int
+		translated string
+	}
+	var cands []cand
 	for _, rec := range h.store.ListContainers() {
 		for _, m := range rec.Mounts {
 			if m.Source == "" || m.Destination == "" {
 				continue
 			}
 			if source == m.Destination || strings.HasPrefix(source, m.Destination+"/") {
-				if len(m.Destination) > len(bestDst) {
-					bestDst, bestSrc = m.Destination, m.Source
-				}
+				cands = append(cands, cand{len(m.Destination), m.Source + source[len(m.Destination):]})
 			}
 		}
 	}
-	if bestDst == "" {
-		return ""
-	}
-	translated := bestSrc + source[len(bestDst):]
-	if _, err := os.Stat(translated); err == nil {
-		return translated
-	}
-	// The leaf did not stat. For a Unix SOCKET this is expected and transient:
-	// its owner deletes and recreates it (aimee's aimee-http.sock across a
-	// restart), so at any instant it may be absent. A bind-dest match already
-	// proves this host path is the real backing of `source`, and the socket
-	// mount only needs the parent DIRECTORY (appendSocketMount mounts the dir and
-	// symlinks the socket inside it). Requiring the socket leaf to exist would
-	// drop the translation and let the caller fall through to the /proc/<pid>/root
-	// path — which is not just PID-fragile but, when the target is itself a
-	// mountpoint (a smoothfs-backed /var/lib/aimee), CANNOT be bind-mounted across
-	// namespaces: lxc-start aborts with EINVAL and the whole container fails to
-	// start. So for a .sock leaf, accept the translation when its parent dir
-	// exists. Non-socket paths keep the strict leaf check (unchanged).
-	if strings.HasSuffix(translated, ".sock") {
-		if _, err := os.Stat(filepath.Dir(translated)); err == nil {
-			return translated
+	// Prefer the candidate whose translated LEAF actually exists: that is the
+	// container that truly holds this path. This is what disambiguates a shared
+	// destination — only the socket's real owner has the file on disk. Longest
+	// destination breaks ties among equally-real matches (most specific mount).
+	best, bestLen := "", -1
+	for _, c := range cands {
+		if _, err := os.Stat(c.translated); err == nil && c.dstLen > bestLen {
+			best, bestLen = c.translated, c.dstLen
 		}
 	}
-	return ""
+	if best != "" {
+		return best
+	}
+	// No candidate's leaf exists. For a Unix SOCKET that is expected and
+	// transient: its owner deletes and recreates it (aimee's aimee-http.sock
+	// across a restart), so at any instant it may be absent. The socket mount
+	// only needs the parent DIRECTORY (appendSocketMount mounts the dir and
+	// symlinks the socket inside it). Requiring the leaf would drop the
+	// translation and let the caller fall through to the /proc/<pid>/root path —
+	// which is not just PID-fragile but, when the target is itself a mountpoint (a
+	// smoothfs-backed /var/lib/aimee), CANNOT be bind-mounted across namespaces:
+	// lxc-start aborts with EINVAL and the container fails to start. So for a
+	// .sock source, accept the candidate whose parent directory exists (longest
+	// destination wins) so an intermittently-absent socket still resolves to a
+	// stable host path. Non-socket paths keep the strict leaf check (unchanged).
+	if strings.HasSuffix(source, ".sock") {
+		for _, c := range cands {
+			if _, err := os.Stat(filepath.Dir(c.translated)); err == nil && c.dstLen > bestLen {
+				best, bestLen = c.translated, c.dstLen
+			}
+		}
+	}
+	return best
 }
 
 // rootfsPathFor returns the host-side rootfs path for a managed container.

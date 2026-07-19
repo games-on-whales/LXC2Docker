@@ -213,3 +213,36 @@ func TestTranslateSiblingBindSourceSocketParentFallback(t *testing.T) {
 		t.Errorf("present socket leaf: got %q, want %q", got, present)
 	}
 }
+
+// TestTranslateSiblingBindSourceSharedDestPicksRealOwner covers the aimee-server
+// vs aimee-kb collision: both mount their OWN host home at the SAME destination
+// (/var/lib/aimee), but only the server actually holds aimee-http.sock. The
+// runtime must translate the socket to the server's host path, not the kb path
+// (which has no such file and would fail lxc-start with ENOENT).
+func TestTranslateSiblingBindSourceSharedDestPicksRealOwner(t *testing.T) {
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	h := &Handler{store: st}
+
+	serverHome := t.TempDir() // /mnt/<pool>/.plugins/aimee-server/home
+	kbHome := t.TempDir()     // /mnt/<pool>/.plugins/aimee-kb/kb/home
+	for _, c := range []struct{ name, home string }{{"aimee-kb", kbHome}, {"aimee-server", serverHome}} {
+		if err := st.AddContainer(&store.ContainerRecord{
+			ID: c.name, Name: c.name,
+			Mounts: []store.MountSpec{{Type: "bind", Source: c.home, Destination: "/var/lib/aimee"}},
+		}); err != nil {
+			t.Fatalf("add %s: %v", c.name, err)
+		}
+	}
+	// Only the server holds the socket.
+	serverSock := filepath.Join(serverHome, "aimee-http.sock")
+	if f, err := os.Create(serverSock); err == nil {
+		f.Close()
+	}
+
+	if got := h.translateSiblingBindSource("/var/lib/aimee/aimee-http.sock"); got != serverSock {
+		t.Errorf("shared-dest socket: got %q, want the real owner %q", got, serverSock)
+	}
+}
