@@ -2160,6 +2160,16 @@ func (m *Manager) startLXCContainer(id string) error {
 }
 
 func (m *Manager) ensureBridgeAttachment(id string) error {
+	// Bridge attachment only applies to a veth NIC on the managed bridge. A
+	// container created with `--network none` (lxc.net.0.type = empty, an
+	// isolated netns with only loopback) or `--network host` (shared host netns)
+	// has no veth, so lxc-info never reports a Link — waiting for one would fail
+	// every start of an isolated sandbox. Skip when no bridged NIC is configured.
+	if !m.hasBridgedNIC(id) {
+		log.Printf("StartContainer[LXC]: %s has no bridged NIC (isolated/host netns); skipping bridge attachment", id)
+		return nil
+	}
+
 	var link string
 	var out []byte
 	var err error
@@ -2194,6 +2204,34 @@ func (m *Manager) ensureBridgeAttachment(id string) error {
 	}
 	log.Printf("StartContainer[LXC]: attached host link %s to %s for %s", link, BridgeName, id[:12])
 	return nil
+}
+
+// hasBridgedNIC reports whether container id is configured with a veth NIC that
+// needs attaching to the managed bridge. It reads the on-disk LXC config (the
+// authority for what was actually started). When the config cannot be read it
+// returns true so attachment is still attempted (preserving prior behaviour for
+// the normal bridged path rather than silently skipping it).
+func (m *Manager) hasBridgedNIC(id string) bool {
+	data, err := os.ReadFile(filepath.Join(m.lxcPath, id, "config"))
+	if err != nil {
+		return true
+	}
+	return bridgedNICConfigured(string(data))
+}
+
+// bridgedNICConfigured is the pure parser behind hasBridgedNIC: true only when
+// the config declares `lxc.net.0.type = veth`. `empty` (--network none), `none`
+// (--network host), or the absence of any lxc.net.0.type all mean no veth to
+// attach to the bridge.
+func bridgedNICConfigured(configText string) bool {
+	for _, line := range strings.Split(configText, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) != "lxc.net.0.type" {
+			continue
+		}
+		return strings.TrimSpace(value) == "veth"
+	}
+	return false
 }
 
 func lxcInfoLink(out string) string {

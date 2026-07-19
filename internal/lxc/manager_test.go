@@ -166,6 +166,27 @@ Link:           vethABCDEF
 	}
 }
 
+func TestBridgedNICConfigured(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		cfg  string
+		want bool
+	}{
+		{"veth bridged", "lxc.net.0.type = veth\nlxc.net.0.link = br0\n", true},
+		{"network none (empty)", "lxc.rootfs.path = dir:/x\nlxc.net.0.type = empty\n", false},
+		{"network host (none)", "lxc.net.0.type = none\n", false},
+		{"no network configured", "lxc.rootfs.path = dir:/x\nlxc.uts.name = c\n", false},
+		{"veth without spaces", "lxc.net.0.type=veth\n", true},
+	}
+	for _, tc := range cases {
+		if got := bridgedNICConfigured(tc.cfg); got != tc.want {
+			t.Errorf("%s: bridgedNICConfigured = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestBuildResolvConfUsesHostNameservers(t *testing.T) {
 	dir := t.TempDir()
 	hostResolv := filepath.Join(dir, "resolv.conf")
