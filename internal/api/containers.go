@@ -3038,10 +3038,27 @@ func (h *Handler) translateViaBindDest(source string) string {
 		return ""
 	}
 	translated := bestSrc + source[len(bestDst):]
-	if _, err := os.Stat(translated); err != nil {
-		return ""
+	if _, err := os.Stat(translated); err == nil {
+		return translated
 	}
-	return translated
+	// The leaf did not stat. For a Unix SOCKET this is expected and transient:
+	// its owner deletes and recreates it (aimee's aimee-http.sock across a
+	// restart), so at any instant it may be absent. A bind-dest match already
+	// proves this host path is the real backing of `source`, and the socket
+	// mount only needs the parent DIRECTORY (appendSocketMount mounts the dir and
+	// symlinks the socket inside it). Requiring the socket leaf to exist would
+	// drop the translation and let the caller fall through to the /proc/<pid>/root
+	// path — which is not just PID-fragile but, when the target is itself a
+	// mountpoint (a smoothfs-backed /var/lib/aimee), CANNOT be bind-mounted across
+	// namespaces: lxc-start aborts with EINVAL and the whole container fails to
+	// start. So for a .sock leaf, accept the translation when its parent dir
+	// exists. Non-socket paths keep the strict leaf check (unchanged).
+	if strings.HasSuffix(translated, ".sock") {
+		if _, err := os.Stat(filepath.Dir(translated)); err == nil {
+			return translated
+		}
+	}
+	return ""
 }
 
 // rootfsPathFor returns the host-side rootfs path for a managed container.

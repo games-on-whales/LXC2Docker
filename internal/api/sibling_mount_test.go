@@ -165,3 +165,51 @@ func TestEnsureRuntimeDirMount(t *testing.T) {
 		t.Error("relative XDG_RUNTIME_DIR should produce no mount")
 	}
 }
+
+// TestTranslateSiblingBindSourceSocketParentFallback covers the aimee case: a
+// sibling passes an in-container Unix-socket path whose leaf is transiently
+// absent (the socket's owner deletes/recreates it). Because a .sock leaf only
+// needs its parent directory (the socket dir is what gets mounted), the runtime
+// must still resolve it to the stable host path rather than fall through to the
+// unmountable /proc/<pid>/root path.
+func TestTranslateSiblingBindSourceSocketParentFallback(t *testing.T) {
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	h := &Handler{store: st}
+
+	hostHome := t.TempDir() // stands in for /mnt/<pool>/.plugins/aimee-server/home
+	if err := st.AddContainer(&store.ContainerRecord{
+		ID:   "aimee-server",
+		Name: "aimee-server",
+		Mounts: []store.MountSpec{
+			{Type: "bind", Source: hostHome, Destination: "/var/lib/aimee"},
+		},
+	}); err != nil {
+		t.Fatalf("add container: %v", err)
+	}
+
+	// The socket LEAF does not exist (recreated on restart), but its parent dir
+	// (the bind root) does. A .sock source must still translate to the host path.
+	wantHostSock := filepath.Join(hostHome, "aimee-http.sock")
+	if got := h.translateSiblingBindSource("/var/lib/aimee/aimee-http.sock"); got != wantHostSock {
+		t.Errorf("absent socket leaf: got %q, want stable host path %q", got, wantHostSock)
+	}
+
+	// A NON-socket missing leaf under the same bind is still left untouched: the
+	// parent-dir fallback is socket-only, so general missing paths are unaffected.
+	const missing = "/var/lib/aimee/not-a-socket-file"
+	if got := h.translateSiblingBindSource(missing); got != missing {
+		t.Errorf("non-socket missing leaf should not translate: got %q", got)
+	}
+
+	// A present socket leaf translates too (the ordinary case).
+	present := filepath.Join(hostHome, "present.sock")
+	if f, err := os.Create(present); err == nil {
+		f.Close()
+	}
+	if got := h.translateSiblingBindSource("/var/lib/aimee/present.sock"); got != present {
+		t.Errorf("present socket leaf: got %q, want %q", got, present)
+	}
+}
