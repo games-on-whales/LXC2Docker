@@ -761,6 +761,44 @@ func networkSettingsFor(rec *store.ContainerRecord) map[string]EndpointSettings 
 	return buildContainerEndpoints(rec)
 }
 
+// isNoneNetworkMode reports whether the container was created with --network none,
+// as persisted in its raw HostConfig. canonicalNetworkName leaves "none" intact,
+// so an exact match is sufficient.
+func isNoneNetworkMode(rec *store.ContainerRecord) bool {
+	if len(rec.RawHostConfig) == 0 {
+		return false
+	}
+	var hc HostConfig
+	if err := json.Unmarshal(rec.RawHostConfig, &hc); err != nil {
+		return false
+	}
+	return strings.TrimSpace(hc.NetworkMode) == "none"
+}
+
+// inspectNetworkSettings builds the NetworkSettings for a container inspect.
+// A --network none container runs in an isolated netns (loopback only, no veth,
+// no route out — see NoNetworkConfig / lxc.net.0.type=empty), so it is reported
+// as networkless: no managed-bridge address, gateway, or endpoint. The record
+// still carries a VMID-derived IP for internal bookkeeping, but surfacing it here
+// falsely advertised egress and tripped isolation probes (a genuinely isolated
+// sandbox was rejected). {"none":{}} matches Docker's own --network none inspect.
+func inspectNetworkSettings(rec *store.ContainerRecord, ports map[string][]PortBinding) NetworkSettings {
+	if isNoneNetworkMode(rec) {
+		return NetworkSettings{
+			Ports:    ports,
+			Networks: map[string]EndpointSettings{"none": {}},
+		}
+	}
+	return NetworkSettings{
+		Bridge:      lxc.BridgeName,
+		IPAddress:   rec.IPAddress,
+		IPPrefixLen: 24,
+		Gateway:     lxc.BridgeGW,
+		Ports:       ports,
+		Networks:    networkSettingsFor(rec),
+	}
+}
+
 // GET /containers/{id}/json
 func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
@@ -900,14 +938,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			Healthcheck:  healthcheckFrom(rec),
 		}),
 		HostConfig: buildHostConfig(rec),
-		NetworkSettings: NetworkSettings{
-			Bridge:      lxc.BridgeName,
-			IPAddress:   rec.IPAddress,
-			IPPrefixLen: 24,
-			Gateway:     lxc.BridgeGW,
-			Ports:       ports,
-			Networks:    networkSettingsFor(rec),
-		},
+		NetworkSettings: inspectNetworkSettings(rec, ports),
 	}
 	if boolValue(r, "size") {
 		sz := rootfsSize(h.mgr.RootfsPath(id))
