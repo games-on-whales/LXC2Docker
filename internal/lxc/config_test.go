@@ -138,6 +138,36 @@ func TestAppendSocketMountKeepsHiddenSocketMountForTranslatedDestinations(t *tes
 	}
 }
 
+// A socket's parent directory, created under a restrictive umask (e.g. 0750), must
+// be made traversable so a non-root plugin uid inside the container can descend to
+// the socket — otherwise it gets EACCES even though the socket itself is 0777.
+func TestAppendSocketMountMakesParentDirTraversable(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	runtime := filepath.Join(base, "smoothnas-runtime")
+	if err := os.Mkdir(runtime, 0o750); err != nil { // umask-stripped: not world/group traversable
+		t.Fatal(err)
+	}
+	sock := filepath.Join(runtime, "docker.sock")
+	if err := os.WriteFile(sock, nil, 0o600); err != nil { // stand-in for the socket file
+		t.Fatal(err)
+	}
+
+	_ = appendSocketMount(nil, &ContainerConfig{}, sock, MountSpec{
+		Source:      sock,
+		Destination: "/var/run/docker.sock",
+	})
+
+	fi, err := os.Stat(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o055 != 0o055 {
+		t.Fatalf("socket parent dir not traversable by group/other after appendSocketMount: mode=%04o", perm)
+	}
+}
+
 func TestBuildItemsAppendsRawConfig(t *testing.T) {
 	t.Parallel()
 

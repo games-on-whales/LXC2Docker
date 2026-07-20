@@ -1151,6 +1151,21 @@ func appendSocketMount(items []configItem, cfg *ContainerConfig, source string, 
 	socketName := filepath.Base(source)
 	destParent := filepath.Dir(m.Destination)
 
+	// A world-accessible socket is still unreachable if its directory is not
+	// traversable. Each LXC container has its own UID view, so a plugin process
+	// running as a NON-ROOT uid must be able to descend into the socket's parent
+	// to connect(). That parent is typically created under the daemon's service
+	// umask (systemd hardening commonly sets UMask=0027), which strips group/other
+	// execute and leaves e.g. /run/smoothnas-runtime at 0750 — the plugin uid then
+	// gets EACCES on the socket path even though the socket itself is 0777
+	// (observed: a non-root aimee-server plugin could not reach the runtime
+	// docker.sock after every runtime restart, until the dir was chmod'd by hand).
+	// Add group+other r-x to the parent, preserving owner bits; Chmod ignores the
+	// umask. Run on every container (re)creation, so it self-heals across restarts.
+	if fi, err := os.Stat(parentDir); err == nil {
+		os.Chmod(parentDir, fi.Mode().Perm()|0o055)
+	}
+
 	// When a socket is mounted back into the same runtime directory path
 	// (for example /run/user/wolf/wayland-1 -> /run/user/wolf/wayland-1),
 	// mount the runtime directory itself at the real destination path.
