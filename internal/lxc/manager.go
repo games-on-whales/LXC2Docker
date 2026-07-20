@@ -2012,8 +2012,115 @@ func ethIPv4InNetns(pid int, iface string) string {
 	return ""
 }
 
+// procRootRel reports whether src is a sibling-namespace bind source of the form
+// /proc/<pid>/root/<rel> (how translateViaContainerRootfs resolves a path that
+// only exists inside another container's live mount namespace). It returns the
+// in-container relative path (no leading slash) and true when it matches.
+func procRootRel(src string) (string, bool) {
+	const p = "/proc/"
+	if !strings.HasPrefix(src, p) {
+		return "", false
+	}
+	rest := src[len(p):] // "<pid>/root/<rel>"
+	slash := strings.IndexByte(rest, '/')
+	if slash <= 0 {
+		return "", false
+	}
+	if _, err := strconv.Atoi(rest[:slash]); err != nil {
+		return "", false
+	}
+	rest = rest[slash:] // "/root/<rel>"
+	const r = "/root/"
+	if !strings.HasPrefix(rest, r) {
+		return "", false
+	}
+	rel := rest[len(r):]
+	if rel == "" {
+		return "", false
+	}
+	return rel, true
+}
+
+// resolveProcRoot returns /proc/<pid>/root/<rel> for the first CURRENTLY-running
+// managed container whose live mount namespace exposes /<rel>. It mirrors the API
+// layer's Pass-2 rootfs resolution, but is run at start with fresh PIDs so it
+// never returns a path rooted at a dead process.
+func (m *Manager) resolveProcRoot(rel string) string {
+	for _, rec := range m.store.ListContainers() {
+		pid := m.InitPID(rec.ID)
+		if pid <= 0 {
+			continue
+		}
+		cand := fmt.Sprintf("/proc/%d/root/%s", pid, rel)
+		if _, err := os.Stat(cand); err == nil {
+			return cand
+		}
+	}
+	return ""
+}
+
+// refreshProcMountSources rewrites lxc.mount.entry sources of the form
+// /proc/<pid>/root/<rel> whose PID has since exited, immediately before
+// lxc-start. Such a source is resolved at CREATE time against a sibling
+// container's live mount namespace (translateViaContainerRootfs Pass 2); by the
+// time the container starts, that PID is often gone — the sibling exited, or the
+// path's owner restarted — and lxc-start then fails to mount it with EINVAL,
+// which surfaces as an intermittent "container failed to start". Re-resolving
+// each stale source against a container that is running RIGHT NOW closes the
+// create->start staleness window. A source whose PID is still alive is left
+// untouched; one that cannot be re-resolved (no live provider) is left as-is so
+// the original failure and its log are preserved.
+func (m *Manager) refreshProcMountSources(id string) {
+	cfgPath := filepath.Join(m.lxcPath, id, "config")
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	changed := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "lxc.mount.entry") {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "lxc.mount.entry"))
+		rest = strings.TrimSpace(strings.TrimPrefix(rest, "="))
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			continue
+		}
+		src := strings.ReplaceAll(fields[0], `\040`, " ")
+		rel, ok := procRootRel(src)
+		if !ok {
+			continue
+		}
+		if _, err := os.Stat(src); err == nil {
+			continue // PID still alive; the mount will resolve
+		}
+		fresh := m.resolveProcRoot(rel)
+		if fresh == "" || fresh == src {
+			continue
+		}
+		fields[0] = strings.ReplaceAll(fresh, " ", `\040`)
+		lines[i] = "lxc.mount.entry = " + strings.Join(fields, " ")
+		changed = true
+		short := id
+		if len(short) > 12 {
+			short = short[:12]
+		}
+		log.Printf("StartContainer[LXC]: %s: re-resolved stale mount source %s -> %s", short, src, fresh)
+	}
+	if !changed {
+		return
+	}
+	if err := os.WriteFile(cfgPath, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		log.Printf("StartContainer[LXC]: %s: rewrite config after mount re-resolve: %v", id, err)
+	}
+}
+
 func (m *Manager) startLXCContainer(id string) error {
-	m.applyChownLabels(id) // fix shared bind-mount ownership before init runs
+	m.applyChownLabels(id)        // fix shared bind-mount ownership before init runs
+	m.refreshProcMountSources(id) // re-point stale /proc/<pid>/root bind sources
 	log.Printf("StartContainer[LXC]: starting %s", id)
 	// -d (daemonize): modern lxc-start runs in the FOREGROUND by default, which
 	// would block here until the container exits. Daemonize so the call returns
@@ -2053,6 +2160,16 @@ func (m *Manager) startLXCContainer(id string) error {
 }
 
 func (m *Manager) ensureBridgeAttachment(id string) error {
+	// Bridge attachment only applies to a veth NIC on the managed bridge. A
+	// container created with `--network none` (lxc.net.0.type = empty, an
+	// isolated netns with only loopback) or `--network host` (shared host netns)
+	// has no veth, so lxc-info never reports a Link — waiting for one would fail
+	// every start of an isolated sandbox. Skip when no bridged NIC is configured.
+	if !m.hasBridgedNIC(id) {
+		log.Printf("StartContainer[LXC]: %s has no bridged NIC (isolated/host netns); skipping bridge attachment", id)
+		return nil
+	}
+
 	var link string
 	var out []byte
 	var err error
@@ -2087,6 +2204,34 @@ func (m *Manager) ensureBridgeAttachment(id string) error {
 	}
 	log.Printf("StartContainer[LXC]: attached host link %s to %s for %s", link, BridgeName, id[:12])
 	return nil
+}
+
+// hasBridgedNIC reports whether container id is configured with a veth NIC that
+// needs attaching to the managed bridge. It reads the on-disk LXC config (the
+// authority for what was actually started). When the config cannot be read it
+// returns true so attachment is still attempted (preserving prior behaviour for
+// the normal bridged path rather than silently skipping it).
+func (m *Manager) hasBridgedNIC(id string) bool {
+	data, err := os.ReadFile(filepath.Join(m.lxcPath, id, "config"))
+	if err != nil {
+		return true
+	}
+	return bridgedNICConfigured(string(data))
+}
+
+// bridgedNICConfigured is the pure parser behind hasBridgedNIC: true only when
+// the config declares `lxc.net.0.type = veth`. `empty` (--network none), `none`
+// (--network host), or the absence of any lxc.net.0.type all mean no veth to
+// attach to the bridge.
+func bridgedNICConfigured(configText string) bool {
+	for _, line := range strings.Split(configText, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) != "lxc.net.0.type" {
+			continue
+		}
+		return strings.TrimSpace(value) == "veth"
+	}
+	return false
 }
 
 func lxcInfoLink(out string) string {

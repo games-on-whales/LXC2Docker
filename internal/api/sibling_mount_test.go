@@ -165,3 +165,84 @@ func TestEnsureRuntimeDirMount(t *testing.T) {
 		t.Error("relative XDG_RUNTIME_DIR should produce no mount")
 	}
 }
+
+// TestTranslateSiblingBindSourceSocketParentFallback covers the aimee case: a
+// sibling passes an in-container Unix-socket path whose leaf is transiently
+// absent (the socket's owner deletes/recreates it). Because a .sock leaf only
+// needs its parent directory (the socket dir is what gets mounted), the runtime
+// must still resolve it to the stable host path rather than fall through to the
+// unmountable /proc/<pid>/root path.
+func TestTranslateSiblingBindSourceSocketParentFallback(t *testing.T) {
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	h := &Handler{store: st}
+
+	hostHome := t.TempDir() // stands in for /mnt/<pool>/.plugins/aimee-server/home
+	if err := st.AddContainer(&store.ContainerRecord{
+		ID:   "aimee-server",
+		Name: "aimee-server",
+		Mounts: []store.MountSpec{
+			{Type: "bind", Source: hostHome, Destination: "/var/lib/aimee"},
+		},
+	}); err != nil {
+		t.Fatalf("add container: %v", err)
+	}
+
+	// The socket LEAF does not exist (recreated on restart), but its parent dir
+	// (the bind root) does. A .sock source must still translate to the host path.
+	wantHostSock := filepath.Join(hostHome, "aimee-http.sock")
+	if got := h.translateSiblingBindSource("/var/lib/aimee/aimee-http.sock"); got != wantHostSock {
+		t.Errorf("absent socket leaf: got %q, want stable host path %q", got, wantHostSock)
+	}
+
+	// A NON-socket missing leaf under the same bind is still left untouched: the
+	// parent-dir fallback is socket-only, so general missing paths are unaffected.
+	const missing = "/var/lib/aimee/not-a-socket-file"
+	if got := h.translateSiblingBindSource(missing); got != missing {
+		t.Errorf("non-socket missing leaf should not translate: got %q", got)
+	}
+
+	// A present socket leaf translates too (the ordinary case).
+	present := filepath.Join(hostHome, "present.sock")
+	if f, err := os.Create(present); err == nil {
+		f.Close()
+	}
+	if got := h.translateSiblingBindSource("/var/lib/aimee/present.sock"); got != present {
+		t.Errorf("present socket leaf: got %q, want %q", got, present)
+	}
+}
+
+// TestTranslateSiblingBindSourceSharedDestPicksRealOwner covers the aimee-server
+// vs aimee-kb collision: both mount their OWN host home at the SAME destination
+// (/var/lib/aimee), but only the server actually holds aimee-http.sock. The
+// runtime must translate the socket to the server's host path, not the kb path
+// (which has no such file and would fail lxc-start with ENOENT).
+func TestTranslateSiblingBindSourceSharedDestPicksRealOwner(t *testing.T) {
+	st, err := store.NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	h := &Handler{store: st}
+
+	serverHome := t.TempDir() // /mnt/<pool>/.plugins/aimee-server/home
+	kbHome := t.TempDir()     // /mnt/<pool>/.plugins/aimee-kb/kb/home
+	for _, c := range []struct{ name, home string }{{"aimee-kb", kbHome}, {"aimee-server", serverHome}} {
+		if err := st.AddContainer(&store.ContainerRecord{
+			ID: c.name, Name: c.name,
+			Mounts: []store.MountSpec{{Type: "bind", Source: c.home, Destination: "/var/lib/aimee"}},
+		}); err != nil {
+			t.Fatalf("add %s: %v", c.name, err)
+		}
+	}
+	// Only the server holds the socket.
+	serverSock := filepath.Join(serverHome, "aimee-http.sock")
+	if f, err := os.Create(serverSock); err == nil {
+		f.Close()
+	}
+
+	if got := h.translateSiblingBindSource("/var/lib/aimee/aimee-http.sock"); got != serverSock {
+		t.Errorf("shared-dest socket: got %q, want the real owner %q", got, serverSock)
+	}
+}
