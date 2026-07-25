@@ -977,15 +977,12 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		h.store.AddContainer(rec)
 	}
 
-	// Refresh StartedAt (Docker updates it on every start, not just the
-	// first), clear the user-stopped flag so the restart watcher enforces
-	// the policy again on subsequent exits, and clear FinishedAt now that
-	// the container is running again.
-	if rec := h.store.GetContainer(id); rec != nil {
-		now := time.Now()
-		rec.StartedAt = &now
+	// StartedAt/FinishedAt are stamped by StartContainer, which every start
+	// path funnels through. StoppedByUser stays here: it records *user* intent,
+	// so only an explicit API start clears it — a restart-policy convergence
+	// must not silently un-stop a container the user stopped by hand.
+	if rec := h.store.GetContainer(id); rec != nil && rec.StoppedByUser {
 		rec.StoppedByUser = false
-		rec.FinishedAt = nil
 		h.store.AddContainer(rec)
 	}
 
