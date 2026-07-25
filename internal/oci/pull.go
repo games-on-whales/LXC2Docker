@@ -26,6 +26,11 @@ type ImageConfig struct {
 	Ports      []string          // e.g. ["80/tcp", "443/tcp"]
 	Labels     map[string]string // OCI image labels (rendered in Portainer's image detail)
 	Digest     string            // manifest digest, "sha256:..." (empty if unknown)
+	// ConfigDigest is the sha256 of the image's config blob — the value Docker
+	// exposes as the image ID. Without it, pulled images fall back to the
+	// tag-derived pseudo-ID ("oci_ghcr_io_org_app_tag"), which is not content
+	// addressed: two different images pushed to the same tag share one ID.
+	ConfigDigest string
 }
 
 // ProgressEvent represents a single line of pull progress emitted to the
@@ -482,12 +487,13 @@ func parseImageConfig(ociDir, tag string) (*ImageConfig, error) {
 	}
 
 	return &ImageConfig{
-		Entrypoint: imgCfg.Config.Entrypoint,
-		Cmd:        imgCfg.Config.Cmd,
-		Env:        imgCfg.Config.Env,
-		WorkingDir: imgCfg.Config.WorkingDir,
-		Ports:      ports,
-		Labels:     imgCfg.Config.Labels,
+		Entrypoint:   imgCfg.Config.Entrypoint,
+		Cmd:          imgCfg.Config.Cmd,
+		Env:          imgCfg.Config.Env,
+		WorkingDir:   imgCfg.Config.WorkingDir,
+		Ports:        ports,
+		Labels:       imgCfg.Config.Labels,
+		ConfigDigest: manifest.Config.Digest,
 	}, nil
 }
 
