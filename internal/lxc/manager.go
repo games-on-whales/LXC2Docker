@@ -1193,6 +1193,7 @@ lxc.uts.name = %s
 			OCIPorts:      cfg.Ports,
 			OCILabels:     cfg.Labels,
 			RepoDigest:    repoDigest,
+			ConfigDigest:  cfg.ConfigDigest,
 		}); err == nil {
 			os.WriteFile(filepath.Join(templateDir, "oci-meta.json"), data, 0o644)
 		}
@@ -1214,6 +1215,11 @@ lxc.uts.name = %s
 		OCIPorts:        cfg.Ports,
 		OCILabels:       cfg.Labels,
 		RepoDigest:      repoDigest,
+		// The config-blob sha256 is Docker's image ID. Build and commit already
+		// compute one (imageDisplayID falls back to the tag-derived "oci_…"
+		// pseudo-ID without it); pulls get it straight from the manifest, so
+		// `docker images`/`inspect` report a real content hash for every image.
+		ConfigDigest: cfg.ConfigDigest,
 	}
 	if err := m.store.AddImage(imgRec); err != nil {
 		return err
@@ -1816,6 +1822,14 @@ func (m *Manager) StartContainer(id string) error {
 		err = m.startLXCContainer(id)
 	}
 	if err == nil {
+		// Stamp StartedAt here for the same reason ensurePortForwards lives
+		// here: the API /start handler is not the only start path. The
+		// restart-policy watcher and the startup reconcile call StartContainer
+		// directly, and a container they bring up used to keep StartedAt nil —
+		// so `docker inspect` reported the Go zero time (0001-01-01T00:00:00Z)
+		// for a plainly-running container, and the watcher kept treating it as
+		// "never started", which skips restart-policy handling entirely.
+		m.stampStarted(id)
 		// Peers learn this container's (possibly reassigned) IP.
 		m.syncHosts()
 		// (Re)publish the container's port forwards. Every start path funnels
@@ -1830,6 +1844,22 @@ func (m *Manager) StartContainer(id string) error {
 		m.ensurePortForwards(id)
 	}
 	return err
+}
+
+// stampStarted records the start time on a container that just came up, and
+// clears the previous run's exit time. Docker refreshes StartedAt on every
+// start, not just the first, so this re-stamps on restarts too.
+func (m *Manager) stampStarted(id string) {
+	rec := m.store.GetContainer(id)
+	if rec == nil {
+		return
+	}
+	now := time.Now()
+	rec.StartedAt = &now
+	rec.FinishedAt = nil
+	if err := m.store.AddContainer(rec); err != nil {
+		log.Printf("StartContainer: persist StartedAt for %s: %v", shortID(id), err)
+	}
 }
 
 // ensurePortForwards (re)applies all of a container's published-port DNAT rules
