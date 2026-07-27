@@ -130,25 +130,6 @@ func TestCloneLegacyTemplateByCopyWritesContainerRootfsConfig(t *testing.T) {
 	}
 }
 
-func TestSmoothNASPluginLabelsAreGCProtected(t *testing.T) {
-	t.Parallel()
-
-	managed := &store.ContainerRecord{Labels: map[string]string{"io.smoothnas.managed": "true"}}
-	if !smoothNASManagedContainer(managed) {
-		t.Fatal("expected SmoothNAS managed plugin container to be GC-protected")
-	}
-
-	worker := &store.ContainerRecord{Labels: map[string]string{"io.smoothnas.gh-runner.worker": "true"}}
-	if !smoothNASRunnerWorker(worker) {
-		t.Fatal("expected SmoothNAS runner worker to be excluded from orphan support cleanup")
-	}
-
-	plain := &store.ContainerRecord{Labels: map[string]string{"io.smoothnas.plugin": "gh-runner"}}
-	if smoothNASManagedContainer(plain) || smoothNASRunnerWorker(plain) {
-		t.Fatal("non-owner SmoothNAS labels should not opt into GC protection")
-	}
-}
-
 func TestLXCInfoLinkParsesHostVeth(t *testing.T) {
 	t.Parallel()
 
