@@ -67,8 +67,15 @@ func TestResolveKnownApp(t *testing.T) {
 	if got.TemplateContainerName != "__template_app_nginx_latest" {
 		t.Fatalf("unexpected template name %q", got.TemplateContainerName)
 	}
-	if got.BaseRef != "debian:bookworm" {
+	if got.BaseRef != "images.linuxcontainers.org/debian:bookworm" {
 		t.Fatalf("unexpected base ref %q", got.BaseRef)
+	}
+	base, err := Resolve(got.BaseRef, "", false)
+	if err != nil {
+		t.Fatalf("Resolve(app BaseRef) returned error: %v", err)
+	}
+	if base.Kind != KindDistro || base.Distro != "debian" || base.Release != "bookworm" {
+		t.Fatalf("app BaseRef resolved to %+v, want debian/bookworm KindDistro", base)
 	}
 }
 
