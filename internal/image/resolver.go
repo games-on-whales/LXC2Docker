@@ -22,8 +22,9 @@ type ResolvedImage struct {
 	Arch string
 	// App is populated only for KindApp; it describes the packages to install.
 	App *AppDef
-	// BaseRef is populated only for KindApp; it is the base image reference
-	// that must be resolved and pulled before this image can be built.
+	// BaseRef is populated only for KindApp; it is the explicit
+	// images.linuxcontainers.org base reference that must be resolved and
+	// pulled before this image can be built.
 	BaseRef string
 	// TemplateContainerName is the LXC container name used as the clone
 	// source for this image, e.g. "__template_ubuntu_22.04".
@@ -90,6 +91,12 @@ func Resolve(ref, arch string, preferOCI bool) (*ResolvedImage, error) {
 				return nil, fmt.Errorf("image: app %q has unknown base %q", name, def.Base)
 			}
 			appDef := def // copy
+			// Bare distro names deliberately resolve as OCI images. App
+			// shortcuts, however, are built by cloning an LXC download
+			// template, so make that internal intent explicit. Without the
+			// host prefix pullApp resolves this as KindOCI and then invokes
+			// pullDistro with empty distro/release fields.
+			baseRef := "images.linuxcontainers.org/" + def.Base
 			return &ResolvedImage{
 				Ref:                   ref,
 				Kind:                  KindApp,
@@ -97,7 +104,7 @@ func Resolve(ref, arch string, preferOCI bool) (*ResolvedImage, error) {
 				Release:               baseRelease,
 				Arch:                  arch,
 				App:                   &appDef,
-				BaseRef:               def.Base,
+				BaseRef:               baseRef,
 				TemplateContainerName: appTemplateName(name, tag),
 			}, nil
 		}

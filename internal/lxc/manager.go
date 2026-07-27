@@ -188,11 +188,10 @@ func (m *Manager) reconcile() {
 	}
 }
 
-// StartGC launches a background goroutine that periodically removes stopped
-// ephemeral containers. Compose-managed services (those with Docker Compose
-// labels) and Proxmox CTs (VMID > 0) are left alone. This handles the common
-// case where Wolf sessions end abnormally (e.g. daemon restart) and child
-// containers (PulseAudio, Steam, Wolf-UI) are left behind.
+// StartGC launches a background goroutine that periodically removes exited
+// AutoRemove containers. It deliberately does not infer ownership or orphan
+// status from container names: matching Docker means a running container is
+// never reaped, and an exited container persists unless AutoRemove was set.
 func (m *Manager) StartGC(ctx context.Context) {
 	go func() {
 		// Run immediately on startup to clean leftovers, then periodically.
@@ -736,68 +735,13 @@ func shouldStartNeverStarted(rec *store.ContainerRecord) bool {
 }
 
 func (m *Manager) gc() {
-	// Separate ephemeral containers into stopped (remove immediately) and
-	// running (check for orphans).
-	var stopped []*store.ContainerRecord
-	var runningSession []*store.ContainerRecord // Wolf-UI, WolfSteam, etc.
-	var runningSupport []*store.ContainerRecord // WolfPulseAudio, etc.
-
 	for _, rec := range m.store.ListContainers() {
-		// Never touch Proxmox CTs or compose-managed services.
-		if rec.VMID > 0 {
-			continue
-		}
-		if rec.Labels != nil {
-			if _, ok := rec.Labels["com.docker.compose.service"]; ok {
-				continue
-			}
-		}
-		if smoothNASManagedContainer(rec) {
-			continue
-		}
-		// Never touch transient image-build containers. The classic builder runs
-		// each RUN step inside an ephemeral "build-<id>" LXC container; without
-		// this the GC classifies it as an orphaned support container (no "_" in
-		// the name, no session container present) and kills it mid-build —
-		// SIGKILL surfaces to the build as "RUN failed: exit status 137". The
-		// builder is torn down by the build flow itself (finalize / cleanupTemp).
-		if strings.HasPrefix(rec.ID, "build-") || strings.HasPrefix(rec.Name, "build-") {
-			continue
-		}
-
 		state, _ := m.State(rec.ID)
-		if state == "exited" {
-			// A container that has never been started also reads as "exited"
-			// (lxc-info returns nothing for a not-yet-running or still-being-
-			// created CT). It is really in "created" state: a `docker run` is
-			// mid-flight between the create and start calls, and a slow image
-			// clone (e.g. a freshly built image whose template dataset has to be
-			// materialized first) can stretch that window to several seconds.
-			// Reaping it here deletes the container out from under the imminent
-			// attach/start, which then 404s. Only ephemeral containers that have
-			// actually run and exited are eligible for GC — this mirrors
-			// enforceRestartPolicies, which already skips never-started CTs.
-			if rec.StartedAt == nil {
-				continue
-			}
-			stopped = append(stopped, rec)
-		} else if state == "running" {
-			if smoothNASRunnerWorker(rec) {
-				continue
-			}
-			// Session containers have unique per-session names (Wolf-UI_<id>,
-			// WolfSteam_<id>). Support containers are generic (WolfPulseAudio).
-			if strings.Contains(rec.Name, "_") {
-				runningSession = append(runningSession, rec)
-			} else {
-				runningSupport = append(runningSupport, rec)
-			}
+		if !shouldGarbageCollect(rec, state) {
+			continue
 		}
-	}
 
-	// Remove all stopped ephemeral containers.
-	for _, rec := range stopped {
-		log.Printf("GC: removing stopped container %s (%s)", rec.Name, rec.ID[:12])
+		log.Printf("GC: removing exited AutoRemove container %s (%s)", rec.Name, rec.ID[:12])
 		if rec.IPAddress != "" {
 			RemovePortForwards(rec.IPAddress)
 		}
@@ -805,62 +749,15 @@ func (m *Manager) gc() {
 			log.Printf("GC: failed to remove %s: %v", rec.ID[:12], err)
 		}
 	}
-
-	// Orphan detection: if there are support containers (PulseAudio) but
-	// no session containers AND no running owner, the support containers
-	// are orphans from sessions that ended abnormally.
-	//
-	// A long-running owner spawns support containers (PulseAudio) via the
-	// Docker API and keeps them for the lifetime of the owner, even while
-	// idle (before any session). We must not reap them while the owner runs.
-	// Two owner deployment models exist:
-	//   - a Proxmox CT (VMID > 0), e.g. Wolf running as a PVE CT; and
-	//   - a SmoothNAS-managed container (io.smoothnas.managed=true), e.g.
-	//     Wolf running as a managed LXC2Docker container rather than a PVE
-	//     CT. That same label already exempts the owner itself from GC above.
-	if len(runningSession) == 0 && len(runningSupport) > 0 {
-		ownerRunning := false
-		for _, rec := range m.store.ListContainers() {
-			isOwner := rec.VMID > 0 || smoothNASManagedContainer(rec)
-			if !isOwner {
-				continue
-			}
-			if st, _ := m.State(rec.ID); st == "running" {
-				ownerRunning = true
-				break
-			}
-		}
-		if !ownerRunning {
-			for _, rec := range runningSupport {
-				log.Printf("GC: stopping orphaned container %s (%s, image=%s)",
-					rec.Name, rec.ID[:12], rec.Image)
-				if err := m.StopContainer(rec.ID, 5*time.Second); err != nil {
-					log.Printf("GC: failed to stop %s: %v", rec.ID[:12], err)
-					continue
-				}
-				if rec.IPAddress != "" {
-					RemovePortForwards(rec.IPAddress)
-				}
-				if err := m.RemoveContainer(rec.ID); err != nil {
-					log.Printf("GC: failed to remove %s: %v", rec.ID[:12], err)
-				}
-			}
-		}
-	}
 }
 
-func smoothNASManagedContainer(rec *store.ContainerRecord) bool {
-	if rec == nil || rec.Labels == nil {
-		return false
-	}
-	return rec.Labels["io.smoothnas.managed"] == "true"
-}
-
-func smoothNASRunnerWorker(rec *store.ContainerRecord) bool {
-	if rec == nil || rec.Labels == nil {
-		return false
-	}
-	return rec.Labels["io.smoothnas.gh-runner.worker"] == "true"
+// shouldGarbageCollect captures Docker's --rm lifecycle contract. A container
+// is eligible only after it has actually started and subsequently exited with
+// AutoRemove enabled. Names, labels, ownership, and elapsed time do not alter
+// that decision. In particular, running containers and persistent exited
+// containers are never garbage-collected.
+func shouldGarbageCollect(rec *store.ContainerRecord, state string) bool {
+	return rec != nil && rec.AutoRemove && rec.StartedAt != nil && state == "exited"
 }
 
 // PullOpts controls a PullImage invocation. Credentials (if non-empty) are
