@@ -800,6 +800,31 @@ func inspectNetworkSettings(rec *store.ContainerRecord, ports map[string][]PortB
 }
 
 // GET /containers/{id}/json
+// containerImageID renders the value Docker puts in ContainerJSON.Image: the
+// image's content-addressed ID, not the reference the user typed. Docker keeps
+// the reference in .Config.Image and the ID in .Image, and tooling relies on
+// the distinction — the standard "did my deploy actually replace the container"
+// check compares `docker image inspect --format {{.Id}}` against
+// `docker inspect <ctr> --format {{.Image}}`.
+//
+// This daemon returned the reference in both fields, so that check compared a
+// digest to a tag and could never pass. A verification step that can only fail
+// gets ignored, which is worse than having none.
+//
+// Falls back to the reference when no image record exists (legacy container, or
+// the image has since been removed) rather than inventing a digest or returning
+// an empty string.
+func containerImageID(img *store.ImageRecord, ref string) string {
+	if img == nil {
+		return ref
+	}
+	id := imageDisplayID(img)
+	if id == "" {
+		return ref
+	}
+	return "sha256:" + id
+}
+
 func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
 	if id == "" {
@@ -913,7 +938,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			FinishedAt: finishedAt,
 			Health:     healthStateFrom(rec),
 		},
-		Image:  rec.Image,
+		Image:  containerImageID(h.store.GetImage(normalizeImageRef(rec.Image)), rec.Image),
 		Mounts: mounts,
 		Config: normalizeContainerConfig(&ContainerConfig{
 			Hostname:     hostname,

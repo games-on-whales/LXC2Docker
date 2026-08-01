@@ -780,7 +780,20 @@ func (h *Handler) findImageByID(id string) *store.ImageRecord {
 // (legacy records). Callers prefix "sha256:".
 func imageDisplayID(rec *store.ImageRecord) string {
 	if rec.ConfigDigest != "" {
-		return rec.ConfigDigest
+		// Bare hex, always. Every caller prefixes "sha256:" itself, per the
+		// contract on store.ImageRecord.ConfigDigest.
+		//
+		// Two writers disagreed about the format: build and commit store
+		// hex.EncodeToString output, while pull stores manifest.Config.Digest
+		// straight from the OCI manifest, which already carries the prefix. That
+		// surfaced as a doubled ID on every pulled image:
+		//
+		//   docker image inspect ghcr.io/ggml-org/llama.cpp:server-rocm
+		//     Id = "sha256:sha256:a40ffec0460df2942..."
+		//
+		// The writer is fixed too, but stores already on disk hold the prefixed
+		// form, so normalising here is what heals them without a migration.
+		return strings.TrimPrefix(rec.ConfigDigest, "sha256:")
 	}
 	return rec.ID
 }
