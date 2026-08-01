@@ -1090,7 +1090,7 @@ lxc.uts.name = %s
 			OCIPorts:      cfg.Ports,
 			OCILabels:     cfg.Labels,
 			RepoDigest:    repoDigest,
-			ConfigDigest:  cfg.ConfigDigest,
+			ConfigDigest:  strings.TrimPrefix(cfg.ConfigDigest, "sha256:"),
 		}); err == nil {
 			os.WriteFile(filepath.Join(templateDir, "oci-meta.json"), data, 0o644)
 		}
@@ -1116,7 +1116,11 @@ lxc.uts.name = %s
 		// compute one (imageDisplayID falls back to the tag-derived "oci_…"
 		// pseudo-ID without it); pulls get it straight from the manifest, so
 		// `docker images`/`inspect` report a real content hash for every image.
-		ConfigDigest: cfg.ConfigDigest,
+		//
+		// Stored BARE, matching the field's contract and what build and commit
+		// write. The manifest gives it as "sha256:<hex>", and storing that
+		// verbatim made every reader's own "sha256:" prefix produce a doubled ID.
+		ConfigDigest: strings.TrimPrefix(cfg.ConfigDigest, "sha256:"),
 	}
 	if err := m.store.AddImage(imgRec); err != nil {
 		return err
