@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -31,13 +32,24 @@ func newExecStore() *execStore {
 func (s *execStore) add(r *execRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.records[r.ID] = r
+	copy := cloneExecRecord(r)
+	s.records[copy.ID] = copy
 }
 
 func (s *execStore) get(id string) *execRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.records[id]
+	return cloneExecRecord(s.records[id])
+}
+
+func cloneExecRecord(r *execRecord) *execRecord {
+	if r == nil {
+		return nil
+	}
+	copy := *r
+	copy.Cmd = slices.Clone(r.Cmd)
+	copy.Env = slices.Clone(r.Env)
+	return &copy
 }
 
 // claimStart atomically marks an exec as started for the first time, returning
@@ -85,7 +97,9 @@ func (s *execStore) update(id string, fn func(*execRecord)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if r, ok := s.records[id]; ok {
-		fn(r)
+		working := cloneExecRecord(r)
+		fn(working)
+		s.records[id] = cloneExecRecord(working)
 	}
 }
 

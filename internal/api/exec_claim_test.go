@@ -6,6 +6,56 @@ import (
 	"testing"
 )
 
+func TestExecStoreRecordsAreIsolated(t *testing.T) {
+	t.Parallel()
+
+	s := newExecStore()
+	original := &execRecord{
+		ID:  "isolated",
+		Cmd: []string{"original"},
+		Env: []string{"OWNER=store"},
+	}
+	s.add(original)
+	original.Cmd[0] = "input-alias"
+
+	got := s.get(original.ID)
+	got.Running = true
+	got.Cmd[0] = "get-alias"
+	got.Env[0] = "OWNER=caller"
+
+	stored := s.get(original.ID)
+	if stored.Running {
+		t.Fatal("mutation through get changed stored Running")
+	}
+	if stored.Cmd[0] != "original" {
+		t.Fatalf("stored Cmd = %q, want original", stored.Cmd[0])
+	}
+	if stored.Env[0] != "OWNER=store" {
+		t.Fatalf("stored Env = %q, want OWNER=store", stored.Env[0])
+	}
+}
+
+func TestExecStoreConcurrentReadsAreIsolated(t *testing.T) {
+	t.Parallel()
+
+	s := newExecStore()
+	s.add(&execRecord{ID: "read-race"})
+	const workers = 8
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				rec := s.get("read-race")
+				rec.Running = !rec.Running
+				rec.ExitCode++
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // TestExecClaimStartConcurrent: under a race of N simultaneous starts of the
 // same exec, exactly one must win (the whole point of the atomic guard). Run
 // with -race for the strongest signal.
