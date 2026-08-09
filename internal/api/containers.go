@@ -1027,6 +1027,36 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// stopWithIntent records that the user asked for this container to stop, and
+// only then runs the stop.
+//
+// The order is the whole point. The restart watcher restarts any exited
+// container whose StoppedByUser is unset, so intent recorded *after* the
+// container is down loses to a tick that lands in between — and that gap is not
+// small: a stop signals init and then waits for it to die, which takes as long
+// as the workload takes to shut down. Lose that race and the container really
+// did stop and really was put straight back, which reads as "stop does nothing".
+// Docker records the intent when the request arrives, not when the process
+// finally exits; so do we.
+//
+// A stop that fails restores the previous value: a container still running must
+// keep its restart policy rather than silently lose it to a failed attempt.
+func (h *Handler) stopWithIntent(id string, stop func() error) error {
+	rec := h.store.GetContainer(id)
+	prev := false
+	if rec != nil {
+		prev = rec.StoppedByUser
+		rec.StoppedByUser = true
+		h.store.AddContainer(rec)
+	}
+	err := stop()
+	if err != nil && rec != nil && !prev {
+		rec.StoppedByUser = false
+		h.store.AddContainer(rec)
+	}
+	return err
+}
+
 // POST /containers/{id}/stop
 func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
@@ -1035,6 +1065,11 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s, _ := h.mgr.State(id); s != "running" && s != "paused" {
+		// Nothing to stop — but the request still says "and keep it that way".
+		// Without recording that, a stop aimed at a container the watcher had
+		// just restarted, or one that had exited on its own, answers 304 and
+		// changes nothing, and the next tick brings it back up.
+		h.stopWithIntent(id, func() error { return nil })
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -1044,13 +1079,15 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		stopSig = rec.StopSignal
 		defaultTO = rec.StopTimeout
 	}
-	if err := h.mgr.StopContainerWithSignal(id, stopTimeoutWithDefault(r, defaultTO), stopSig); err != nil {
+	if err := h.stopWithIntent(id, func() error {
+		return h.mgr.StopContainerWithSignal(id, stopTimeoutWithDefault(r, defaultTO), stopSig)
+	}); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	rec := h.store.GetContainer(id)
 	if rec != nil {
-		rec.StoppedByUser = true
+		// StoppedByUser was set ahead of the stop, by stopWithIntent.
 		now := time.Now()
 		rec.FinishedAt = &now
 		sig := stopSig
@@ -1223,13 +1260,17 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusConflict, "Container is not running")
 		return
 	}
-	if err := h.mgr.KillContainer(id, signal); err != nil {
+	// Same ordering as stop: a kill is the most abrupt exit there is, so the
+	// watcher is most likely to see it before intent lands.
+	if err := h.stopWithIntent(id, func() error {
+		return h.mgr.KillContainer(id, signal)
+	}); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	rec := h.store.GetContainer(id)
 	if rec != nil {
-		rec.StoppedByUser = true
+		// StoppedByUser was set ahead of the kill, by stopWithIntent.
 		now := time.Now()
 		rec.FinishedAt = &now
 		sig := signal
@@ -1264,7 +1305,13 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 			state, _ = h.mgr.State(id)
 		}
 		if state == "running" {
-			h.mgr.StopContainer(id, 5*time.Second)
+			// Intent first here too. The record is deleted a few lines below,
+			// but between this stop finishing and that delete the watcher can
+			// still restart the container — leaving a running CT behind with no
+			// record of it, which is worse than a stop that did not stick.
+			h.stopWithIntent(id, func() error {
+				return h.mgr.StopContainer(id, 5*time.Second)
+			})
 		}
 	} else {
 		if state, _ := h.mgr.State(id); state == "running" || state == "paused" {
