@@ -460,9 +460,10 @@ func (m *Manager) runDueHealthchecks(now time.Time, emit HealthEmitter) {
 		if state, _ := m.State(rec.ID); state != "running" {
 			// Reset to "starting" when the container restarts.
 			if rec.HealthStatus != "starting" {
-				rec.HealthStatus = "starting"
-				rec.HealthFailingStreak = 0
-				m.store.AddContainer(rec)
+				m.store.UpdateContainer(rec.ID, func(current *store.ContainerRecord) {
+					current.HealthStatus = "starting"
+					current.HealthFailingStreak = 0
+				})
 			}
 			continue
 		}
@@ -528,50 +529,53 @@ func (m *Manager) runOneHealthcheck(rec *store.ContainerRecord, start time.Time,
 		}
 	}
 
-	prevStatus := rec.HealthStatus
 	result := store.HealthResult{
 		Start:    start,
 		End:      end,
 		ExitCode: exitCode,
 		Output:   truncateOutput(string(out)),
 	}
-	rec.HealthLastCheck = &end
-	rec.HealthLog = append(rec.HealthLog, result)
-	// Keep the last 5 entries, matching Docker's default.
-	if len(rec.HealthLog) > 5 {
-		rec.HealthLog = rec.HealthLog[len(rec.HealthLog)-5:]
-	}
-	retries := rec.HealthcheckRetries
-	if retries <= 0 {
-		retries = 3
-	}
-	if exitCode == 0 {
-		rec.HealthFailingStreak = 0
-		rec.HealthStatus = "healthy"
-	} else {
-		// During the start period (default 0), failures don't count against
-		// the streak — they're recorded but don't flip the status. Once
-		// past the grace window, normal Retries-based logic applies. This
-		// matches Docker's --health-start-period semantics.
-		inStartPeriod := false
-		if rec.StartedAt != nil && rec.HealthcheckStartPeriod > 0 {
-			if end.Sub(*rec.StartedAt) < time.Duration(rec.HealthcheckStartPeriod) {
-				inStartPeriod = true
+	prevStatus := ""
+	updated, err := m.store.UpdateContainer(rec.ID, func(current *store.ContainerRecord) {
+		prevStatus = current.HealthStatus
+		current.HealthLastCheck = &end
+		current.HealthLog = append(current.HealthLog, result)
+		// Keep the last 5 entries, matching Docker's default.
+		if len(current.HealthLog) > 5 {
+			current.HealthLog = current.HealthLog[len(current.HealthLog)-5:]
+		}
+		retries := current.HealthcheckRetries
+		if retries <= 0 {
+			retries = 3
+		}
+		if exitCode == 0 {
+			current.HealthFailingStreak = 0
+			current.HealthStatus = "healthy"
+		} else {
+			// During the start period (default 0), failures don't count against
+			// the streak — they're recorded but don't flip the status. Once
+			// past the grace window, normal Retries-based logic applies. This
+			// matches Docker's --health-start-period semantics.
+			inStartPeriod := false
+			if current.StartedAt != nil && current.HealthcheckStartPeriod > 0 {
+				if end.Sub(*current.StartedAt) < time.Duration(current.HealthcheckStartPeriod) {
+					inStartPeriod = true
+				}
+			}
+			if !inStartPeriod {
+				current.HealthFailingStreak++
+				if current.HealthFailingStreak >= retries {
+					current.HealthStatus = "unhealthy"
+				}
 			}
 		}
-		if !inStartPeriod {
-			rec.HealthFailingStreak++
-			if rec.HealthFailingStreak >= retries {
-				rec.HealthStatus = "unhealthy"
-			}
-		}
-	}
-	if err := m.store.AddContainer(rec); err != nil {
+	})
+	if err != nil {
 		log.Printf("health-watcher: persist %s: %v", rec.ID[:12], err)
 		return
 	}
-	if emit != nil && rec.HealthStatus != prevStatus {
-		emit(rec.ID, rec.HealthStatus)
+	if updated != nil && emit != nil && updated.HealthStatus != prevStatus {
+		emit(rec.ID, updated.HealthStatus)
 	}
 }
 
@@ -617,75 +621,100 @@ func (m *Manager) StartRestartWatcherWithEmitter(ctx context.Context, emit Resta
 // the appropriate action (restart, remove, or leave).
 func (m *Manager) enforceRestartPolicies(emit RestartEmitter) {
 	for _, rec := range m.store.ListContainers() {
-		// A container that was never started ("created") is normally left
-		// alone — a plain `docker create` must not auto-run. But one declared
-		// with an always/unless-stopped policy is *meant* to be running, so a
-		// create whose start never landed (an orchestrator create+start that
-		// raced, or a start that errored transiently) must not be stranded in
-		// "created" forever. Converge it to running. (on-failure/no are left:
-		// a never-started container hasn't failed and "no" means don't manage.)
-		if rec.StartedAt == nil {
-			if shouldStartNeverStarted(rec) {
-				if s, _ := m.State(rec.ID); s != "running" {
-					log.Printf("restart-watcher: starting never-started %s (%s) per policy=%s",
-						rec.Name, rec.ID[:12], rec.RestartPolicy)
-					if err := m.StartContainer(rec.ID); err != nil {
-						log.Printf("restart-watcher: start created %s: %v", rec.ID[:12], err)
-					} else if emit != nil {
-						emit(rec.ID, "start")
-					}
+		m.enforceRestartPolicy(rec.ID, emit)
+	}
+}
+
+// enforceRestartPolicy holds the same per-container lifecycle guard used by
+// API start/stop/kill/remove operations. The policy decision and any resulting
+// start are therefore one atomic lifecycle operation: either the watcher starts
+// first and a waiting stop subsequently stops it, or stop intent lands first
+// and the watcher observes it before deciding.
+func (m *Manager) enforceRestartPolicy(id string, emit RestartEmitter) {
+	unlock := m.store.LockContainerLifecycle(id)
+	defer unlock()
+
+	rec := m.store.GetContainer(id)
+	if rec == nil {
+		return
+	}
+	// A container that was never started ("created") is normally left
+	// alone — a plain `docker create` must not auto-run. But one declared
+	// with an always/unless-stopped policy is *meant* to be running, so a
+	// create whose start never landed (an orchestrator create+start that
+	// raced, or a start that errored transiently) must not be stranded in
+	// "created" forever. Converge it to running. (on-failure/no are left:
+	// a never-started container hasn't failed and "no" means don't manage.)
+	if rec.StartedAt == nil {
+		if shouldStartNeverStarted(rec) {
+			if s, _ := m.State(rec.ID); s != "running" {
+				log.Printf("restart-watcher: starting never-started %s (%s) per policy=%s",
+					rec.Name, rec.ID[:12], rec.RestartPolicy)
+				if err := m.StartContainer(rec.ID); err != nil {
+					log.Printf("restart-watcher: start created %s: %v", rec.ID[:12], err)
+				} else if emit != nil {
+					emit(rec.ID, "start")
 				}
 			}
-			continue
 		}
-		state, _ := m.State(rec.ID)
-		if state != "exited" {
-			continue
-		}
+		return
+	}
+	state, _ := m.State(rec.ID)
+	if state != "exited" {
+		return
+	}
 
-		// Record the first observed exit time so inspect can show
-		// "Exited X minutes ago". The watcher is the earliest place we
-		// can reliably detect a spontaneous exit — StopContainer sets
-		// FinishedAt on user-initiated stops, but crashes need this path.
-		if rec.FinishedAt == nil {
-			now := time.Now()
-			rec.FinishedAt = &now
-			if err := m.store.AddContainer(rec); err != nil {
-				log.Printf("restart-watcher: persist FinishedAt %s: %v", rec.ID[:12], err)
+	// Record the first observed exit time so inspect can show
+	// "Exited X minutes ago". The watcher is the earliest place we
+	// can reliably detect a spontaneous exit — StopContainer sets
+	// FinishedAt on user-initiated stops, but crashes need this path.
+	if rec.FinishedAt == nil {
+		now := time.Now()
+		updated, err := m.store.UpdateContainer(rec.ID, func(current *store.ContainerRecord) {
+			if current.FinishedAt == nil {
+				current.FinishedAt = &now
 			}
+		})
+		if err != nil {
+			log.Printf("restart-watcher: persist FinishedAt %s: %v", rec.ID[:12], err)
 		}
+		if updated == nil {
+			return
+		}
+		rec = updated
+	}
 
-		// AutoRemove wins over RestartPolicy because Docker treats
-		// --rm as a stronger signal — the container ceases to exist
-		// after exit regardless of what the policy says.
-		if rec.AutoRemove {
-			log.Printf("restart-watcher: auto-removing exited container %s (%s)", rec.Name, rec.ID[:12])
-			RemovePortForwards(rec.IPAddress)
-			if err := m.RemoveContainer(rec.ID); err != nil {
-				log.Printf("restart-watcher: remove %s: %v", rec.ID[:12], err)
-			} else if emit != nil {
-				emit(rec.ID, "destroy")
-			}
-			continue
+	// AutoRemove wins over RestartPolicy because Docker treats
+	// --rm as a stronger signal — the container ceases to exist
+	// after exit regardless of what the policy says.
+	if rec.AutoRemove {
+		log.Printf("restart-watcher: auto-removing exited container %s (%s)", rec.Name, rec.ID[:12])
+		RemovePortForwards(rec.IPAddress)
+		if err := m.RemoveContainer(rec.ID); err != nil {
+			log.Printf("restart-watcher: remove %s: %v", rec.ID[:12], err)
+		} else if emit != nil {
+			emit(rec.ID, "destroy")
 		}
+		return
+	}
 
-		if !shouldRestart(rec) {
-			continue
-		}
+	if !shouldRestart(rec) {
+		return
+	}
 
-		log.Printf("restart-watcher: restarting %s (%s) per policy=%s (attempt %d)",
-			rec.Name, rec.ID[:12], rec.RestartPolicy, rec.RestartCount+1)
-		if err := m.StartContainer(rec.ID); err != nil {
-			log.Printf("restart-watcher: start %s: %v", rec.ID[:12], err)
-			continue
-		}
-		rec.RestartCount++
-		if err := m.store.AddContainer(rec); err != nil {
-			log.Printf("restart-watcher: persist %s: %v", rec.ID[:12], err)
-		}
-		if emit != nil {
-			emit(rec.ID, "restart")
-		}
+	log.Printf("restart-watcher: restarting %s (%s) per policy=%s (attempt %d)",
+		rec.Name, rec.ID[:12], rec.RestartPolicy, rec.RestartCount+1)
+	if err := m.StartContainer(rec.ID); err != nil {
+		log.Printf("restart-watcher: start %s: %v", rec.ID[:12], err)
+		return
+	}
+	if _, err := m.store.UpdateContainer(rec.ID, func(current *store.ContainerRecord) {
+		current.RestartCount++
+	}); err != nil {
+		log.Printf("restart-watcher: persist %s: %v", rec.ID[:12], err)
+	}
+	if emit != nil {
+		emit(rec.ID, "restart")
 	}
 }
 
@@ -1259,8 +1288,11 @@ func (m *Manager) lanMACForContainer(id string, cfg ContainerConfig) string {
 	if strings.TrimSpace(rec.LANMacAddress) != "" {
 		return strings.TrimSpace(rec.LANMacAddress)
 	}
-	rec.LANMacAddress = mac
-	if err := m.store.AddContainer(rec); err != nil {
+	if _, err := m.store.UpdateContainer(id, func(current *store.ContainerRecord) {
+		if strings.TrimSpace(current.LANMacAddress) == "" {
+			current.LANMacAddress = mac
+		}
+	}); err != nil {
 		log.Printf("lan mac: persist %s for %s: %v", mac, id[:12], err)
 	}
 	return mac
@@ -1341,12 +1373,11 @@ func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg C
 	m.prepareRootfs(rootfs, cfg)
 
 	// Update store record with IP and VMID.
-	if storeRec := m.store.GetContainer(id); storeRec != nil {
+	_, err = m.store.UpdateContainer(id, func(storeRec *store.ContainerRecord) {
 		storeRec.IPAddress = ip
 		storeRec.VMID = vmid
-		return m.store.AddContainer(storeRec)
-	}
-	return nil
+	})
+	return err
 }
 
 // createEphemeralPVE creates a raw-LXC container by ZFS-cloning the PVE
@@ -1426,11 +1457,10 @@ lxc.uts.name = %s
 	m.prepareRootfs(cloneMountpoint, cfg)
 
 	// Update store record with IP (VMID stays 0 for ephemeral).
-	if storeRec := m.store.GetContainer(id); storeRec != nil {
+	_, err := m.store.UpdateContainer(id, func(storeRec *store.ContainerRecord) {
 		storeRec.IPAddress = ip
-		return m.store.AddContainer(storeRec)
-	}
-	return nil
+	})
+	return err
 }
 
 // createLegacyContainer clones the image template into a new container by
@@ -1474,11 +1504,10 @@ func (m *Manager) createLegacyContainer(id string, imgRec *store.ImageRecord, cf
 	m.prepareRootfs(rootfs, cfg)
 
 	// Update store record with IP.
-	if storeRec := m.store.GetContainer(id); storeRec != nil {
+	_, err := m.store.UpdateContainer(id, func(storeRec *store.ContainerRecord) {
 		storeRec.IPAddress = ip
-		return m.store.AddContainer(storeRec)
-	}
-	return nil
+	})
+	return err
 }
 
 func (m *Manager) cloneLegacyTemplate(templateName, id string) error {
@@ -1751,14 +1780,11 @@ func (m *Manager) StartContainer(id string) error {
 // clears the previous run's exit time. Docker refreshes StartedAt on every
 // start, not just the first, so this re-stamps on restarts too.
 func (m *Manager) stampStarted(id string) {
-	rec := m.store.GetContainer(id)
-	if rec == nil {
-		return
-	}
 	now := time.Now()
-	rec.StartedAt = &now
-	rec.FinishedAt = nil
-	if err := m.store.AddContainer(rec); err != nil {
+	if _, err := m.store.UpdateContainer(id, func(rec *store.ContainerRecord) {
+		rec.StartedAt = &now
+		rec.FinishedAt = nil
+	}); err != nil {
 		log.Printf("StartContainer: persist StartedAt for %s: %v", shortID(id), err)
 	}
 }

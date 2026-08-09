@@ -372,11 +372,10 @@ func (m *Manager) createPVEFromTarball(id string, imgRec *store.ImageRecord, cfg
 	// container". Recording it up front makes gc() treat the record as a
 	// Proxmox CT (rec.VMID > 0) and skip it. A genuinely failed create is
 	// cleaned up by the caller's error path and the reapOrphanCTs grace window.
-	if storeRec := m.store.GetContainer(id); storeRec != nil {
+	if _, err := m.store.UpdateContainer(id, func(storeRec *store.ContainerRecord) {
 		storeRec.VMID = vmid
-		if err := m.store.AddContainer(storeRec); err != nil {
-			return fmt.Errorf("manager: persist vmid: %w", err)
-		}
+	}); err != nil {
+		return fmt.Errorf("manager: persist vmid: %w", err)
 	}
 
 	// Fill in LAN config (and convert --network=host to a LAN NIC) before the
@@ -461,12 +460,11 @@ func (m *Manager) finalizePVECT(id string, vmid int, hostname string, cfg Contai
 	m.prepareRootfs(rootfsPath, cfg)
 	unmount() // a held mount blocks pct start on block-device backends
 
-	if storeRec := m.store.GetContainer(id); storeRec != nil {
+	_, err = m.store.UpdateContainer(id, func(storeRec *store.ContainerRecord) {
 		storeRec.IPAddress = ip
 		storeRec.VMID = vmid
-		return m.store.AddContainer(storeRec)
-	}
-	return nil
+	})
+	return err
 }
 
 // reconfigureReusedPVECT adopts an already-provisioned Proxmox CT (cfg.ReuseVMID,
@@ -528,9 +526,11 @@ func (m *Manager) reconfigureReusedPVECT(id string, cfg ContainerConfig) error {
 
 	log.Printf("CreateContainer[reuse]: adopted warm CT %d for %s (no clone)", vmid, shortID(id))
 	if rec != nil {
-		rec.VMID = vmid
-		rec.IPAddress = ip
-		return m.store.AddContainer(rec)
+		_, err := m.store.UpdateContainer(id, func(current *store.ContainerRecord) {
+			current.VMID = vmid
+			current.IPAddress = ip
+		})
+		return err
 	}
 	return nil
 }
@@ -745,11 +745,10 @@ func (m *Manager) createPVELinkedCloneFromTarball(id string, imgRec *store.Image
 	}
 	// Record the VMID up front so gc() doesn't reap the half-built record
 	// mid-clone (same rationale as createPVEFromTarball).
-	if storeRec := m.store.GetContainer(id); storeRec != nil {
+	if _, err := m.store.UpdateContainer(id, func(storeRec *store.ContainerRecord) {
 		storeRec.VMID = vmid
-		if err := m.store.AddContainer(storeRec); err != nil {
-			return fmt.Errorf("manager: persist vmid: %w", err)
-		}
+	}); err != nil {
+		return fmt.Errorf("manager: persist vmid: %w", err)
 	}
 
 	// Fill in LAN config before the IP allocation in finalizePVECT keys off

@@ -7,9 +7,11 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -252,9 +254,16 @@ type state struct {
 
 // Store is a thread-safe, file-backed metadata store.
 type Store struct {
-	mu   sync.RWMutex
-	path string
-	data state
+	mu             sync.RWMutex
+	path           string
+	data           state
+	lifecycleMu    sync.Mutex
+	lifecycleLocks map[string]*containerLifecycleLock
+}
+
+type containerLifecycleLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 // New opens (or creates) the store at the default path.
@@ -345,8 +354,66 @@ func (s *Store) FreeIP(ip string) {
 func (s *Store) AddContainer(r *ContainerRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data.Containers[r.ID] = r
+	copy := cloneContainerRecord(r)
+	s.data.Containers[copy.ID] = copy
 	return s.save()
+}
+
+// UpdateContainer applies update to the current stored record while holding
+// the store lock, persists it, and returns an isolated snapshot. The callback
+// must not call another Store method.
+//
+// Callers doing read-modify-write updates should use this instead of combining
+// GetContainer with AddContainer: the latter can overwrite a concurrent update
+// with fields from a stale snapshot.
+func (s *Store) UpdateContainer(id string, update func(*ContainerRecord)) (*ContainerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec := s.data.Containers[id]
+	if rec == nil {
+		return nil, nil
+	}
+	previous := rec
+	working := cloneContainerRecord(rec)
+	update(working)
+	// Replace the map entry with a clone so neither values captured by the
+	// callback nor references assigned from its closure can alias stored state.
+	stored := cloneContainerRecord(working)
+	s.data.Containers[id] = stored
+	result := cloneContainerRecord(stored)
+	if err := s.save(); err != nil {
+		s.data.Containers[id] = previous
+		return nil, err
+	}
+	return result, nil
+}
+
+// LockContainerLifecycle serializes lifecycle decisions and operations for one
+// container without blocking unrelated containers. Call the returned function
+// exactly once to release the guard.
+func (s *Store) LockContainerLifecycle(id string) func() {
+	s.lifecycleMu.Lock()
+	if s.lifecycleLocks == nil {
+		s.lifecycleLocks = make(map[string]*containerLifecycleLock)
+	}
+	lock := s.lifecycleLocks[id]
+	if lock == nil {
+		lock = &containerLifecycleLock{}
+		s.lifecycleLocks[id] = lock
+	}
+	lock.refs++
+	s.lifecycleMu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		s.lifecycleMu.Lock()
+		lock.refs--
+		if lock.refs == 0 && s.lifecycleLocks[id] == lock {
+			delete(s.lifecycleLocks, id)
+		}
+		s.lifecycleMu.Unlock()
+	}
 }
 
 // RemoveContainer deletes a container record by ID and frees its IP address.
@@ -413,7 +480,7 @@ func parseManagedIPOctet(ip string) (int, bool) {
 func (s *Store) GetContainer(id string) *ContainerRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.data.Containers[id]
+	return cloneContainerRecord(s.data.Containers[id])
 }
 
 // FindContainerByName returns the first container whose Name matches.
@@ -423,7 +490,7 @@ func (s *Store) FindContainerByName(name string) *ContainerRecord {
 	name = strings.TrimPrefix(name, "/")
 	for _, r := range s.data.Containers {
 		if r.Name == name {
-			return r
+			return cloneContainerRecord(r)
 		}
 	}
 	return nil
@@ -435,9 +502,59 @@ func (s *Store) ListContainers() []*ContainerRecord {
 	defer s.mu.RUnlock()
 	out := make([]*ContainerRecord, 0, len(s.data.Containers))
 	for _, r := range s.data.Containers {
-		out = append(out, r)
+		out = append(out, cloneContainerRecord(r))
 	}
 	return out
+}
+
+func cloneContainerRecord(r *ContainerRecord) *ContainerRecord {
+	if r == nil {
+		return nil
+	}
+	copy := *r
+	copy.Entrypoint = slices.Clone(r.Entrypoint)
+	copy.Cmd = slices.Clone(r.Cmd)
+	copy.Env = slices.Clone(r.Env)
+	copy.Labels = maps.Clone(r.Labels)
+	copy.PortBindings = slices.Clone(r.PortBindings)
+	copy.Mounts = slices.Clone(r.Mounts)
+	copy.StartedAt = cloneTime(r.StartedAt)
+	copy.FinishedAt = cloneTime(r.FinishedAt)
+	copy.ExposedPorts = maps.Clone(r.ExposedPorts)
+	copy.Volumes = maps.Clone(r.Volumes)
+	copy.Networks = cloneNetworkAttachments(r.Networks)
+	copy.RawHostConfig = slices.Clone(r.RawHostConfig)
+	copy.HealthcheckTest = slices.Clone(r.HealthcheckTest)
+	copy.HealthLastCheck = cloneTime(r.HealthLastCheck)
+	copy.HealthLog = slices.Clone(r.HealthLog)
+	return &copy
+}
+
+func cloneNetworkAttachments(in map[string]NetworkAttachment) map[string]NetworkAttachment {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]NetworkAttachment, len(in))
+	for name, attachment := range in {
+		attachment.Aliases = slices.Clone(attachment.Aliases)
+		attachment.Links = slices.Clone(attachment.Links)
+		attachment.DriverOpts = maps.Clone(attachment.DriverOpts)
+		if attachment.IPAMConfig != nil {
+			ipam := *attachment.IPAMConfig
+			ipam.LinkLocalIPs = slices.Clone(attachment.IPAMConfig.LinkLocalIPs)
+			attachment.IPAMConfig = &ipam
+		}
+		out[name] = attachment
+	}
+	return out
+}
+
+func cloneTime(in *time.Time) *time.Time {
+	if in == nil {
+		return nil
+	}
+	copy := *in
+	return &copy
 }
 
 // AddImage persists a new image record keyed by its Ref.

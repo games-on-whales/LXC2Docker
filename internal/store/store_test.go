@@ -2,9 +2,155 @@ package store
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestContainerReadsDoNotAliasStore(t *testing.T) {
+	t.Parallel()
+
+	s, err := NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewAt failed: %v", err)
+	}
+	original := &ContainerRecord{
+		ID:     "isolated",
+		Name:   "original",
+		Labels: map[string]string{"owner": "store"},
+		Networks: map[string]NetworkAttachment{
+			"bridge": {Aliases: []string{"original"}},
+		},
+	}
+	if err := s.AddContainer(original); err != nil {
+		t.Fatalf("AddContainer failed: %v", err)
+	}
+
+	// Writes through the value passed to AddContainer, GetContainer, or
+	// ListContainers must never mutate the store without another store call.
+	original.Name = "input-alias"
+	got := s.GetContainer(original.ID)
+	got.Name = "get-alias"
+	got.Labels["owner"] = "caller"
+	attachment := got.Networks["bridge"]
+	attachment.Aliases[0] = "caller"
+	got.Networks["bridge"] = attachment
+	listed := s.ListContainers()[0]
+	listed.Name = "list-alias"
+	var callbackRecord *ContainerRecord
+	updated, err := s.UpdateContainer(original.ID, func(current *ContainerRecord) {
+		callbackRecord = current
+		current.ExitCode = 17
+	})
+	if err != nil {
+		t.Fatalf("UpdateContainer failed: %v", err)
+	}
+	callbackRecord.Name = "callback-alias"
+	updated.Name = "result-alias"
+
+	stored := s.GetContainer(original.ID)
+	if stored.Name != "original" {
+		t.Fatalf("stored Name = %q, want original", stored.Name)
+	}
+	if stored.Labels["owner"] != "store" {
+		t.Fatalf("stored label = %q, want store", stored.Labels["owner"])
+	}
+	if alias := stored.Networks["bridge"].Aliases[0]; alias != "original" {
+		t.Fatalf("stored network alias = %q, want original", alias)
+	}
+	if stored.ExitCode != 17 {
+		t.Fatalf("stored ExitCode = %d, want 17", stored.ExitCode)
+	}
+}
+
+func TestContainerConcurrentReadsAreIsolated(t *testing.T) {
+	t.Parallel()
+
+	s, err := NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewAt failed: %v", err)
+	}
+	if err := s.AddContainer(&ContainerRecord{ID: "race", Name: "race"}); err != nil {
+		t.Fatalf("AddContainer failed: %v", err)
+	}
+
+	const workers = 8
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				rec := s.GetContainer("race")
+				rec.RestartCount++
+				rec.StoppedByUser = !rec.StoppedByUser
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestUpdateContainerSerializesConcurrentChanges(t *testing.T) {
+	t.Parallel()
+
+	s, err := NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewAt failed: %v", err)
+	}
+	if err := s.AddContainer(&ContainerRecord{ID: "updates", Name: "updates"}); err != nil {
+		t.Fatalf("AddContainer failed: %v", err)
+	}
+
+	const workers = 8
+	const updatesPerWorker = 25
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < updatesPerWorker; j++ {
+				if _, err := s.UpdateContainer("updates", func(rec *ContainerRecord) {
+					rec.RestartCount++
+				}); err != nil {
+					t.Errorf("UpdateContainer failed: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	want := workers * updatesPerWorker
+	if got := s.GetContainer("updates").RestartCount; got != want {
+		t.Fatalf("RestartCount = %d, want %d", got, want)
+	}
+}
+
+func TestUpdateContainerRollsBackWhenPersistenceFails(t *testing.T) {
+	t.Parallel()
+
+	s, err := NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewAt failed: %v", err)
+	}
+	if err := s.AddContainer(&ContainerRecord{ID: "rollback", Name: "original"}); err != nil {
+		t.Fatalf("AddContainer failed: %v", err)
+	}
+
+	s.path = filepath.Join(t.TempDir(), "missing", "state.json")
+	updated, err := s.UpdateContainer("rollback", func(rec *ContainerRecord) {
+		rec.Name = "not-persisted"
+	})
+	if err == nil {
+		t.Fatal("UpdateContainer succeeded with an unwritable state path")
+	}
+	if updated != nil {
+		t.Fatalf("UpdateContainer returned %+v on persistence failure, want nil", updated)
+	}
+	if got := s.GetContainer("rollback").Name; got != "original" {
+		t.Fatalf("failed update left Name = %q, want original", got)
+	}
+}
 
 func TestStorePersistenceAndLookup(t *testing.T) {
 	t.Parallel()
