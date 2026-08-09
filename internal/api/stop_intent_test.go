@@ -1,7 +1,11 @@
 package api
 
 import (
+	"errors"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/games-on-whales/LXC2Docker/internal/store"
 )
@@ -59,13 +63,64 @@ func TestStopWithIntentRecordsIntentBeforeStopping(t *testing.T) {
 func TestStopWithIntentRestoresIntentWhenTheStopFails(t *testing.T) {
 	h, rec := stopIntentFixture(t)
 
-	err := h.stopWithIntent(rec.ID, func() error { return errStopFailed })
+	err := h.stopWithIntent(rec.ID, func() error {
+		if _, err := h.store.UpdateContainer(rec.ID, func(current *store.ContainerRecord) {
+			current.StartError = "concurrent update"
+		}); err != nil {
+			t.Fatalf("concurrent UpdateContainer: %v", err)
+		}
+		return errStopFailed
+	})
 	if err != errStopFailed {
 		t.Fatalf("stopWithIntent err = %v, want %v", err, errStopFailed)
 	}
 	if h.store.GetContainer(rec.ID).StoppedByUser {
 		t.Fatal("a failed stop left the container marked stopped-by-user, " +
 			"which disables its restart policy")
+	}
+	if got := h.store.GetContainer(rec.ID).StartError; got != "concurrent update" {
+		t.Fatalf("failed-stop restore overwrote %q, want concurrent update", got)
+	}
+}
+
+func TestStopWithIntentSerializesOverlappingStops(t *testing.T) {
+	h, rec := stopIntentFixture(t)
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- h.stopWithIntent(rec.ID, func() error {
+			close(firstEntered)
+			<-releaseFirst
+			return errStopFailed
+		})
+	}()
+	<-firstEntered
+
+	secondEntered := make(chan struct{})
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- h.stopWithIntent(rec.ID, func() error {
+			close(secondEntered)
+			return nil
+		})
+	}()
+
+	select {
+	case <-secondEntered:
+		t.Fatal("a second stop ran while the first still owned the lifecycle operation")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstResult; err != errStopFailed {
+		t.Fatalf("first stop err = %v, want %v", err, errStopFailed)
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatalf("second stop failed: %v", err)
+	}
+	if !h.store.GetContainer(rec.ID).StoppedByUser {
+		t.Fatal("the failed first stop rolled back the successful second stop's intent")
 	}
 }
 
@@ -96,6 +151,55 @@ func TestStopWithIntentToleratesAMissingRecord(t *testing.T) {
 	}
 	if !ran {
 		t.Fatal("the stop was skipped for a container with no store record")
+	}
+}
+
+func TestStopWithIntentDoesNotStopWhenIntentCannotPersist(t *testing.T) {
+	base := t.TempDir()
+	st, err := store.NewAt(base)
+	if err != nil {
+		t.Fatalf("store.NewAt: %v", err)
+	}
+	rec := &store.ContainerRecord{ID: "persist-failure", Name: "wolf"}
+	if err := st.AddContainer(rec); err != nil {
+		t.Fatalf("AddContainer: %v", err)
+	}
+	if err := os.RemoveAll(base); err != nil {
+		t.Fatalf("remove store directory: %v", err)
+	}
+
+	ran := false
+	err = (&Handler{store: st}).stopWithIntent(rec.ID, func() error {
+		ran = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "persist stop intent") {
+		t.Fatalf("stopWithIntent err = %v, want persistence failure", err)
+	}
+	if ran {
+		t.Fatal("stop callback ran without durable stop intent")
+	}
+}
+
+func TestStopWithIntentSurfacesRollbackPersistenceFailure(t *testing.T) {
+	base := t.TempDir()
+	st, err := store.NewAt(base)
+	if err != nil {
+		t.Fatalf("store.NewAt: %v", err)
+	}
+	rec := &store.ContainerRecord{ID: "rollback-failure", Name: "wolf"}
+	if err := st.AddContainer(rec); err != nil {
+		t.Fatalf("AddContainer: %v", err)
+	}
+
+	err = (&Handler{store: st}).stopWithIntent(rec.ID, func() error {
+		if err := os.RemoveAll(base); err != nil {
+			t.Fatalf("remove store directory: %v", err)
+		}
+		return errStopFailed
+	})
+	if !errors.Is(err, errStopFailed) || !strings.Contains(err.Error(), "restore stop intent") {
+		t.Fatalf("stopWithIntent err = %v, want stop and rollback failures", err)
 	}
 }
 

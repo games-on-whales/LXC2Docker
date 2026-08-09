@@ -145,12 +145,13 @@ func (h *Handler) updateContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	rec.RawHostConfig = rawHC
-	rec.RestartPolicy = hc.RestartPolicy.Name
-	rec.RestartMaxRetry = hc.RestartPolicy.MaximumRetryCount
-	rec.AutoRemove = hc.AutoRemove
-	rec.OomScoreAdj = hc.OomScoreAdj
-	if err := h.store.AddContainer(rec); err != nil {
+	if _, err := h.store.UpdateContainer(id, func(current *store.ContainerRecord) {
+		current.RawHostConfig = rawHC
+		current.RestartPolicy = hc.RestartPolicy.Name
+		current.RestartMaxRetry = hc.RestartPolicy.MaximumRetryCount
+		current.AutoRemove = hc.AutoRemove
+		current.OomScoreAdj = hc.OomScoreAdj
+	}); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}

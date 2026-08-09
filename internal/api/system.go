@@ -495,7 +495,9 @@ func (h *Handler) connectNetwork(w http.ResponseWriter, r *http.Request) {
 		DriverOpts: copyStringMap(ep.DriverOpts),
 		IPAMConfig: endpointIPAMToStore(ep.IPAMConfig),
 	}
-	if err := h.store.AddContainer(rec); err != nil {
+	if _, err := h.store.UpdateContainer(cid, func(current *store.ContainerRecord) {
+		current.Networks = rec.Networks
+	}); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -536,7 +538,9 @@ func (h *Handler) disconnectNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	delete(rec.Networks, name)
-	if err := h.store.AddContainer(rec); err != nil {
+	if _, err := h.store.UpdateContainer(cid, func(current *store.ContainerRecord) {
+		current.Networks = rec.Networks
+	}); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}

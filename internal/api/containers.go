@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -510,7 +511,9 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		} else if len(rec.Networks) == 0 {
 			rec.Networks = defaultContainerNetworks(rec)
 		}
-		if err := h.store.AddContainer(rec); err != nil {
+		if _, err := h.store.UpdateContainer(id, func(current *store.ContainerRecord) {
+			current.Networks = rec.Networks
+		}); err != nil {
 			errResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -962,7 +965,7 @@ func (h *Handler) inspectContainer(w http.ResponseWriter, r *http.Request) {
 			StopTimeout:  stopTimeoutPtr(rec.StopTimeout),
 			Healthcheck:  healthcheckFrom(rec),
 		}),
-		HostConfig: buildHostConfig(rec),
+		HostConfig:      buildHostConfig(rec),
 		NetworkSettings: inspectNetworkSettings(rec, ports),
 	}
 	if boolValue(r, "size") {
@@ -980,6 +983,8 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
+	unlock := h.store.LockContainerLifecycle(id)
+	defer unlock()
 	if s, _ := h.mgr.State(id); s == "running" {
 		w.WriteHeader(http.StatusNotModified)
 		return
@@ -989,26 +994,25 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 		// State.Error. Portainer's detail page renders this alongside
 		// the red "failed to start" toast, and the user can see the
 		// underlying reason without chasing daemon logs.
-		if rec := h.store.GetContainer(id); rec != nil {
+		if _, saveErr := h.store.UpdateContainer(id, func(rec *store.ContainerRecord) {
 			rec.StartError = err.Error()
-			h.store.AddContainer(rec)
+		}); saveErr != nil {
+			log.Printf("start %s: persist error metadata: %v", id[:12], saveErr)
 		}
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	// Clear any stale error from a previous failed start.
-	if rec := h.store.GetContainer(id); rec != nil && rec.StartError != "" {
-		rec.StartError = ""
-		h.store.AddContainer(rec)
-	}
-
 	// StartedAt/FinishedAt are stamped by StartContainer, which every start
 	// path funnels through. StoppedByUser stays here: it records *user* intent,
 	// so only an explicit API start clears it — a restart-policy convergence
 	// must not silently un-stop a container the user stopped by hand.
-	if rec := h.store.GetContainer(id); rec != nil && rec.StoppedByUser {
+	if _, err := h.store.UpdateContainer(id, func(rec *store.ContainerRecord) {
+		rec.StartError = ""
 		rec.StoppedByUser = false
-		h.store.AddContainer(rec)
+	}); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 
 	// Port forwards are (re)published by StartContainer itself, so every start
@@ -1042,17 +1046,32 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 // A stop that fails restores the previous value: a container still running must
 // keep its restart policy rather than silently lose it to a failed attempt.
 func (h *Handler) stopWithIntent(id string, stop func() error) error {
-	rec := h.store.GetContainer(id)
+	unlock := h.store.LockContainerLifecycle(id)
+	defer unlock()
+	return h.stopWithIntentLocked(id, stop)
+}
+
+// stopWithIntentLocked is stopWithIntent for callers that already hold the
+// container lifecycle guard (for example force-remove, which must keep the
+// watcher out until the record itself has been removed).
+func (h *Handler) stopWithIntentLocked(id string, stop func() error) error {
 	prev := false
-	if rec != nil {
+	rec, err := h.store.UpdateContainer(id, func(rec *store.ContainerRecord) {
 		prev = rec.StoppedByUser
 		rec.StoppedByUser = true
-		h.store.AddContainer(rec)
+	})
+	if err != nil {
+		return fmt.Errorf("persist stop intent: %w", err)
 	}
-	err := stop()
+	err = stop()
 	if err != nil && rec != nil && !prev {
-		rec.StoppedByUser = false
-		h.store.AddContainer(rec)
+		// Update the current record rather than the pre-stop snapshot: another
+		// goroutine may have changed unrelated lifecycle fields while stop ran.
+		if _, rollbackErr := h.store.UpdateContainer(id, func(current *store.ContainerRecord) {
+			current.StoppedByUser = false
+		}); rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("restore stop intent: %w", rollbackErr))
+		}
 	}
 	return err
 }
@@ -1064,29 +1083,33 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	if s, _ := h.mgr.State(id); s != "running" && s != "paused" {
-		// Nothing to stop — but the request still says "and keep it that way".
-		// Without recording that, a stop aimed at a container the watcher had
-		// just restarted, or one that had exited on its own, answers 304 and
-		// changes nothing, and the next tick brings it back up.
-		h.stopWithIntent(id, func() error { return nil })
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
 	stopSig := ""
 	defaultTO := 0
 	if rec := h.store.GetContainer(id); rec != nil {
 		stopSig = rec.StopSignal
 		defaultTO = rec.StopTimeout
 	}
-	if err := h.stopWithIntent(id, func() error {
+	unlock := h.store.LockContainerLifecycle(id)
+	defer unlock()
+	notModified := false
+	if err := h.stopWithIntentLocked(id, func() error {
+		if s, _ := h.mgr.State(id); s != "running" && s != "paused" {
+			// Nothing to stop — but the request still says "and keep it that
+			// way". This check is under the lifecycle guard, so the watcher
+			// cannot start the container between the check and the response.
+			notModified = true
+			return nil
+		}
 		return h.mgr.StopContainerWithSignal(id, stopTimeoutWithDefault(r, defaultTO), stopSig)
 	}); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	rec := h.store.GetContainer(id)
-	if rec != nil {
+	if notModified {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	rec, err := h.store.UpdateContainer(id, func(rec *store.ContainerRecord) {
 		// StoppedByUser was set ahead of the stop, by stopWithIntent.
 		now := time.Now()
 		rec.FinishedAt = &now
@@ -1095,7 +1118,10 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 			sig = "SIGTERM"
 		}
 		rec.ExitCode = exitCodeForSignal(sig)
-		h.store.AddContainer(rec)
+	})
+	if err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	h.emitContainer("stop", rec)
 	h.emitContainer("die", rec)
@@ -1256,20 +1282,21 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid signal: %s", signal))
 		return
 	}
+	unlock := h.store.LockContainerLifecycle(id)
+	defer unlock()
 	if s, _ := h.mgr.State(id); s != "running" && s != "paused" {
 		errResponse(w, http.StatusConflict, "Container is not running")
 		return
 	}
 	// Same ordering as stop: a kill is the most abrupt exit there is, so the
 	// watcher is most likely to see it before intent lands.
-	if err := h.stopWithIntent(id, func() error {
+	if err := h.stopWithIntentLocked(id, func() error {
 		return h.mgr.KillContainer(id, signal)
 	}); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	rec := h.store.GetContainer(id)
-	if rec != nil {
+	rec, err := h.store.UpdateContainer(id, func(rec *store.ContainerRecord) {
 		// StoppedByUser was set ahead of the kill, by stopWithIntent.
 		now := time.Now()
 		rec.FinishedAt = &now
@@ -1278,7 +1305,10 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 			sig = "SIGKILL"
 		}
 		rec.ExitCode = exitCodeForSignal(sig)
-		h.store.AddContainer(rec)
+	})
+	if err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	h.emitContainer("kill", rec)
 	h.emitContainer("die", rec)
@@ -1297,6 +1327,8 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	force := boolValue(r, "force")
+	unlock := h.store.LockContainerLifecycle(id)
+	defer unlock()
 
 	if force {
 		state, _ := h.mgr.State(id)
@@ -1309,9 +1341,16 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 			// but between this stop finishing and that delete the watcher can
 			// still restart the container — leaving a running CT behind with no
 			// record of it, which is worse than a stop that did not stick.
-			h.stopWithIntent(id, func() error {
-				return h.mgr.StopContainer(id, 5*time.Second)
-			})
+			timeout := 5 * time.Second
+			if rec := h.store.GetContainer(id); rec != nil && rec.StopTimeout > 0 {
+				timeout = time.Duration(rec.StopTimeout) * time.Second
+			}
+			if err := h.stopWithIntentLocked(id, func() error {
+				return h.mgr.StopContainer(id, timeout)
+			}); err != nil {
+				errResponse(w, http.StatusInternalServerError, err.Error())
+				return
+			}
 		}
 	} else {
 		if state, _ := h.mgr.State(id); state == "running" || state == "paused" {
@@ -1599,6 +1638,8 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
+	unlock := h.store.LockContainerLifecycle(id)
+	defer unlock()
 	state, _ := h.mgr.State(id)
 	if state == "running" {
 		defaultTO := 0
@@ -1650,8 +1691,10 @@ func (h *Handler) renameContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	oldName := rec.Name
-	rec.Name = newName
-	if err := h.store.AddContainer(rec); err != nil {
+	rec, err := h.store.UpdateContainer(id, func(current *store.ContainerRecord) {
+		current.Name = newName
+	})
+	if err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
