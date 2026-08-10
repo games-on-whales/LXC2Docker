@@ -196,6 +196,12 @@ type ContainerConfig struct {
 	// re-open latency win: no clone, and the in-rootfs warm state (shader caches,
 	// app config) survives. See reconfigureReusedPVECT.
 	ReuseVMID int
+	// RequestedVMID, when > 0, pins the Proxmox VMID a fresh CT is created with
+	// instead of taking the lowest free one. Set from the "dld.vmid" label, for
+	// callers that need a container at a known, stable id. An id already owned by
+	// any guest in the cluster fails the create rather than silently sliding to
+	// the next free one. Ignored by ReuseVMID, which adopts an existing CT.
+	RequestedVMID int
 }
 
 // ISOMount describes one read-only ISO bind-mount.

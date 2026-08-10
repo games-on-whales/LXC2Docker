@@ -1299,10 +1299,13 @@ func (m *Manager) lanMACForContainer(id string, cfg ContainerConfig) string {
 }
 
 func (m *Manager) createPVEContainer(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
-	vmid, err := allocateVMID()
+	vmid, err := allocateVMID(cfg.RequestedVMID)
 	if err != nil {
 		return fmt.Errorf("manager: %w", err)
 	}
+	// Held only for the create: on success the CT config is on disk and the
+	// reservation is redundant, on failure the id must become free again.
+	defer releaseVMID(vmid)
 
 	// Fill in LAN config from daemon settings before any networking setup.
 	// This may also convert a --network=host container into LAN mode (a CT
@@ -2924,13 +2927,26 @@ var (
 // direct scan of the cluster config dirs. An in-process reservation set closes
 // the same-instant race two concurrent creates would otherwise hit (the same
 // race `pvesh`-then-create has across the cluster, which Proxmox accepts).
-func allocateVMID() (int, error) {
+func allocateVMID(requested int) (int, error) {
 	vmidMu.Lock()
 	defer vmidMu.Unlock()
 
 	used, err := usedVMIDs()
 	if err != nil {
 		return 0, fmt.Errorf("allocate VMID: %w", err)
+	}
+	// A requested id that is already taken is an error rather than a silent bump
+	// to the next free one: the caller pinned it (dld.vmid) precisely because
+	// which id it gets matters, and quietly creating a different CT defeats that.
+	if requested > 0 {
+		if used[requested] {
+			return 0, fmt.Errorf("allocate VMID: %d is already in use by a guest in this cluster", requested)
+		}
+		if vmidReserved[requested] {
+			return 0, fmt.Errorf("allocate VMID: %d is already being created", requested)
+		}
+		vmidReserved[requested] = true
+		return requested, nil
 	}
 	// Drop reservations that have since been committed to disk; only genuinely
 	// in-flight IDs need to stay reserved.
@@ -2948,14 +2964,47 @@ func allocateVMID() (int, error) {
 	}
 }
 
-// usedVMIDs returns the set of VMIDs currently allocated on this node, read from
-// the cluster config: every <vmid>.conf under /etc/pve/lxc (containers) and
-// /etc/pve/qemu-server (VMs). A missing dir is not an error — a node may have no
-// CTs or no VMs.
+// releaseVMID drops an allocation's reservation. Callers defer it for the whole
+// create: by the time a create returns, either the CT config is on disk (so
+// usedVMIDs reports the id used and the reservation is redundant) or the create
+// failed and the id is genuinely free again.
+//
+// This matters most for a pinned id (dld.vmid). An auto-allocated id that leaks
+// a reservation just costs one id out of a huge space, but a leaked reservation
+// on a pinned id makes every later create for that exact id fail with "already
+// being created" until the daemon restarts — turning one transient failure into
+// a permanent one for a container that is trying to restart.
+func releaseVMID(vmid int) {
+	vmidMu.Lock()
+	defer vmidMu.Unlock()
+	delete(vmidReserved, vmid)
+}
+
+// pveGuestGlobs are the config paths every guest id in the cluster appears
+// under. /etc/pve is a cluster filesystem: nodes/<node>/ holds one directory per
+// node and is readable from any of them, while /etc/pve/lxc and
+// /etc/pve/qemu-server are symlinks to *this* node's entries.
+//
+// Both forms are listed because the whole cluster matters here. `pct create`
+// rejects an id owned anywhere ("CT 103 already exists on node 'pve1'"), so
+// scanning only the local node hands out ids a peer holds and every create for
+// such an id fails. The local symlinks stay in the list so a node that is not in
+// a cluster — no nodes/ tree — is still covered. Ids seen twice are a set, so
+// the overlap between the two forms costs nothing.
+var pveGuestGlobs = []string{
+	"/etc/pve/nodes/*/lxc/*.conf",
+	"/etc/pve/nodes/*/qemu-server/*.conf",
+	"/etc/pve/lxc/*.conf",
+	"/etc/pve/qemu-server/*.conf",
+}
+
+// usedVMIDs returns the set of VMIDs allocated anywhere in the cluster, read
+// from the cluster config. A missing dir is not an error — a node may have no
+// CTs, no VMs, or no cluster at all.
 func usedVMIDs() (map[int]bool, error) {
 	used := map[int]bool{}
-	for _, dir := range []string{"/etc/pve/lxc", "/etc/pve/qemu-server"} {
-		entries, err := filepath.Glob(filepath.Join(dir, "*.conf"))
+	for _, pattern := range pveGuestGlobs {
+		entries, err := filepath.Glob(pattern)
 		if err != nil {
 			return nil, err
 		}

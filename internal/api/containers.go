@@ -230,6 +230,18 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg.ReuseVMID = reuseVMID
 
+	// Pin the CT id via the "dld.vmid" label, for callers that need a container
+	// at a known id rather than whatever is lowest and free. Anything that isn't
+	// a plausible Proxmox id is ignored rather than fatal — the create then takes
+	// the next free id, which is the behaviour without the label at all.
+	if v := strings.TrimSpace(req.Labels["dld.vmid"]); v != "" {
+		if vmid, err := strconv.Atoi(v); err == nil && vmid >= 100 {
+			cfg.RequestedVMID = vmid
+		} else {
+			log.Printf("create: ignoring dld.vmid=%q (not a Proxmox guest id)", v)
+		}
+	}
+
 	// Rootfs disk size: the "dld.disksize" label takes precedence over
 	// Docker's --storage-opt size (HostConfig.StorageOpt["size"]). Either way
 	// 0/unset leaves the daemon to size the rootfs from the image.
