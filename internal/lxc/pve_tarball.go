@@ -360,10 +360,13 @@ func resolveRootfsGB(cfg ContainerConfig, tarball string) int {
 // Proxmox template CT, so templates never appear in the Proxmox UI. The
 // container itself is a normal CT, visible in the UI as expected.
 func (m *Manager) createPVEFromTarball(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
-	vmid, err := allocateVMID()
+	vmid, err := allocateVMID(cfg.RequestedVMID)
 	if err != nil {
 		return fmt.Errorf("manager: %w", err)
 	}
+	// Held only for the create: on success the CT config is on disk and the
+	// reservation is redundant, on failure the id must become free again.
+	defer releaseVMID(vmid)
 
 	// Record the VMID in the store record immediately. The `pct create` below
 	// takes several seconds before the CT is started; until the VMID is
@@ -680,10 +683,13 @@ func (m *Manager) ensureImageTemplateCT(imgRec *store.ImageRecord) (int, error) 
 		}
 	}
 
-	vmid, err := allocateVMID()
+	// A template CT is daemon-internal and never the container the caller pinned,
+	// so it always takes the next free id.
+	vmid, err := allocateVMID(0)
 	if err != nil {
 		return 0, fmt.Errorf("manager: %w", err)
 	}
+	defer releaseVMID(vmid)
 
 	sizeGB := tarballRootfsGB(imgRec.TemplateTarball)
 	log.Printf("ensureImageTemplateCT: pct create template %d from tarball for %s (rootfs %dG)", vmid, imgRec.Ref, sizeGB)
@@ -739,10 +745,13 @@ func (m *Manager) createPVELinkedCloneFromTarball(id string, imgRec *store.Image
 		return m.createPVEFromTarball(id, imgRec, cfg)
 	}
 
-	vmid, err := allocateVMID()
+	vmid, err := allocateVMID(cfg.RequestedVMID)
 	if err != nil {
 		return fmt.Errorf("manager: %w", err)
 	}
+	// Held only for the create: on success the CT config is on disk and the
+	// reservation is redundant, on failure the id must become free again.
+	defer releaseVMID(vmid)
 	// Record the VMID up front so gc() doesn't reap the half-built record
 	// mid-clone (same rationale as createPVEFromTarball).
 	if _, err := m.store.UpdateContainer(id, func(storeRec *store.ContainerRecord) {
