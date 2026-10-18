@@ -739,19 +739,31 @@ func (m *Manager) ensureImageTemplateCT(imgRec *store.ImageRecord) (int, error) 
 // pct exactly like the pct-create path. Any failure falls back to that path so a
 // launch never hard-fails on the fast path.
 func (m *Manager) createPVELinkedCloneFromTarball(id string, imgRec *store.ImageRecord, cfg ContainerConfig) error {
-	tmplVMID, err := m.ensureImageTemplateCT(imgRec)
-	if err != nil {
-		log.Printf("createPVELinkedCloneFromTarball: template prep failed (%v); falling back to pct create", err)
-		return m.createPVEFromTarball(id, imgRec, cfg)
-	}
-
+	// Reserve the requested guest ID before allocating an image template, which
+	// otherwise consumes the lowest free ID the caller may have just selected.
 	vmid, err := allocateVMID(cfg.RequestedVMID)
 	if err != nil {
 		return fmt.Errorf("manager: %w", err)
 	}
 	// Held only for the create: on success the CT config is on disk and the
 	// reservation is redundant, on failure the id must become free again.
-	defer releaseVMID(vmid)
+	reserved := true
+	defer func() {
+		if reserved {
+			releaseVMID(vmid)
+		}
+	}()
+	fallback := func() error {
+		// The slow path allocates for itself; release our reservation first.
+		releaseVMID(vmid)
+		reserved = false
+		return m.createPVEFromTarball(id, imgRec, cfg)
+	}
+	tmplVMID, err := m.ensureImageTemplateCT(imgRec)
+	if err != nil {
+		log.Printf("createPVELinkedCloneFromTarball: template prep failed (%v); falling back to pct create", err)
+		return fallback()
+	}
 	// Record the VMID up front so gc() doesn't reap the half-built record
 	// mid-clone (same rationale as createPVEFromTarball).
 	if _, err := m.store.UpdateContainer(id, func(storeRec *store.ContainerRecord) {
@@ -778,7 +790,7 @@ func (m *Manager) createPVELinkedCloneFromTarball(id string, imgRec *store.Image
 	).CombinedOutput(); err != nil {
 		log.Printf("createPVELinkedCloneFromTarball: pct clone failed (%s: %v); falling back to pct create", strings.TrimSpace(string(out)), err)
 		exec.Command("pct", "destroy", fmt.Sprintf("%d", vmid), "--force").Run()
-		return m.createPVEFromTarball(id, imgRec, cfg)
+		return fallback()
 	}
 
 	// The clone inherits the template's image-minimum rootfs; grow it if a larger

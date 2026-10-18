@@ -500,6 +500,11 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		rec.IPAddress = reuseOldIP
 	}
 
+	// Publishing the record makes it visible to the restart watcher. Hold the
+	// lifecycle guard until provisioning and network setup are complete so an
+	// always/unless-stopped policy cannot boot a half-configured CT.
+	unlock := h.store.LockContainerLifecycle(id)
+	defer unlock()
 	if err := h.store.AddContainer(rec); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
