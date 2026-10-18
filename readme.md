@@ -14,7 +14,7 @@ toolchain, so a host already running LXC/Proxmox has everything it needs.
 installs it):
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/games-on-whales/LXC2Docker/main/scripts/install-on-pve.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/games-on-whales/LXC2Docker/beta/scripts/install-on-pve.sh)"
 ```
 
 **Manually**, grab the `.deb` from the [latest release][releases]:

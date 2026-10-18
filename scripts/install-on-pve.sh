@@ -5,7 +5,7 @@
 # the community-scripts CT install runs the daemon inside an LXC in plain-LXC
 # mode instead.
 #
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/games-on-whales/LXC2Docker/main/scripts/install-on-pve.sh)"
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/games-on-whales/LXC2Docker/beta/scripts/install-on-pve.sh)"
 #
 set -eEuo pipefail
 

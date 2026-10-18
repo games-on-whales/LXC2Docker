@@ -86,14 +86,11 @@ tarball: build
 	tar -czf $(TARBALL) -C $(BUILD_DIR)/tar .
 	@echo ">> built $(TARBALL)"
 
-## Cut a release: auto-increments the version from the latest tag and pushes it;
-## CI builds the .deb + tarball and publishes the GitHub release. Default bumps
-## the patch; override the bump or pin a version:
-##   make release              # patch bump (v0.1.4 -> v0.1.5)
-##   make release BUMP=minor   # or BUMP=major
-##   make release VER=1.4.0    # explicit version
+## Publish a calendar release. Existing vYYYY.MM tags are immutable.
+##   make release                  # current UTC month
+##   make release VER=v2026.10      # explicit calendar version
 release:
-	./scripts/release.sh $(if $(VER),$(VER),$(if $(BUMP),--$(BUMP)))
+	./scripts/release.sh $(VER)
 
 ## Remove binary and systemd unit.
 uninstall:
