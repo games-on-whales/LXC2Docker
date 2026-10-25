@@ -2560,24 +2560,10 @@ func (m *Manager) UnpauseContainer(id string) error {
 }
 
 // State returns the Docker-compatible state string for a container.
-// For PVE CTs uses pct status; otherwise lxc-info.
+// Both PVE CTs and legacy containers are queried with lxc-info.
 func (m *Manager) State(id string) (string, error) {
 	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
-		out, err := exec.Command("pct", "status", fmt.Sprintf("%d", rec.VMID)).Output()
-		if err != nil {
-			return "exited", nil
-		}
-		// pct status output: "status: running" or "status: stopped"
-		status := strings.TrimSpace(string(out))
-		status = strings.TrimPrefix(status, "status: ")
-		switch status {
-		case "running":
-			return "running", nil
-		case "stopped":
-			return "exited", nil
-		default:
-			return status, nil
-		}
+		return pveState(rec.VMID), nil
 	}
 
 	out, err := exec.Command("lxc-info", "-n", id, "--lxcpath", m.lxcPath, "-sH").Output()
@@ -2594,6 +2580,33 @@ func (m *Manager) State(id string) (string, error) {
 		return "exited", nil
 	default:
 		return lxcState, nil
+	}
+}
+
+// pveLXCPath is where Proxmox VE keeps the runtime LXC config of a started CT.
+const pveLXCPath = "/var/lib/lxc"
+
+// pveState reports a PVE CT's state the way `pct status` did, but via
+// lxc-info. pct is a Perl CLI that loads the PVE stack on every call (~0.8 s
+// CPU), and State runs on every inspect/list and every 200 ms per
+// /containers/{id}/wait client; lxc-info answers in a few ms.
+//
+// pct status only distinguishes running from stopped: it reports "running"
+// while the CT's LXC monitor is up, which includes a frozen CT.
+// Keep that mapping: a "paused" here would end a pending /wait, which treats
+// anything but "running" as exited. A CT lxc-info cannot query maps to
+// "exited", as the pct error path did.
+func pveState(vmid int) string {
+	out, err := exec.Command("lxc-info", "-n", strconv.Itoa(vmid),
+		"--lxcpath", pveLXCPath, "-sH").Output()
+	if err != nil {
+		return "exited"
+	}
+	switch strings.ToUpper(strings.TrimSpace(string(out))) {
+	case "STOPPED", "":
+		return "exited"
+	default: // RUNNING, STARTING, STOPPING, ABORTING, FREEZING, FROZEN, THAWED
+		return "running"
 	}
 }
 

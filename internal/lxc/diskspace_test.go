@@ -1,6 +1,7 @@
 package lxc
 
 import (
+	"os"
 	"testing"
 )
 
@@ -47,7 +48,7 @@ func TestFreeBytes(t *testing.T) {
 func TestCheckCreateDiskPressure(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
+	dir := diskBackedTempDir(t)
 	free, err := FreeBytes(dir)
 	if err != nil {
 		t.Fatalf("FreeBytes: %v", err)
@@ -101,4 +102,25 @@ func TestHumanBytes(t *testing.T) {
 			t.Errorf("humanBytes(%d) = %q, want %q", in, got, want)
 		}
 	}
+}
+
+// diskBackedTempDir returns a temp dir the guardrail actually checks.
+// t.TempDir() lives under /tmp, which is a tmpfs on Debian 13 / PVE 9, and
+// checkCreateDiskPressure skips tmpfs sources by design. Fall back to a dir
+// beside the package sources (the checkout is disk-backed), and skip only
+// when that is a tmpfs too.
+func diskBackedTempDir(t *testing.T) string {
+	t.Helper()
+	if dir := t.TempDir(); !isTmpfs(dir) {
+		return dir
+	}
+	dir, err := os.MkdirTemp(".", "diskspace-test-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	if isTmpfs(dir) {
+		t.Skipf("no disk-backed temp dir available (%s is tmpfs)", dir)
+	}
+	return dir
 }

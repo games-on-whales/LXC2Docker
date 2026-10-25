@@ -208,3 +208,51 @@ var errStopFailed = errStop("stop failed")
 type errStop string
 
 func (e errStop) Error() string { return string(e) }
+
+// /containers/{id}/wait reports the record the moment it sees the exit, which
+// happens inside the stop. The exit code must already be there by then, or the
+// wait returns the previous run's code (0 instead of 143 for a SIGTERM stop).
+func TestStopRecordingExitRecordsCodeBeforeStopping(t *testing.T) {
+	h, rec := stopIntentFixture(t)
+
+	seenDuringStop := -1
+	err := h.stopRecordingExit(rec.ID, 143, func() error {
+		seenDuringStop = h.store.GetContainer(rec.ID).ExitCode
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("stopRecordingExit: %v", err)
+	}
+	if seenDuringStop != 143 {
+		t.Fatalf("ExitCode during stop = %d, want 143", seenDuringStop)
+	}
+}
+
+// A failed stop left the container running, so it keeps the code of its last
+// real exit.
+func TestStopRecordingExitRestoresCodeWhenTheStopFails(t *testing.T) {
+	h, rec := stopIntentFixture(t)
+	rec.ExitCode = 3
+	if err := h.store.AddContainer(rec); err != nil {
+		t.Fatalf("AddContainer: %v", err)
+	}
+
+	if err := h.stopRecordingExit(rec.ID, 137, func() error { return errStopFailed }); err != errStopFailed {
+		t.Fatalf("stopRecordingExit err = %v, want %v", err, errStopFailed)
+	}
+	if got := h.store.GetContainer(rec.ID).ExitCode; got != 3 {
+		t.Fatalf("ExitCode after failed stop = %d, want 3", got)
+	}
+}
+
+func TestStopRecordingExitToleratesAMissingRecord(t *testing.T) {
+	h, _ := stopIntentFixture(t)
+
+	ran := false
+	if err := h.stopRecordingExit("nosuchcontainer", 143, func() error { ran = true; return nil }); err != nil {
+		t.Fatalf("stopRecordingExit: %v", err)
+	}
+	if !ran {
+		t.Fatal("the stop was skipped for a container with no store record")
+	}
+}
