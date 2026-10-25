@@ -175,7 +175,7 @@ func (m *Manager) reconcile() {
 			continue
 		}
 		state, _ := m.State(rec.ID)
-		if state == "running" && rec.IPAddress != "" {
+		if IsLive(state) && rec.IPAddress != "" {
 			if rec.VMID == 0 {
 				if err := m.ensureBridgeAttachment(rec.ID); err != nil {
 					log.Printf("reconcile: bridge attach for %s (%s) failed: %v", rec.Name, rec.ID[:12], err)
@@ -304,7 +304,8 @@ func (m *Manager) reconcilePortForwards() {
 		// transient blip; a truly dead container is normally removed from the
 		// store (so it drops out of this loop and is pruned) rather than left
 		// readable-as-erroring.
-		running := sterr != nil || st == "running"
+		// A paused container keeps its IP and its published ports.
+		running := sterr != nil || IsLive(st)
 		if !running {
 			continue
 		}
@@ -457,7 +458,11 @@ func (m *Manager) runDueHealthchecks(now time.Time, emit HealthEmitter) {
 		if len(rec.HealthcheckTest) == 1 && rec.HealthcheckTest[0] == "NONE" {
 			continue
 		}
-		if state, _ := m.State(rec.ID); state != "running" {
+		state, _ := m.State(rec.ID)
+		if state == "paused" {
+			continue // no probes while frozen; keep the last health status
+		}
+		if state != "running" {
 			// Reset to "starting" when the container restarts.
 			if rec.HealthStatus != "starting" {
 				m.store.UpdateContainer(rec.ID, func(current *store.ContainerRecord) {
@@ -724,11 +729,11 @@ func (m *Manager) enforceRestartPolicy(id string, emit RestartEmitter) {
 //   - ""/"no"         → never
 //   - "always"        → always, even if the user stopped it
 //   - "unless-stopped"→ restart unless StoppedByUser is set
-//   - "on-failure"    → restart up to MaximumRetryCount times; we can't
-//     distinguish "failure" from "clean exit" without an exit code (LXC's
-//     State() doesn't expose one), so we treat every exit as failure. The
-//     retry cap prevents infinite loops for containers that exit
-//     immediately.
+//   - "on-failure"    → restart up to MaximumRetryCount times. Every exit
+//     counts as a failure: the exit monitor records non-zero codes, but an
+//     init killed by a signal (e.g. OOM) also reads as 0 there, so a 0 cannot
+//     be told apart from a clean exit. The retry cap prevents infinite loops
+//     for containers that exit immediately.
 func shouldRestart(rec *store.ContainerRecord) bool {
 	switch rec.RestartPolicy {
 	case "always":
@@ -1730,7 +1735,7 @@ func parseChownEntry(entry string) (path string, uid, gid int) {
 // For Proxmox CTs (VMID > 0), uses pct start; otherwise lxc-start.
 func (m *Manager) StartContainer(id string) error {
 	state, _ := m.State(id)
-	if state == "running" {
+	if IsLive(state) {
 		return nil
 	}
 
@@ -1780,13 +1785,14 @@ func (m *Manager) StartContainer(id string) error {
 }
 
 // stampStarted records the start time on a container that just came up, and
-// clears the previous run's exit time. Docker refreshes StartedAt on every
-// start, not just the first, so this re-stamps on restarts too.
+// clears the previous run's exit time and code. Docker refreshes StartedAt on
+// every start, not just the first, so this re-stamps on restarts too.
 func (m *Manager) stampStarted(id string) {
 	now := time.Now()
 	if _, err := m.store.UpdateContainer(id, func(rec *store.ContainerRecord) {
 		rec.StartedAt = &now
 		rec.FinishedAt = nil
+		rec.ExitCode = 0
 	}); err != nil {
 		log.Printf("StartContainer: persist StartedAt for %s: %v", shortID(id), err)
 	}
@@ -1801,7 +1807,7 @@ func (m *Manager) ensurePortForwards(id string) {
 	if rec == nil || rec.IPAddress == "" || len(rec.PortBindings) == 0 {
 		return
 	}
-	if st, _ := m.State(id); st != "running" {
+	if st, _ := m.State(id); !IsLive(st) {
 		return
 	}
 	for _, pb := range rec.PortBindings {
@@ -2281,6 +2287,7 @@ func (m *Manager) StopContainerWithSignal(id string, timeout time.Duration, sign
 		}
 	}
 
+	m.thawIfPaused(id)
 	state, _ := m.State(id)
 	if state != "running" {
 		return nil
@@ -2354,6 +2361,7 @@ func (m *Manager) KillContainer(id, signal string) error {
 	}
 
 	rec := m.store.GetContainer(id)
+	m.thawIfPaused(id)
 
 	if signal == "KILL" || signal == "9" || signal == "SIGKILL" {
 		if rec != nil && rec.VMID > 0 {
@@ -2422,8 +2430,8 @@ func (m *Manager) RemoveContainer(id string) error {
 	}
 
 	state, _ := m.State(id)
-	if state == "running" {
-		return fmt.Errorf("manager: cannot remove running container %s; stop it first", id)
+	if IsLive(state) {
+		return fmt.Errorf("manager: cannot remove %s container %s; stop it first", state, id)
 	}
 
 	// Drop the per-container state dir (the id-embedded /etc/hostname source).
@@ -2526,88 +2534,88 @@ func (m *Manager) RemoveImage(ref string) error {
 	return m.store.RemoveImage(ref)
 }
 
-// PauseContainer freezes the container's processes. Uses pct suspend for PVE
-// CTs (which writes the freezer cgroup) and lxc-freeze for legacy containers.
+// PauseContainer freezes the container's processes with lxc-freeze, for PVE
+// CTs and legacy containers alike. pct suspend is not a freeze: on PVE 9 it is
+// a CRIU checkpoint (lxc-checkpoint -s), which fails for ordinary CTs and
+// leaves them running.
 func (m *Manager) PauseContainer(id string) error {
-	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
-		out, err := exec.Command("pct", "suspend", fmt.Sprintf("%d", rec.VMID)).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("manager: pct suspend %d: %s: %w", rec.VMID, out, err)
-		}
-		return nil
-	}
-	out, err := exec.Command("lxc-freeze", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
+	name, lxcPath := m.lxcName(id)
+	out, err := exec.Command("lxc-freeze", "-n", name, "--lxcpath", lxcPath).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: freeze %s: %s: %w", id, out, err)
+		return fmt.Errorf("manager: freeze %s: %s: %w", name, out, err)
 	}
 	return nil
 }
 
 // UnpauseContainer resumes a frozen container.
 func (m *Manager) UnpauseContainer(id string) error {
-	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
-		out, err := exec.Command("pct", "resume", fmt.Sprintf("%d", rec.VMID)).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("manager: pct resume %d: %s: %w", rec.VMID, out, err)
-		}
-		return nil
-	}
-	out, err := exec.Command("lxc-unfreeze", "-n", id, "--lxcpath", m.lxcPath).CombinedOutput()
+	name, lxcPath := m.lxcName(id)
+	out, err := exec.Command("lxc-unfreeze", "-n", name, "--lxcpath", lxcPath).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("manager: unfreeze %s: %s: %w", id, out, err)
+		return fmt.Errorf("manager: unfreeze %s: %s: %w", name, out, err)
 	}
 	return nil
 }
 
-// State returns the Docker-compatible state string for a container.
-// Both PVE CTs and legacy containers are queried with lxc-info.
-func (m *Manager) State(id string) (string, error) {
-	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
-		return pveState(rec.VMID), nil
+// thawIfPaused resumes a paused container so a stop or kill can act on it. A
+// frozen init cannot run its signal handlers, so a graceful stop would always
+// time out; Docker likewise resumes a paused container it stops or kills.
+func (m *Manager) thawIfPaused(id string) {
+	if st, _ := m.State(id); st == "paused" {
+		if err := m.UnpauseContainer(id); err != nil {
+			log.Printf("manager: thaw %s before stop: %v", id, err)
+		}
 	}
+}
 
-	out, err := exec.Command("lxc-info", "-n", id, "--lxcpath", m.lxcPath, "-sH").Output()
-	if err != nil {
-		return "exited", nil
-	}
-	lxcState := strings.ToLower(strings.TrimSpace(string(out)))
-	switch lxcState {
-	case "running":
-		return "running", nil
-	case "frozen":
-		return "paused", nil
-	case "stopped":
-		return "exited", nil
-	default:
-		return lxcState, nil
-	}
+// State returns the Docker-compatible state string for a container: one of
+// "running", "paused" or "exited". Both PVE CTs and legacy containers are
+// queried with lxc-info; pct status (a Perl CLI, ~0.8 s CPU per call) is far
+// too slow for a function that runs on every inspect/list and every 200 ms per
+// /containers/{id}/wait client.
+func (m *Manager) State(id string) (string, error) {
+	name, lxcPath := m.lxcName(id)
+	return lxcInfoState(name, lxcPath), nil
 }
 
 // pveLXCPath is where Proxmox VE keeps the runtime LXC config of a started CT.
 const pveLXCPath = "/var/lib/lxc"
 
-// pveState reports a PVE CT's state the way `pct status` did, but via
-// lxc-info. pct is a Perl CLI that loads the PVE stack on every call (~0.8 s
-// CPU), and State runs on every inspect/list and every 200 ms per
-// /containers/{id}/wait client; lxc-info answers in a few ms.
-//
-// pct status only distinguishes running from stopped: it reports "running"
-// while the CT's LXC monitor is up, which includes a frozen CT.
-// Keep that mapping: a "paused" here would end a pending /wait, which treats
-// anything but "running" as exited. A CT lxc-info cannot query maps to
-// "exited", as the pct error path did.
-func pveState(vmid int) string {
-	out, err := exec.Command("lxc-info", "-n", strconv.Itoa(vmid),
-		"--lxcpath", pveLXCPath, "-sH").Output()
+// lxcName returns the LXC container name and lxcpath for a container: the VMID
+// on the PVE lxcpath for a Proxmox CT, the Docker ID on the daemon's lxcpath
+// otherwise.
+func (m *Manager) lxcName(id string) (string, string) {
+	if rec := m.store.GetContainer(id); rec != nil && rec.VMID > 0 {
+		return strconv.Itoa(rec.VMID), pveLXCPath
+	}
+	return id, m.lxcPath
+}
+
+// lxcInfoState maps lxc-info's state onto Docker's. A container lxc-info
+// cannot query (never started, or a stopped PVE CT) is "exited". Transitional
+// states count as the state they leave or enter while the init is still alive
+// (STARTING/STOPPING/ABORTING/THAWED are "running", FREEZING is "paused"), so
+// a /wait or a stop never sees a container as exited before it really is.
+func lxcInfoState(name, lxcPath string) string {
+	out, err := exec.Command("lxc-info", "-n", name, "--lxcpath", lxcPath, "-sH").Output()
 	if err != nil {
 		return "exited"
 	}
 	switch strings.ToUpper(strings.TrimSpace(string(out))) {
 	case "STOPPED", "":
 		return "exited"
-	default: // RUNNING, STARTING, STOPPING, ABORTING, FREEZING, FROZEN, THAWED
+	case "FROZEN", "FREEZING":
+		return "paused"
+	default: // RUNNING, STARTING, STOPPING, ABORTING, THAWED
 		return "running"
 	}
+}
+
+// IsLive reports whether a State() value means the container's processes
+// exist: running, or paused (frozen, but still holding its rootfs, IP and
+// published ports).
+func IsLive(state string) bool {
+	return state == "running" || state == "paused"
 }
 
 // Exec runs cmd inside the container. For PVE CTs uses pct exec;

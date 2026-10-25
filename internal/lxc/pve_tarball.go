@@ -482,8 +482,8 @@ func (m *Manager) reconfigureReusedPVECT(id string, cfg ContainerConfig) error {
 	if _, err := os.Stat(pveConfigPath(vmid)); err != nil {
 		return fmt.Errorf("reused CT %d config missing: %w", vmid, err)
 	}
-	if st, _ := m.State(id); st == "running" {
-		return fmt.Errorf("reused CT %d is running", vmid)
+	if st, _ := m.State(id); IsLive(st) {
+		return fmt.Errorf("reused CT %d is %s", vmid, st)
 	}
 
 	rec := m.store.GetContainer(id)

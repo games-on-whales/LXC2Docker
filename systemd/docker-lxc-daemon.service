@@ -19,9 +19,8 @@ RestartSec=5s
 User=root
 Group=root
 
-# Give the socket group ownership to 'docker' if it exists, so non-root
-# users in the docker group can connect exactly as with the real Docker daemon.
-ExecStartPost=/bin/sh -c 'getent group docker && chown root:docker /var/run/docker.sock || true'
+# The daemon gives its socket to the 'docker' group itself once it is
+# listening (an ExecStartPost here ran before the socket existed).
 
 # Ensure state directory exists
 RuntimeDirectory=docker-lxc-daemon

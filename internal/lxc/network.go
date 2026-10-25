@@ -69,20 +69,8 @@ func EnsureBridge() error {
 		}
 	}
 
-	// Ensure the nftables table exists with the masquerade rule.
-	// Using "nft -f" with a table block is idempotent — it merges into any
-	// existing table rather than replacing it.
-	nftRule := fmt.Sprintf(`
-table ip %s {
-	chain postrouting {
-		type nat hook postrouting priority srcnat; policy accept;
-		ip saddr 10.100.0.0/24 oifname != "%s" masquerade
-		ct status dnat masquerade
-	}
-}
-`, NATTableName, BridgeName)
 	cmd := exec.Command("nft", "-f", "-")
-	cmd.Stdin = strings.NewReader(nftRule)
+	cmd.Stdin = strings.NewReader(masqueradeScript())
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("network: nft masquerade: %s: %w", out, err)
 	}
@@ -96,6 +84,30 @@ table ip %s {
 	ensureForwardAccept(BridgeName)
 
 	return nil
+}
+
+// masqueradeScript is the nft -f script that converges the managed table's
+// postrouting chain to exactly its two masquerade rules. A table block merges
+// the table and chain but *appends* the rules it lists, and EnsureBridge runs
+// every 30 s from the network reconciler, so without the flush the chain grew
+// by two rules per tick. The script is one nft transaction, so the chain is
+// never observed empty. Nothing else writes to postrouting (DNAT lives in
+// prerouting/output), so flushing it drops nothing.
+func masqueradeScript() string {
+	return fmt.Sprintf(`
+table ip %[1]s {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+	}
+}
+flush chain ip %[1]s postrouting
+table ip %[1]s {
+	chain postrouting {
+		ip saddr 10.100.0.0/24 oifname != "%[2]s" masquerade
+		ct status dnat masquerade
+	}
+}
+`, NATTableName, BridgeName)
 }
 
 // ensureForwardAccept idempotently inserts iptables FORWARD ACCEPT rules for

@@ -122,7 +122,13 @@ func (h *Handler) execCreate(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	if state, _ := h.mgr.State(containerID); state != "running" && state != "paused" {
+	switch state, _ := h.mgr.State(containerID); state {
+	case "running":
+	case "paused":
+		// A process started in a frozen cgroup never runs; the exec would hang.
+		errResponse(w, http.StatusConflict, fmt.Sprintf("Container %s is paused, unpause the container before exec", containerID))
+		return
+	default:
 		errResponse(w, http.StatusConflict, "Container is not running")
 		return
 	}
