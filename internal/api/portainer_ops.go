@@ -87,16 +87,32 @@ func (h *Handler) resizeExec(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /containers/{id}/pause
-// LXC freeze requires the freezer cgroup, which is not available for
-// unprivileged containers on modern kernels. Return a clear 409 so Portainer
-// surfaces a real message instead of a mystery 404.
+// Freezes the container's processes (lxc-freeze; the cgroup v2 freezer works
+// for unprivileged CTs). A paused container stays "live": it keeps its IP and
+// ports, a /wait on it keeps waiting, and stop/kill resume it first.
 func (h *Handler) pauseContainer(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
 	if id == "" {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	errResponse(w, http.StatusConflict, "pause is not supported by docker-lxc-daemon")
+	unlock := h.store.LockContainerLifecycle(id)
+	defer unlock()
+	switch state, _ := h.mgr.State(id); state {
+	case "paused":
+		errResponse(w, http.StatusConflict, fmt.Sprintf("Container %s is already paused", id))
+		return
+	case "running":
+	default:
+		errResponse(w, http.StatusConflict, fmt.Sprintf("Container %s is not running", id))
+		return
+	}
+	if err := h.mgr.PauseContainer(id); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.emitContainer("pause", h.store.GetContainer(id))
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // POST /containers/{id}/unpause
@@ -106,7 +122,18 @@ func (h *Handler) unpauseContainer(w http.ResponseWriter, r *http.Request) {
 		errResponse(w, http.StatusNotFound, "No such container")
 		return
 	}
-	errResponse(w, http.StatusConflict, "unpause is not supported by docker-lxc-daemon")
+	unlock := h.store.LockContainerLifecycle(id)
+	defer unlock()
+	if state, _ := h.mgr.State(id); state != "paused" {
+		errResponse(w, http.StatusConflict, fmt.Sprintf("Container %s is not paused", id))
+		return
+	}
+	if err := h.mgr.UnpauseContainer(id); err != nil {
+		errResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.emitContainer("unpause", h.store.GetContainer(id))
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // POST /containers/{id}/update
@@ -252,8 +279,8 @@ func (h *Handler) pruneContainers(w http.ResponseWriter, r *http.Request) {
 	var reclaimed int64
 	for _, rec := range h.store.ListContainers() {
 		state, _ := h.mgr.State(rec.ID)
-		if state == "running" {
-			continue
+		if lxc.IsLive(state) {
+			continue // prune never removes a running or paused container
 		}
 		if !pruneEligible(rec.Created, rec.Labels, filters, until) {
 			continue

@@ -354,3 +354,41 @@ func TestBareImageRef(t *testing.T) {
 		t.Fatalf("unexpected registry strip behavior: %q", got)
 	}
 }
+
+func TestBareImageRefDefaultsTheTag(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		"alpine":                          "alpine:latest",
+		"docker.io/library/alpine":        "alpine:latest",
+		"ghcr.io/org/app":                 "org/app:latest",
+		"registry:5000/app":               "app:latest", // the port is not a tag
+		"alpine:3.19":                     "alpine:3.19",
+		"alpine@sha256:0123456789abcdef0": "alpine@sha256:0123456789abcdef0",
+	}
+	for in, want := range cases {
+		if got := bareImageRef(in); got != want {
+			t.Errorf("bareImageRef(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The implicit pull in container create once stored images under the untagged
+// name; a later lookup for the tagged name must still find them.
+func TestGetImageMatchesAnUntaggedRecordForLatest(t *testing.T) {
+	t.Parallel()
+
+	s, err := NewAt(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewAt: %v", err)
+	}
+	if err := s.AddImage(&ImageRecord{Ref: "alpine", ID: "sha256:abc"}); err != nil {
+		t.Fatalf("AddImage: %v", err)
+	}
+	if s.GetImage("alpine:latest") == nil {
+		t.Fatal(`GetImage("alpine:latest") did not find the record stored as "alpine"`)
+	}
+	if s.GetImage("alpine:3.19") != nil {
+		t.Fatal(`GetImage("alpine:3.19") matched the "alpine" (latest) record`)
+	}
+}

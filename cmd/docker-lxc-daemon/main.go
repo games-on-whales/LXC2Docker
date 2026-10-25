@@ -101,15 +101,11 @@ func main() {
 		log.Printf("warning: chmod socket: %v", err)
 	}
 
-	// Create a compatibility symlink at /var/run/docker.sock so Docker
-	// clients and compose files work without modification.
-	compatSocket := "/var/run/docker.sock"
-	if *socketPath != compatSocket {
-		os.Remove(compatSocket)
-		if err := os.Symlink(*socketPath, compatSocket); err != nil {
-			log.Printf("warning: symlink %s → %s: %v", compatSocket, *socketPath, err)
-		}
-	}
+	chownSocketToDockerGroup(*socketPath)
+
+	// Link /var/run/docker.sock to the socket so Docker clients and compose
+	// files work without modification, unless another daemon is serving it.
+	ownsCompatLink := linkCompatSocket(compatSocketPath, *socketPath)
 
 	srv := &http.Server{Handler: handler}
 
@@ -123,6 +119,8 @@ func main() {
 	mgr.StartNetworkReconciler(ctx)
 	// Start the restart-policy / AutoRemove watcher.
 	mgr.StartRestartWatcherWithEmitter(ctx, restartEmit)
+	// Record the exit code of containers whose init exits on its own.
+	mgr.StartExitMonitor(ctx)
 	// Start the HEALTHCHECK runner so Portainer's health badge updates.
 	mgr.StartHealthWatcher(ctx, healthEmit)
 	// Warn (log + event) when a watched filesystem is running out of space,
@@ -143,6 +141,9 @@ func main() {
 			log.Printf("container shutdown: %v", err)
 		}
 		lxc.TeardownBridge()
+		if ownsCompatLink {
+			unlinkCompatSocket(compatSocketPath, *socketPath)
+		}
 	}()
 
 	fmt.Printf("docker-lxc-daemon listening on %s\n", *socketPath)

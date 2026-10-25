@@ -113,7 +113,7 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	// X-Registry-Auth on this request (same decoder as /images/create).
 	if rec := h.store.GetImage(imageRef); rec == nil || !h.mgr.ImageReady(rec) {
 		creds := decodeRegistryAuth(r.Header.Get("X-Registry-Auth"))
-		pullErr := h.mgr.PullImageWith(req.Image, "amd64", lxc.PullOpts{
+		pullErr := h.mgr.PullImageWith(imageRef, "amd64", lxc.PullOpts{
 			Credentials: creds,
 		})
 		if pullErr != nil {
@@ -585,7 +585,7 @@ func (h *Handler) reusableContainer(old *store.ContainerRecord, imageRef string)
 			old.VMID, imageRef, old.ImageDigest, curDigest)
 		return false
 	}
-	if st, _ := h.mgr.State(old.ID); st == "running" {
+	if st, _ := h.mgr.State(old.ID); lxc.IsLive(st) {
 		return false // can't reconfigure a live container out from under itself
 	}
 	return true
@@ -610,7 +610,7 @@ func (h *Handler) listContainers(w http.ResponseWriter, r *http.Request) {
 		if state == "exited" && rec.StartedAt == nil {
 			state = "created"
 		}
-		if !all && state != "running" {
+		if !all && !lxc.IsLive(state) { // docker ps lists paused containers too
 			continue
 		}
 		// Filter evaluation. The "status" filter accepts the same state
@@ -1002,8 +1002,13 @@ func (h *Handler) startContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	unlock := h.store.LockContainerLifecycle(id)
 	defer unlock()
-	if s, _ := h.mgr.State(id); s == "running" {
+	s, _ := h.mgr.State(id)
+	if s == "running" {
 		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	if s == "paused" {
+		errResponse(w, http.StatusConflict, "cannot start a paused container, try unpause instead")
 		return
 	}
 	if err := h.mgr.StartContainer(id); err != nil {
@@ -1239,7 +1244,7 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wasRunning := false
-	if state, _ := h.mgr.State(id); state == "running" {
+	if state, _ := h.mgr.State(id); lxc.IsLive(state) {
 		wasRunning = true
 	}
 
@@ -1280,7 +1285,7 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 			}
 		case "next-exit":
 			state, _ := h.mgr.State(id)
-			if !wasRunning && state == "running" {
+			if !wasRunning && lxc.IsLive(state) {
 				wasRunning = true
 			}
 			rec := h.store.GetContainer(id)
@@ -1288,13 +1293,13 @@ func (h *Handler) waitContainer(w http.ResponseWriter, r *http.Request) {
 			// is never observed "running"; detect it via StartedAt being set
 			// after the wait began.
 			startedDuringWait := rec != nil && rec.StartedAt != nil && rec.StartedAt.After(waitStart)
-			if state != "running" && (wasRunning || startedDuringWait) {
+			if !lxc.IsLive(state) && (wasRunning || startedDuringWait) {
 				sendResult(rec)
 				return
 			}
 		default:
 			state, _ := h.mgr.State(id)
-			if state != "running" {
+			if !lxc.IsLive(state) {
 				sendResult(h.store.GetContainer(id))
 				return
 			}
@@ -1397,9 +1402,14 @@ func (h *Handler) removeContainer(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		if state, _ := h.mgr.State(id); state == "running" || state == "paused" {
+		switch state, _ := h.mgr.State(id); state {
+		case "running":
 			errResponse(w, http.StatusConflict,
 				"You cannot remove a running container. Stop the container before attempting removal or use force")
+			return
+		case "paused":
+			errResponse(w, http.StatusConflict,
+				"You cannot remove a paused container. Unpause and then stop the container before attempting removal or force remove")
 			return
 		}
 	}
@@ -1685,7 +1695,7 @@ func (h *Handler) restartContainer(w http.ResponseWriter, r *http.Request) {
 	unlock := h.store.LockContainerLifecycle(id)
 	defer unlock()
 	state, _ := h.mgr.State(id)
-	if state == "running" {
+	if lxc.IsLive(state) {
 		defaultTO := 0
 		if rec := h.store.GetContainer(id); rec != nil {
 			defaultTO = rec.StopTimeout
@@ -1759,7 +1769,7 @@ func (h *Handler) topContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state, _ := h.mgr.State(id)
-	if state != "running" {
+	if !lxc.IsLive(state) {
 		errResponse(w, http.StatusConflict, "container is not running")
 		return
 	}

@@ -82,7 +82,7 @@ func (m *Manager) watchedPaths() []string {
 		add("/" + m.pveStorage)
 	}
 	for _, rec := range m.store.ListContainers() {
-		if state, _ := m.State(rec.ID); state != "running" {
+		if state, _ := m.State(rec.ID); !IsLive(state) {
 			continue
 		}
 		for _, mnt := range rec.Mounts {

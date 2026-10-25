@@ -593,9 +593,10 @@ func (s *Store) GetImage(ref string) *ImageRecord {
 	return nil
 }
 
-// bareImageRef strips registry and "library/" prefixes from an image ref.
+// bareImageRef strips registry and "library/" prefixes from an image ref and
+// defaults a missing tag to "latest", as Docker does.
 // "docker.io/library/nginx:latest" → "nginx:latest"
-// "nginx:latest" → "nginx:latest"
+// "nginx" → "nginx:latest"
 func bareImageRef(ref string) string {
 	// Strip registry (anything with a dot before the first slash).
 	if i := strings.Index(ref, "/"); i != -1 {
@@ -606,6 +607,12 @@ func bareImageRef(ref string) string {
 	}
 	// Strip "library/" prefix (Docker Hub default namespace).
 	ref = strings.TrimPrefix(ref, "library/")
+	// Default the tag. A record stored under "alpine" (an implicit pull once
+	// passed the untagged name) must still match a lookup for "alpine:latest".
+	// Only the last path component carries the tag; a digest ref has none.
+	if !strings.Contains(ref, "@") && !strings.Contains(ref[strings.LastIndex(ref, "/")+1:], ":") {
+		ref += ":latest"
+	}
 	return ref
 }
 
