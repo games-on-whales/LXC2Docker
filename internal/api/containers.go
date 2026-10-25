@@ -1093,6 +1093,31 @@ func (h *Handler) stopWithIntentLocked(id string, stop func() error) error {
 	return err
 }
 
+// stopRecordingExit records the exit code a stop or kill will leave before
+// running it. The container goes down inside stop, and /containers/{id}/wait
+// reports the record as soon as it sees the exit, so a code written afterwards
+// loses to a poll landing in between and the wait returns the previous run's
+// code. A stop that fails restores the previous value.
+func (h *Handler) stopRecordingExit(id string, exitCode int, stop func() error) error {
+	prev := 0
+	rec, err := h.store.UpdateContainer(id, func(rec *store.ContainerRecord) {
+		prev = rec.ExitCode
+		rec.ExitCode = exitCode
+	})
+	if err != nil {
+		return fmt.Errorf("persist exit code: %w", err)
+	}
+	err = stop()
+	if err != nil && rec != nil {
+		if _, rollbackErr := h.store.UpdateContainer(id, func(current *store.ContainerRecord) {
+			current.ExitCode = prev
+		}); rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("restore exit code: %w", rollbackErr))
+		}
+	}
+	return err
+}
+
 // POST /containers/{id}/stop
 func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 	id := h.resolveID(mux.Vars(r)["id"])
@@ -1106,6 +1131,10 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		stopSig = rec.StopSignal
 		defaultTO = rec.StopTimeout
 	}
+	sig := stopSig
+	if sig == "" {
+		sig = "SIGTERM"
+	}
 	unlock := h.store.LockContainerLifecycle(id)
 	defer unlock()
 	notModified := false
@@ -1117,7 +1146,9 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 			notModified = true
 			return nil
 		}
-		return h.mgr.StopContainerWithSignal(id, stopTimeoutWithDefault(r, defaultTO), stopSig)
+		return h.stopRecordingExit(id, exitCodeForSignal(sig), func() error {
+			return h.mgr.StopContainerWithSignal(id, stopTimeoutWithDefault(r, defaultTO), stopSig)
+		})
 	}); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1127,14 +1158,9 @@ func (h *Handler) stopContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec, err := h.store.UpdateContainer(id, func(rec *store.ContainerRecord) {
-		// StoppedByUser was set ahead of the stop, by stopWithIntent.
+		// StoppedByUser and ExitCode were set ahead of the stop.
 		now := time.Now()
 		rec.FinishedAt = &now
-		sig := stopSig
-		if sig == "" {
-			sig = "SIGTERM"
-		}
-		rec.ExitCode = exitCodeForSignal(sig)
 	})
 	if err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
@@ -1307,21 +1333,22 @@ func (h *Handler) killContainer(w http.ResponseWriter, r *http.Request) {
 	}
 	// Same ordering as stop: a kill is the most abrupt exit there is, so the
 	// watcher is most likely to see it before intent lands.
+	sig := signal
+	if sig == "" {
+		sig = "SIGKILL"
+	}
 	if err := h.stopWithIntentLocked(id, func() error {
-		return h.mgr.KillContainer(id, signal)
+		return h.stopRecordingExit(id, exitCodeForSignal(sig), func() error {
+			return h.mgr.KillContainer(id, signal)
+		})
 	}); err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	rec, err := h.store.UpdateContainer(id, func(rec *store.ContainerRecord) {
-		// StoppedByUser was set ahead of the kill, by stopWithIntent.
+		// StoppedByUser and ExitCode were set ahead of the kill.
 		now := time.Now()
 		rec.FinishedAt = &now
-		sig := signal
-		if sig == "" {
-			sig = "SIGKILL"
-		}
-		rec.ExitCode = exitCodeForSignal(sig)
 	})
 	if err != nil {
 		errResponse(w, http.StatusInternalServerError, err.Error())
