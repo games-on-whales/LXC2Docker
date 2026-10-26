@@ -425,6 +425,18 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		imageDigest = ir.RepoDigest
 	}
 
+	// A pinned id still held by the container this one replaces (compose
+	// recreate) is free by the time the replacement starts, so its CT is built
+	// then. Anything else holding the id fails the create below.
+	deferCT := false
+	if cfg.RequestedVMID > 0 && reuseVMID == 0 {
+		if old := replacedPinnedHolder(h.store, cfg.RequestedVMID, req.Labels); old != nil && old.ID != id {
+			log.Printf("createContainer: VMID %d is still held by %s, which this container replaces; creating the CT on first start",
+				cfg.RequestedVMID, old.Name)
+			deferCT = true
+		}
+	}
+
 	// Persist record before creating so the IP is allocated.
 	rec := &store.ContainerRecord{
 		ID:              id,
@@ -511,7 +523,11 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("createContainer: creating LXC container %s (image=%s)", id[:12], req.Image)
-	if err := h.mgr.CreateContainer(id, imageRef, cfg); err != nil {
+	create := h.mgr.CreateContainer
+	if deferCT {
+		create = func(id, _ string, cfg lxc.ContainerConfig) error { return h.mgr.DeferCreate(id, cfg) }
+	}
+	if err := create(id, imageRef, cfg); err != nil {
 		log.Printf("createContainer: failed: %v", err)
 		h.store.RemoveContainer(id)
 		errResponse(w, http.StatusInternalServerError, err.Error())
@@ -542,6 +558,27 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		ID:       id,
 		Warnings: []string{},
 	})
+}
+
+// replacedPinnedHolder returns the container whose CT holds the pinned vmid when
+// it belongs to the same compose project and service as the create, i.e. the
+// container compose is replacing. Without compose labels, or for any other
+// holder, it returns nil: the create then fails as before, since nothing is
+// going to free the id.
+func replacedPinnedHolder(st *store.Store, vmid int, labels map[string]string) *store.ContainerRecord {
+	project := labels["com.docker.compose.project"]
+	service := labels["com.docker.compose.service"]
+	if vmid <= 0 || project == "" || service == "" {
+		return nil
+	}
+	for _, rec := range st.ListContainers() {
+		if rec.VMID == vmid &&
+			rec.Labels["com.docker.compose.project"] == project &&
+			rec.Labels["com.docker.compose.service"] == service {
+			return rec
+		}
+	}
+	return nil
 }
 
 // reuseContainersEnabled reports whether warm container reuse is turned on

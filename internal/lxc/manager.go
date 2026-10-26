@@ -643,6 +643,23 @@ func (m *Manager) enforceRestartPolicy(id string, emit RestartEmitter) {
 	if rec == nil {
 		return
 	}
+	// A Proxmox CT that was destroyed behind the daemon's back (an admin, a
+	// cleanup job) can never be started again. Retrying it forever only spams
+	// pct, and the stale record makes compose try to start it instead of
+	// creating a fresh one, so drop the container as Docker would a dead one.
+	if pveCTGone(rec) {
+		log.Printf("restart-watcher: CT %d of %s (%s) no longer exists; removing the container",
+			rec.VMID, rec.Name, rec.ID[:12])
+		if rec.IPAddress != "" {
+			RemovePortForwards(rec.IPAddress)
+		}
+		if err := m.RemoveContainer(rec.ID); err != nil {
+			log.Printf("restart-watcher: remove %s: %v", rec.ID[:12], err)
+		} else if emit != nil {
+			emit(rec.ID, "destroy")
+		}
+		return
+	}
 	// A container that was never started ("created") is normally left
 	// alone — a plain `docker create` must not auto-run. But one declared
 	// with an always/unless-stopped policy is *meant* to be running, so a
@@ -1740,6 +1757,15 @@ func (m *Manager) StartContainer(id string) error {
 	}
 
 	rec := m.store.GetContainer(id)
+	if rec != nil && len(rec.PendingCreate) > 0 {
+		if err := m.createPending(rec); err != nil {
+			return err
+		}
+		rec = m.store.GetContainer(id)
+	}
+	if pveCTGone(rec) {
+		return fmt.Errorf("manager: CT %d of container %s no longer exists", rec.VMID, shortID(id))
+	}
 	if rec != nil && rec.IPAddress != "" {
 		if err := EnsureBridge(); err != nil {
 			return fmt.Errorf("manager: bridge: %w", err)
@@ -2426,6 +2452,7 @@ func (m *Manager) RemoveContainer(id string) error {
 	}
 	if !m.containerExists(id) {
 		log.Printf("RemoveContainer: %s missing from LXC; removing stale store entry", id)
+		os.RemoveAll(filepath.Join(m.store.RootDir(), "containers", id))
 		return m.store.RemoveContainer(id)
 	}
 
@@ -2441,6 +2468,11 @@ func (m *Manager) RemoveContainer(id string) error {
 		// Proxmox CT — destroy via pct.
 		out, err := exec.Command("pct", "destroy", fmt.Sprintf("%d", rec.VMID), "--force").CombinedOutput()
 		if err != nil {
+			if pctConfigMissing(out) {
+				// Gone between the check above and the destroy.
+				log.Printf("RemoveContainer: CT %d of %s already gone; removing stale store entry", rec.VMID, shortID(id))
+				return m.store.RemoveContainer(id)
+			}
 			return fmt.Errorf("manager: pct destroy %d: %s: %w", rec.VMID, out, err)
 		}
 		return m.store.RemoveContainer(id)
@@ -2574,6 +2606,11 @@ func (m *Manager) thawIfPaused(id string) {
 // too slow for a function that runs on every inspect/list and every 200 ms per
 // /containers/{id}/wait client.
 func (m *Manager) State(id string) (string, error) {
+	if pveCTGone(m.store.GetContainer(id)) {
+		// Not this container's CT any more: its state is not ours to report,
+		// and a stop must not reach whatever now holds the id.
+		return "exited", nil
+	}
 	name, lxcPath := m.lxcName(id)
 	return lxcInfoState(name, lxcPath), nil
 }
@@ -3047,9 +3084,93 @@ func (m *Manager) pveRootfsPath(vmid int) string {
 	return fmt.Sprintf("/%s/subvol-%d-disk-0", m.pveStorage, vmid)
 }
 
+// pveDir is the Proxmox cluster filesystem (pmxcfs). A variable so tests can
+// point it at a lookalike.
+var pveDir = "/etc/pve"
+
 // pveConfigPath returns the Proxmox config path for a VMID.
 func pveConfigPath(vmid int) string {
-	return fmt.Sprintf("/etc/pve/lxc/%d.conf", vmid)
+	return fmt.Sprintf("%s/lxc/%d.conf", pveDir, vmid)
+}
+
+// pveConfigReadable reports whether pmxcfs is mounted. While it is down
+// /etc/pve is an empty directory and every CT would read as missing, so nothing
+// may be concluded from an absent config then.
+func pveConfigReadable() bool {
+	_, err := os.Stat(filepath.Join(pveDir, ".version"))
+	return err == nil
+}
+
+// pveCTOwnedBy reports whether CT vmid exists and was written for container id.
+// Every CT config the daemon writes names the container's full id (the console
+// log path, the /etc/hostname bind). A record can outlive its CT — Proxmox, a
+// cleanup job or an admin can destroy it — and the id can then be taken by
+// another guest, or by a new CT this daemon created for a different container.
+// Such a CT is not the record's, and must never be started or destroyed for it.
+func pveCTOwnedBy(vmid int, id string) (exists, owned bool) {
+	data, err := os.ReadFile(pveConfigPath(vmid))
+	if err != nil {
+		return false, false
+	}
+	return true, id != "" && strings.Contains(string(data), id)
+}
+
+// pveCTGone reports whether rec is a Proxmox CT record whose CT no longer
+// exists, or now belongs to something else.
+func pveCTGone(rec *store.ContainerRecord) bool {
+	if rec == nil || rec.VMID <= 0 || !pveConfigReadable() {
+		return false
+	}
+	_, owned := pveCTOwnedBy(rec.VMID, rec.ID)
+	return !owned
+}
+
+// pctConfigMissing reports pct's error for a CT whose config is gone, e.g.
+// "Configuration file 'nodes/pve/lxc/104.conf' does not exist".
+func pctConfigMissing(out []byte) bool {
+	msg := strings.ToLower(string(out))
+	return strings.Contains(msg, "configuration file") && strings.Contains(msg, "does not exist")
+}
+
+// DeferCreate records cfg for container id instead of building its CT now;
+// the CT is built on the container's first start. For a create whose pinned
+// VMID (dld.vmid) is still held by the container it replaces: compose recreates
+// a service by creating the replacement first and only then stopping and
+// removing the old container (older compose: stop, rename, create, remove), and
+// either way the old one is gone by the time the new one starts.
+func (m *Manager) DeferCreate(id string, cfg ContainerConfig) error {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("manager: encode create config: %w", err)
+	}
+	_, err = m.store.UpdateContainer(id, func(rec *store.ContainerRecord) {
+		rec.PendingCreate = data
+	})
+	return err
+}
+
+// createPending builds the CT of a container created with DeferCreate. On
+// failure the container stays pending, so a later start tries again.
+func (m *Manager) createPending(rec *store.ContainerRecord) error {
+	var cfg ContainerConfig
+	if err := json.Unmarshal(rec.PendingCreate, &cfg); err != nil {
+		return fmt.Errorf("manager: decode create config: %w", err)
+	}
+	log.Printf("StartContainer: creating the CT of %s (%s), deferred at create", rec.Name, shortID(rec.ID))
+	if err := m.CreateContainer(rec.ID, rec.ImageID, cfg); err != nil {
+		return err
+	}
+	_, err := m.store.UpdateContainer(rec.ID, func(current *store.ContainerRecord) {
+		current.PendingCreate = nil
+		// Network attachments were recorded at create, before the CT had an IP.
+		for name, att := range current.Networks {
+			if att.IPAddress == "" {
+				att.IPAddress = current.IPAddress
+				current.Networks[name] = att
+			}
+		}
+	})
+	return err
 }
 
 // destroyOrphan removes a cloned container that failed during CreateContainer.
@@ -3071,8 +3192,11 @@ func (m *Manager) destroyOrphan(id string) {
 func (m *Manager) containerExists(name string) bool {
 	// Check store for PVE container by ID.
 	if rec := m.store.GetContainer(name); rec != nil && rec.VMID > 0 {
-		_, err := os.Stat(pveConfigPath(rec.VMID))
-		return err == nil
+		if !pveConfigReadable() {
+			return true // pmxcfs is down; never drop a record over that
+		}
+		_, owned := pveCTOwnedBy(rec.VMID, rec.ID)
+		return owned
 	}
 	// Check image records for PVE template by name.
 	for _, img := range m.store.ListImages() {
