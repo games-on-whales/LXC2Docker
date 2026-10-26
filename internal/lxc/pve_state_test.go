@@ -22,6 +22,8 @@ func TestStatePVEUsesLXCInfo(t *testing.T) {
 	if err := st.AddContainer(&store.ContainerRecord{ID: id, Name: "wolf", VMID: 101}); err != nil {
 		t.Fatalf("AddContainer: %v", err)
 	}
+	// CT 101 is this container's, whatever the host's own /etc/pve holds.
+	writeCT(t, fakePVE(t), 101, id)
 
 	binDir := t.TempDir()
 	argsFile := filepath.Join(t.TempDir(), "lxc-info-args")

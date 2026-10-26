@@ -77,6 +77,11 @@ type ContainerRecord struct {
 	// Raw HostConfig as JSON for full round-trip. Decoding happens at the
 	// API layer; the store treats this as opaque.
 	RawHostConfig []byte `json:"raw_host_config,omitempty"`
+	// PendingCreate, when set, is the create config (the manager's
+	// ContainerConfig as JSON) of a container whose CT is built on its first
+	// start instead of at create: its pinned VMID (dld.vmid) was still held by
+	// the container it replaces. Opaque to the store.
+	PendingCreate []byte `json:"pending_create,omitempty"`
 	// Healthcheck configuration and live health state. The API layer
 	// populates Healthcheck* at create time; the health watcher writes
 	// Health* as it runs probes.
@@ -524,6 +529,7 @@ func cloneContainerRecord(r *ContainerRecord) *ContainerRecord {
 	copy.Volumes = maps.Clone(r.Volumes)
 	copy.Networks = cloneNetworkAttachments(r.Networks)
 	copy.RawHostConfig = slices.Clone(r.RawHostConfig)
+	copy.PendingCreate = slices.Clone(r.PendingCreate)
 	copy.HealthcheckTest = slices.Clone(r.HealthcheckTest)
 	copy.HealthLastCheck = cloneTime(r.HealthLastCheck)
 	copy.HealthLog = slices.Clone(r.HealthLog)
