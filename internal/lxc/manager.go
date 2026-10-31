@@ -1866,10 +1866,9 @@ func (m *Manager) startPVEContainer(id string, vmid int) error {
 			m.announceLANMac(id, vmid)
 			return nil
 		}
-		// Dump config for debugging a real failure.
-		if cfgData, readErr := os.ReadFile(pveConfigPath(vmid)); readErr == nil {
-			log.Printf("StartContainer[PVE]: FAILED config for VMID %d:\n%s", vmid, cfgData)
-		}
+		// Configuration can contain credentials in lxc.environment or init
+		// arguments. Keep diagnostics local instead of copying them to logs.
+		log.Printf("StartContainer[PVE]: VMID %d failed; config: %s", vmid, pveConfigPath(vmid))
 		return fmt.Errorf("manager: pct start %d: %s: %w", vmid, out, err)
 	}
 	deadline := time.Now().Add(30 * time.Second)
@@ -2121,12 +2120,8 @@ func (m *Manager) startLXCContainer(id string) error {
 		"--logfile", filepath.Join(m.lxcPath, id, "lxc-start.log"),
 		"--logpriority", "DEBUG").CombinedOutput()
 	if err != nil {
-		if cfgData, readErr := os.ReadFile(filepath.Join(m.lxcPath, id, "config")); readErr == nil {
-			log.Printf("StartContainer[LXC]: FAILED config for %s:\n%s", id, cfgData)
-		}
-		if logData, readErr := os.ReadFile(filepath.Join(m.lxcPath, id, "lxc-start.log")); readErr == nil {
-			log.Printf("StartContainer[LXC]: lxc-start log for %s:\n%s", id, logData)
-		}
+		log.Printf("StartContainer[LXC]: %s failed; config: %s; diagnostics: %s", id,
+			filepath.Join(m.lxcPath, id, "config"), filepath.Join(m.lxcPath, id, "lxc-start.log"))
 		return fmt.Errorf("manager: start %s: %s: %w", id, out, err)
 	}
 	deadline := time.Now().Add(30 * time.Second)
