@@ -39,10 +39,6 @@ func (h *Handler) createContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if reqJSON, err := json.Marshal(req); err == nil {
-		log.Printf("createContainer: request body: %s", reqJSON)
-	}
-
 	if req.Image == "" {
 		errResponse(w, http.StatusBadRequest, "Image is required")
 		return
